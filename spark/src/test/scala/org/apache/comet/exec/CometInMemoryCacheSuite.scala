@@ -482,7 +482,7 @@ class CometInMemoryCacheSuite extends CometTestBase {
       empty.count()
 
       val emptyDf = spark.sql("SELECT * FROM empty_cache")
-      checkAnswer(emptyDf, Seq.empty[Row])
+      checkCometAnswer(emptyDf, Seq.empty[Row])
 
       val emptyPlan = emptyDf.queryExecution.executedPlan.toString()
       assert(emptyPlan.contains("CometInMemoryTableScan"))
