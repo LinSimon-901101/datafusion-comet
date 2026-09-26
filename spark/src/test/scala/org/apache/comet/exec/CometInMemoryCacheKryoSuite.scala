@@ -115,8 +115,9 @@ class CometInMemoryCacheKryoSuite extends CometTestBase {
 
             val query = "SELECT * FROM kryo_cache WHERE c_dec_short >= 100 AND c_string > '1'"
             // Disabling Comet after caching would still read the same serialized payload.
-            val expected = withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
-              spark.sql(query).collect().toSeq
+            var expected = Seq.empty[Row]
+            withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+              expected = spark.sql(query).collect().toSeq
             }
 
             spark.catalog.cacheTable("kryo_cache", level)

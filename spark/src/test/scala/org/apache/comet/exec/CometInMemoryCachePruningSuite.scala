@@ -146,7 +146,7 @@ class CometInMemoryCachePruningSuite extends CometTestBase {
     "s LIKE 'prefix%'",
     "dec >= -1.125 AND dec < 2.125",
     "ts < TIMESTAMP '1960-01-05 00:00:00'",
-    "b = true",
+    "b <=> true",
     "id IN (1, 9, 49)",
     "d = -100.0D OR s = 'prefix-z'")
 
@@ -172,8 +172,9 @@ class CometInMemoryCachePruningSuite extends CometTestBase {
         // Spark still decodes the same Comet payload and applies the same cached statistics.
         // Use the original in-memory data: Parquet row-group pruning can itself mishandle
         // signed zero, which would make a file-based oracle hide a cache pruning regression.
-        val oracle = withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
-          source
+        var oracle = Seq.empty[Row]
+        withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+          oracle = source
             .selectExpr((Seq("*") ++ predicates.zipWithIndex.map { case (p, i) =>
               s"($p) AS predicate_$i"
             }): _*)
@@ -218,12 +219,13 @@ class CometInMemoryCachePruningSuite extends CometTestBase {
                 "org.apache.spark.sql.comet.execution.arrow.CometCachedBatch"))
 
             predicates.zipWithIndex.foreach { case (predicate, i) =>
+              def matches(row: Row): Boolean =
+                !row.isNullAt(schema.length + i) && row.getBoolean(schema.length + i)
               val expected = oracle
-                .filter { row =>
-                  !row.isNullAt(schema.length + i) && row.getBoolean(schema.length + i)
-                }
+                .filter(matches)
                 .map(_.getInt(0))
                 .sorted
+              val expectedScannedRows = oracle.grouped(4).count(_.exists(matches)) * 4
               assert(expected.nonEmpty && expected.length < expectedRows.length)
               val query = cached.where(predicate).select("id")
               val actual = query.collect().map(_.getInt(0)).sorted.toSeq
@@ -235,10 +237,11 @@ class CometInMemoryCachePruningSuite extends CometTestBase {
                 assert(scans.length == 1)
                 assert(scans.head.originalPlan.predicates.nonEmpty)
                 val scannedRows = scans.head.metrics("numOutputRows").value
-                assert(scannedRows >= expected.length)
+                // Counting eligible fixture batches also rejects a filter that only drops the
+                // all-null batch, without applying the predicate's actual bounds.
                 assert(
-                  scannedRows < expectedRows.length,
-                  s"pruning must skip batches, but decoded $scannedRows rows")
+                  scannedRows == expectedScannedRows,
+                  s"expected $expectedScannedRows rows from eligible batches, decoded $scannedRows")
               }
             }
           } finally {

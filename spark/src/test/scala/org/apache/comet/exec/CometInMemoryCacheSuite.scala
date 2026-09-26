@@ -105,13 +105,15 @@ class CometInMemoryCacheSuite extends CometTestBase {
   // Disabling Comet does not bypass an existing cache: both readers would still consume the
   // same serialized values. Materialize every Spark reference before registering the cache.
   private def uncachedSparkAnswer(query: String): Array[Row] = {
+    var expected = Array.empty[Row]
     withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
       val df = spark.sql(query)
       assert(
         df.queryExecution.withCachedData.collect { case r: InMemoryRelation => r }.isEmpty,
         "the reference answer must not read a cached relation")
-      df.collect()
+      expected = df.collect()
     }
+    expected
   }
 
   // The tests below are ported from Spark 4.1.2's AdaptiveQueryExecSuite; see each source link.
