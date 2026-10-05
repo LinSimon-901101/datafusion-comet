@@ -95,11 +95,6 @@ on:
   push:
     branches:
       - main
-  schedule:
-    # 06:00 UTC daily: after the evening's merges in the Americas and before
-    # the working day starts in Europe, so a red nightly is waiting when the
-    # first people look. Miri runs at 04:00 and the snapshot publish at 03:00.
-    - cron: '0 6 * * *'
   workflow_dispatch:
 
 # Least-privilege default for the whole pipeline: every job here builds and tests,
