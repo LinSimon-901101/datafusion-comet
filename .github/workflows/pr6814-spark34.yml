@@ -1,0 +1,92 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: PR6814 Spark 3.4 Iceberg
+
+on:
+  push:
+    branches: [ci/pr-6814-spark34]
+
+permissions:
+  contents: read
+
+jobs:
+  iceberg:
+    if: github.repository == 'LinSimon-901101/datafusion-comet'
+    name: CometIcebergNativeSuite (Spark 3.4, Scala 2.12, JDK 17)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: amd64/rust
+      env:
+        JAVA_TOOL_OPTIONS: '--add-exports=java.base/sun.nio.ch=ALL-UNNAMED --add-exports=java.base/sun.util.calendar=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED'
+    env:
+      RUST_BACKTRACE: '1'
+      RUSTFLAGS: '-Ctarget-cpu=x86-64-v3 -Clink-arg=-fuse-ld=bfd'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Rust and Java
+        uses: ./.github/actions/setup-builder
+        with:
+          rust-version: stable
+          jdk-version: '17'
+
+      - name: Restore Cargo cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            native/target
+          key: ${{ runner.os }}-cargo-ci-${{ hashFiles('native/**/Cargo.lock', 'native/**/Cargo.toml') }}
+
+      - name: Build native library
+        working-directory: native
+        run: cargo build --locked --profile ci
+
+      - name: Stage native library
+        run: |
+          mkdir -p native/target/release
+          cp native/target/ci/libcomet.so native/target/release/
+
+      - name: Run Spark 3.4 Iceberg tests
+        uses: ./.github/actions/java-test
+        with:
+          artifact_name: pr6814-spark34
+          suites: org.apache.comet.CometIcebergNativeSuite
+          maven_opts: '-Pspark-3.4 -Pscala-2.12 -Dtest=none -DfailIfNoTests=false'
+          skip-native-build: 'true'
+          upload-test-reports: 'true'
+
+      - name: Confirm the three regression tests passed
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          report = Path('spark/target/surefire-reports/SparkTestSuite.txt').read_text()
+          for name in (
+              'DPP - global aggregate after pruning a single split (AQE=false)',
+              'DPP - global aggregate after pruning a single split (AQE=true)',
+              'DPP - empty Iceberg scan does not request S3 policy locations',
+          ):
+              matches = [line for line in report.splitlines() if name in line]
+              assert len(matches) == 1, f'Expected exactly one result for {name}: {matches}'
+              assert not any(state in matches[0] for state in ('FAILED', 'CANCELED', 'IGNORED', 'PENDING')), matches[0]
+              print(matches[0])
+          PY
