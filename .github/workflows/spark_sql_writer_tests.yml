@@ -115,10 +115,21 @@ jobs:
           spark-short-version: ${{ inputs.spark-version }}
           skip-native-build: true
 
-      - name: Run Parquet writer tests
+      - name: Pre-compile Spark writer test classes
         run: |
           cd apache-spark
           rm -rf /root/.m2/repository/org/apache/parquet # somehow parquet cache requires cleanups
+          # This workflow starts from a fresh Spark checkout. Compile before
+          # launching the test JVM so the compiler has its own memory budget.
+          # Match the pre-compile heap in spark_sql_test_reusable.yml.
+          NOLINT_ON_COMPILE=true ENABLE_COMET=true ENABLE_COMET_ONHEAP=true ENABLE_COMET_WRITE=true \
+            build/sbt -Dsbt.log.noformat=true -mem 3072 'sql/Test/compile'
+        env:
+          LC_ALL: "C.UTF-8"
+
+      - name: Run Parquet writer tests
+        run: |
+          cd apache-spark
           # SERIAL_SBT_TESTS gates SparkParallelTestGrouping in
           # project/SparkBuild.scala. We always set it to reduce peak memory
           # on standard 7 GB runners (3.5 and 4.1 are unaffected by the
@@ -133,6 +144,7 @@ jobs:
               "sql/testOnly org.apache.spark.sql.execution.datasources.parquet.ParquetIOSuite org.apache.spark.sql.execution.datasources.parquet.ParquetCommitterSuite org.apache.spark.sql.execution.datasources.parquet.ParquetEncodingSuite org.apache.spark.sql.execution.datasources.parquet.ParquetCompressionCodecPrecedenceSuite org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormatV1Suite org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormatV2Suite org.apache.spark.sql.execution.datasources.parquet.ParquetV1QuerySuite org.apache.spark.sql.execution.datasources.parquet.ParquetV2QuerySuite org.apache.spark.sql.execution.datasources.parquet.ParquetV1PartitionDiscoverySuite org.apache.spark.sql.execution.datasources.parquet.ParquetV2PartitionDiscoverySuite org.apache.spark.sql.execution.datasources.parquet.ParquetFieldIdIOSuite org.apache.spark.sql.execution.datasources.parquet.ParquetSchemaSuite org.apache.spark.sql.execution.datasources.FileFormatWriterSuite org.apache.spark.sql.sources.PartitionedWriteSuite"
         env:
           LC_ALL: "C.UTF-8"
+          # Spark sources and test classes were compiled in the previous step.
           # Cap SBT orchestrator heap so the freed RAM goes to the forked test
           # JVM and OS/container overhead, fixing cgroup-OOM SIGKILLs under
           # 7 GB runners.
