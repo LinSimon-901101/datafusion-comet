@@ -122,11 +122,6 @@ jobs:
         uses: coursier/setup-action@v3
         with:
           jvm: temurin:21
-          # This job launches scalafix directly and does not need the default sbtn app.
-          apps: ''
-          # Also covers repositories declared by the scalafix app descriptor.
-          mirrors: |
-            https://repo1.maven.org/maven2=https://repo.maven.apache.org/maven2
 
       # Split the network from the lint. `cs launch` resolves and downloads the
       # scalafix artifacts from Maven Central, which resets connections now and
