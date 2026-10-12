@@ -1,0 +1,317 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Fork-only validation. Keep this workflow commit out of the upstream change.
+name: Issue 6890 fork validation
+
+on:
+  push:
+    branches: [ci/6890-sql-status-listener-race]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: '1'
+  RUSTFLAGS: '-Ctarget-cpu=x86-64-v3 -Clink-arg=-fuse-ld=bfd'
+
+jobs:
+  native:
+    if: github.repository == 'LinSimon-901101/datafusion-comet'
+    name: Build shared native library
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    container:
+      image: amd64/rust
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Rust and Java
+        uses: ./.github/actions/setup-builder
+        with:
+          rust-version: stable
+          jdk-version: '17'
+
+      - name: Restore Cargo cache
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            native/target
+          key: ${{ runner.os }}-cargo-ci-${{ hashFiles('native/**/Cargo.lock', 'native/**/Cargo.toml') }}
+
+      - name: Build native library
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p issue6890-results
+          cd native
+          cargo build --locked --profile ci 2>&1 | tee ../issue6890-results/native-build.log
+
+      - name: Upload shared native library
+        uses: ./.github/actions/upload-artifact-retry
+        with:
+          name: issue6890-native-library
+          path: native/target/ci/libcomet.so
+          retention-days: 7
+
+      - name: Upload native build log
+        if: always()
+        uses: ./.github/actions/upload-artifact-retry
+        with:
+          name: issue6890-native-log
+          path: issue6890-results/
+          retention-days: 7
+
+  spark:
+    needs: native
+    name: Spark ${{ matrix.full }} sql_core-1 and repeat check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    container:
+      image: amd64/rust
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {short: '3.4', full: '3.4.3'}
+          - {short: '3.5', full: '3.5.9'}
+          - {short: '4.0', full: '4.0.4'}
+          - {short: '4.1', full: '4.1.3'}
+          - {short: '4.2', full: '4.2.0'}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Prepare test command and evidence directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p issue6890-results
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          rows = json.loads(subprocess.check_output([
+              'python3', 'dev/ci/spark-sql-modules.py', '--modules', 'core'
+          ]))['module']
+          row, = [row for row in rows if row['name'] == 'sql_core-1']
+          assert not row['args1'], row
+          Path('issue6890-results/shard.json').write_text(json.dumps(row, indent=2) + '\n')
+          Path('issue6890-results/shard-command.txt').write_text(row['args2'] + '\n')
+          with open(os.environ['GITHUB_ENV'], 'a') as out:
+              out.write(f"HEAP_SIZE={row['heap']}\nMETASPACE_SIZE={row['metaspace']}\n")
+          PY
+          git rev-parse HEAD > issue6890-results/comet-sha.txt
+
+      - name: Set up Rust and Java
+        uses: ./.github/actions/setup-builder
+        with:
+          rust-version: stable
+          jdk-version: '17'
+
+      - name: Download shared native library
+        uses: ./.github/actions/download-artifact-retry
+        with:
+          name: issue6890-native-library
+          path: native/target/release/
+
+      - name: Install Comet and apply Spark patch
+        uses: ./.github/actions/setup-spark-builder
+        with:
+          spark-version: ${{ matrix.full }}
+          spark-short-version: ${{ matrix.short }}
+          skip-native-build: true
+
+      - name: Pre-compile Spark SQL test classes
+        id: compile
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd apache-spark
+          git rev-parse HEAD > ../issue6890-results/spark-sha.txt
+          git diff -- sql/core/src/test/scala/org/apache/spark/sql/execution/ui/SQLAppStatusListenerSuite.scala > ../issue6890-results/applied-listener-fix.diff
+          # Match the reusable workflow's resolver workaround and compile heap.
+          rm -rf /root/.m2/repository/org/apache/parquet
+          for attempt in 1 2 3; do
+            log="../issue6890-results/compile-${attempt}.log"
+            if NOLINT_ON_COMPILE=true build/sbt -Dsbt.log.noformat=true -mem 3072 \
+                'sql/Test/compile' 2>&1 | tee "$log"; then
+              exit 0
+            fi
+            if ! grep -qE 'could not retrieve sbt|ResolveException|Error downloading|download error|Connection reset' "$log"; then
+              exit 1
+            fi
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+            sleep $((10 * (1 << (attempt - 1)) + RANDOM % 5))
+          done
+
+      - name: Run the full sql_core-1 shard
+        shell: bash
+        env:
+          LC_ALL: C.UTF-8
+          NOLINT_ON_COMPILE: 'true'
+          ENABLE_COMET: 'true'
+          ENABLE_COMET_ONHEAP: 'true'
+          SERIAL_SBT_TESTS: '1'
+          SBT_OPTS: >-
+            -Xss4m -XX:+UseG1GC -XX:+UseStringDeduplication
+            -XX:MaxMetaspaceSize=384m -XX:G1HeapRegionSize=2m
+            -XX:InitiatingHeapOccupancyPercent=35 -XX:+ParallelRefProcEnabled
+            -XX:+ExitOnOutOfMemoryError
+        run: |
+          set -euo pipefail
+          cd apache-spark
+          printf -- '-J-Xms1g\n-J-Xmx4g\n-J-XX:MaxMetaspaceSize=1g\n' > .sbtopts
+          shard_command=$(cat ../issue6890-results/shard-command.txt)
+          for attempt in 1 2 3; do
+            log="../issue6890-results/sql_core-1-${attempt}.log"
+            if build/sbt -Dsbt.log.noformat=true -mem 1024 \
+                'set Global / concurrentRestrictions := Seq(Tags.limit(Tags.ForkedTestGroup, 1))' \
+                "$shard_command" 2>&1 | tee "$log"; then
+              cp "$log" ../issue6890-results/sql_core-1.log
+              exit 0
+            fi
+            # Only dependency failures before any test output can be retried.
+            if grep -qE '^\[info\] - |Tests: succeeded|Run completed in' "$log"; then exit 1; fi
+            if ! grep -qE 'could not retrieve sbt|ResolveException|Error downloading|download error|Connection reset' "$log"; then exit 1; fi
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+            sleep $((10 * (1 << (attempt - 1)) + RANDOM % 5))
+          done
+
+      - name: Verify the memory leak regression ran in the shard
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          log = Path('issue6890-results/sql_core-1.log').read_text()
+          suite = 'SQLAppStatusListenerMemoryLeakSuite'
+          blocks = re.findall(r'(?m)^\[info\] ' + suite + r':[ \t]*\r?\n([\s\S]*?)(?=^\[info\] [^ \n][^\n]*:[ \t]*$|\Z)', log)
+          assert len(blocks) == 1, f'Expected one {suite} run, got {len(blocks)}'
+          matches = [line for line in blocks[0].splitlines() if line.startswith('[info] - no memory leak')]
+          assert len(matches) == 1, f'Missing or duplicate regression result: {matches}'
+          assert not any(marker in matches[0] for marker in ('***', '!!!')), matches[0]
+          assert re.search(r'Tests: succeeded [1-9][0-9]*, failed 0,', log), 'Shard totals missing or unsuccessful'
+          print(matches[0])
+          Path('issue6890-results/shard-regression-result.txt').write_text(matches[0] + '\n')
+          PY
+          # Preserve the shard's XML before the repeated suite overwrites it.
+          find apache-spark/sql/core -type d -name test-reports -print0 | \
+            tar --null -T - -czf issue6890-results/shard-test-reports.tar.gz
+
+      - name: Repeat the memory leak suite ten times
+        if: ${{ !cancelled() && steps.compile.outcome == 'success' }}
+        shell: bash
+        env:
+          LC_ALL: C.UTF-8
+          NOLINT_ON_COMPILE: 'true'
+          ENABLE_COMET: 'true'
+          ENABLE_COMET_ONHEAP: 'true'
+          SERIAL_SBT_TESTS: '1'
+          SBT_OPTS: >-
+            -Xss4m -XX:+UseG1GC -XX:+UseStringDeduplication
+            -XX:MaxMetaspaceSize=384m -XX:G1HeapRegionSize=2m
+            -XX:InitiatingHeapOccupancyPercent=35 -XX:+ParallelRefProcEnabled
+            -XX:+ExitOnOutOfMemoryError
+        run: |
+          set -euo pipefail
+          cd apache-spark
+          commands=()
+          for iteration in {1..10}; do
+            commands+=('sql/testOnly org.apache.spark.sql.execution.ui.SQLAppStatusListenerMemoryLeakSuite')
+          done
+          build/sbt -Dsbt.log.noformat=true -mem 1024 \
+            'set Global / concurrentRestrictions := Seq(Tags.limit(Tags.ForkedTestGroup, 1))' \
+            "${commands[@]}" 2>&1 | tee ../issue6890-results/repeated-suite.log
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          log = Path('../issue6890-results/repeated-suite.log').read_text()
+          suites = re.findall(r'(?m)^\[info\] SQLAppStatusListenerMemoryLeakSuite:\s*$', log)
+          results = re.findall(r'(?m)^\[info\] - no memory leak.*$', log)
+          totals = re.findall(r'Tests: succeeded 1, failed 0, canceled 0', log)
+          assert len(suites) == len(results) == len(totals) == 10, (len(suites), len(results), len(totals))
+          assert all('***' not in result and '!!!' not in result for result in results), results
+          Path('../issue6890-results/repeat-regression-result.txt').write_text('\n'.join(results) + '\n')
+          print('All ten repeated memory leak tests passed.')
+          PY
+
+      - name: Summarize version result
+        if: always()
+        shell: bash
+        env:
+          SPARK_VERSION: ${{ matrix.full }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          results = Path('issue6890-results')
+          summary = [f"## Spark {os.environ['SPARK_VERSION']}: {os.environ['JOB_STATUS']}"]
+          for name in ('comet-sha.txt', 'spark-sha.txt', 'shard-regression-result.txt', 'repeat-regression-result.txt'):
+              path = results / name
+              if path.exists():
+                  summary.extend(['', f'### {name}', '```text', path.read_text().rstrip(), '```'])
+          text = '\n'.join(summary) + '\n'
+          results.mkdir(exist_ok=True)
+          (results / 'summary.md').write_text(text)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write(text)
+          PY
+
+      - name: Upload validation evidence
+        if: always()
+        uses: ./.github/actions/upload-artifact-retry
+        with:
+          name: issue6890-spark-${{ matrix.full }}-evidence
+          path: |
+            issue6890-results/
+            apache-spark/**/target/test-reports/
+            apache-spark/**/unit-tests.log
+          retention-days: 7
+
+  results:
+    name: Issue 6890 validation results
+    if: always() && github.repository == 'LinSimon-901101/datafusion-comet'
+    needs: [native, spark]
+    permissions: {}
+    runs-on: ubuntu-slim
+    steps:
+      - name: Require every Spark version to pass
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          jobs = json.loads(os.environ['NEEDS_JSON'])
+          failures = {name: job['result'] for name, job in jobs.items() if job['result'] != 'success'}
+          assert not failures, failures
+          print('All five sql_core-1 shards and 50 repeated memory leak tests passed.')
+          PY
