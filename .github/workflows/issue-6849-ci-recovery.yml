@@ -185,22 +185,38 @@ jobs:
           upload-test-reports: 'true'
           skip-native-build: 'true'
 
-      - name: Require all four single-split join regression cases to pass
+      - name: Verify all four single-split join regression cases
+        env:
+          MAVEN_PROFILE_OPTS: ${{ matrix.profile.maven_opts }}
         run: |
           python3 - <<'PYREPORT'
+          import os
           import re
           from pathlib import Path
 
           report = Path('spark/target/surefire-reports/SparkTestSuite.txt').read_text()
           lines = re.sub(r'\x1b\[[0-9;]*m', '', report).splitlines()
+          # CometIcebergTestBase explicitly disables Iceberg on Spark 4.2,
+          # whose reused Spark 4.0 Iceberg runtime is binary-incompatible.
+          iceberg_unavailable = '-Pspark-4.2' in os.environ['MAVEN_PROFILE_OPTS'].split()
           for aqe in ('false', 'true'):
               for side in ('a', 'b'):
                   name = f'DPP - single-split sort-merge join (AQE={aqe}, pruned={side})'
-                  matches = [line for line in lines if line.startswith('- ' + name)]
+                  matches = [(i, line) for i, line in enumerate(lines)
+                             if line.startswith('- ' + name)]
                   assert len(matches) == 1, (name, matches)
-                  assert not any(state in matches[0] for state in
-                                 ('FAILED', 'CANCELED', 'IGNORED', 'PENDING')), matches[0]
-                  print(matches[0])
+                  index, result = matches[0]
+                  if iceberg_unavailable:
+                      assert result == '- ' + name + ' !!! CANCELED !!!', result
+                      reason = lines[index + 1] if index + 1 < len(lines) else ''
+                      assert re.fullmatch(
+                          r'  CometIcebergNativeSuite\.this\.icebergAvailable was false '
+                          r'Iceberg not available \(CometIcebergNativeSuite\.scala:\d+\)',
+                          reason), (name, reason)
+                      print(result + ' (expected: Iceberg unavailable on Spark 4.2)')
+                  else:
+                      assert result == '- ' + name, result
+                      print(result)
           PYREPORT
 
   results:
