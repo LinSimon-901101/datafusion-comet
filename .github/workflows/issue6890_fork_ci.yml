@@ -102,6 +102,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Trust checkout directories in the container
+        shell: bash
+        run: |
+          # Checkout's temporary Git config is not used by later container steps.
+          # Trust only the two checkouts used by this job, including Spark's git apply.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/apache-spark"
+
       - name: Prepare test command and evidence directory
         shell: bash
         run: |
