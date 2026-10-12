@@ -1,0 +1,226 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Fork-only recovery for upstream PR #6902. Keep this workflow and its test-only
+# prerequisite out of the clean issue #6849 implementation branch.
+name: Issue 6849 scans CI recovery
+
+on:
+  push:
+    branches: [ci/issue-6849-recovery]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_VERSION: stable
+  RUST_BACKTRACE: '1'
+  RUSTFLAGS: '-Clink-arg=-fuse-ld=bfd'
+  EXPECTED_NATIVE_SHA: 8cd6a3f11c3c7f5cef7db868a9651e47273bbe7f
+  SOURCE_RUN_ID: '38279818815'
+  SOURCE_NATIVE_JOB_ID: '114915331107'
+  SOURCE_ARTIFACT_ID: '11761107145'
+
+jobs:
+  prepare:
+    name: Verify native provenance and select upstream scans tests
+    if: github.repository == 'LinSimon-901101/datafusion-comet'
+    runs-on: ubuntu-slim
+    outputs:
+      profiles: ${{ steps.select.outputs.matrix }}
+      suites: ${{ steps.select.outputs.suites }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Require unchanged native sources and build inputs
+        run: |
+          git cat-file -e "$EXPECTED_NATIVE_SHA^{commit}"
+          python3 - <<'PYSOURCE'
+          import os
+          import subprocess
+
+          baseline = os.environ['EXPECTED_NATIVE_SHA']
+          changed = subprocess.check_output(
+              ['git', 'diff', '--name-only', '-z', baseline, 'HEAD'], text=True
+          ).rstrip('\0').split('\0')
+          # Permit only the upstream test fix and the two fork-only workflows.
+          # This also checks every native source, JNI/protobuf input, build file,
+          # local action and toolchain file without an incomplete path list.
+          allowed = {
+              '.github/workflows/issue-6849-fork-ci.yml',
+              '.github/workflows/issue-6849-ci-recovery.yml',
+              'spark/src/test/scala/org/apache/comet/CometIcebergNativeSuite.scala',
+          }
+          unexpected = set(changed) - allowed - {''}
+          assert not unexpected, f'Native artifact cannot be reused after changes to: {unexpected}'
+          print(f'Native sources and build inputs match {baseline}.')
+          print('Only permitted changes: ' + ', '.join(filter(None, changed)))
+          PYSOURCE
+
+      - name: Verify native artifact and its successful producer
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const runId = Number(process.env.SOURCE_RUN_ID);
+            const jobId = Number(process.env.SOURCE_NATIVE_JOB_ID);
+            const artifactId = Number(process.env.SOURCE_ARTIFACT_ID);
+            const expectedSha = process.env.EXPECTED_NATIVE_SHA;
+            const [{ data: run }, { data: job }, { data: artifact }] = await Promise.all([
+              github.rest.actions.getWorkflowRun({ owner, repo, run_id: runId }),
+              github.rest.actions.getJobForWorkflowRun({ owner, repo, job_id: jobId }),
+              github.rest.actions.getArtifact({ owner, repo, artifact_id: artifactId }),
+            ]);
+            if (run.head_sha !== expectedSha || job.run_id !== runId ||
+                job.name !== 'PR Build (Linux) / Build Native Library' ||
+                job.status !== 'completed' || job.conclusion !== 'success' ||
+                artifact.name !== 'native-lib-linux' || artifact.expired ||
+                artifact.workflow_run?.id !== runId ||
+                artifact.workflow_run?.head_sha !== expectedSha) {
+              throw new Error('The pinned native artifact does not match the successful expected build.');
+            }
+            core.info(`Reusing artifact ${artifact.id} from native job ${job.id} at ${expectedSha}.`);
+            core.info(`Artifact expiration: ${artifact.expires_at}`);
+
+      - name: Select exact upstream scans bucket and all Spark profiles
+        id: select
+        run: |
+          python3 dev/ci/linux-test-profiles.py --profiles all --github-output "$GITHUB_OUTPUT"
+          python3 - <<'PYSUITES'
+          import os
+          import re
+          from pathlib import Path
+
+          workflow = Path('.github/workflows/pr_build_linux.yml').read_text()
+          matches = re.findall(
+              r'(?m)^          - name: "scans"\n            value: \|\n'
+              r'((?:              [^\n]+\n)+)', workflow)
+          assert len(matches) == 1, 'Expected one upstream scans bucket'
+          suites = [line.strip() for line in matches[0].splitlines()]
+          assert 'org.apache.comet.CometIcebergNativeSuite' in suites, suites
+          assert all(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.]*', suite) for suite in suites)
+          assert len(suites) == len(set(suites)), 'Duplicate upstream scans suite'
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('suites<<SCANS_SUITES\n' + '\n'.join(suites) + '\nSCANS_SUITES\n')
+          print(f'Selected the complete upstream scans bucket ({len(suites)} suites).')
+          PYSUITES
+
+  scans:
+    name: Upstream scans (${{ matrix.profile.name }})
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ${{ fromJSON(needs.prepare.outputs.profiles) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    container:
+      image: amd64/rust
+      env:
+        JAVA_TOOL_OPTIONS: '--add-exports=java.base/sun.nio.ch=ALL-UNNAMED --add-exports=java.base/sun.util.calendar=ALL-UNNAMED --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/java.lang=ALL-UNNAMED'
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust and Java toolchain
+        uses: ./.github/actions/setup-builder
+        with:
+          rust-version: ${{ env.RUST_VERSION }}
+          jdk-version: ${{ matrix.profile.java_version }}
+
+      # The local retry wrapper supports only artifacts from the current run.
+      # Cross-run downloads need the official action's run-id and token inputs.
+      - name: Download pinned native library from the original Comet CI run
+        uses: actions/download-artifact@v8
+        with:
+          artifact-ids: ${{ env.SOURCE_ARTIFACT_ID }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+          github-token: ${{ github.token }}
+          path: native/target/release/
+          merge-multiple: true
+
+      - name: Verify native libraries are in Maven's expected directory
+        run: |
+          test -s native/target/release/libcomet.so
+          test -s native/target/release/libcomet_test_udfs.so
+
+      - name: Restore Cargo registry
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('native/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: Run exact upstream scans tests
+        uses: ./.github/actions/java-test
+        with:
+          artifact_name: issue-6849-recovery-${{ matrix.profile.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          suites: ${{ needs.prepare.outputs.suites }}
+          maven_opts: ${{ matrix.profile.maven_opts }}
+          upload-test-reports: 'true'
+          skip-native-build: 'true'
+
+      - name: Require all four single-split join regression cases to pass
+        run: |
+          python3 - <<'PYREPORT'
+          import re
+          from pathlib import Path
+
+          report = Path('spark/target/surefire-reports/SparkTestSuite.txt').read_text()
+          lines = re.sub(r'\x1b\[[0-9;]*m', '', report).splitlines()
+          for aqe in ('false', 'true'):
+              for side in ('a', 'b'):
+                  name = f'DPP - single-split sort-merge join (AQE={aqe}, pruned={side})'
+                  matches = [line for line in lines if line.startswith('- ' + name)]
+                  assert len(matches) == 1, (name, matches)
+                  assert not any(state in matches[0] for state in
+                                 ('FAILED', 'CANCELED', 'IGNORED', 'PENDING')), matches[0]
+                  print(matches[0])
+          PYREPORT
+
+  results:
+    name: Issue 6849 scans recovery results
+    if: always() && github.repository == 'LinSimon-901101/datafusion-comet'
+    needs: [prepare, scans]
+    permissions: {}
+    runs-on: ubuntu-slim
+    steps:
+      - name: Require provenance checks and every scans profile to pass
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PYRESULT'
+          import json
+          import os
+
+          jobs = json.loads(os.environ['NEEDS_JSON'])
+          failed = {name: job['result'] for name, job in jobs.items()
+                    if job['result'] != 'success'}
+          assert not failed, f'Recovery validation did not succeed: {failed}'
+          print('Exact upstream scans suites passed on all five Spark profiles.')
+          PYRESULT
