@@ -216,6 +216,10 @@ jobs:
 
   spark-sql-test:
     needs: build
+    # The Spark 3.4 sql_core-3 shard can run just past GitHub's default 6h
+    # job cap; set an explicit ceiling so it finishes instead of being canceled
+    # and tripping the Required Checks aggregator.
+    timeout-minutes: 420
     strategy:
       # The rows are defined in dev/ci/spark-sql-modules.py and selected by
       # the `modules` input; the build job runs the script and publishes the
