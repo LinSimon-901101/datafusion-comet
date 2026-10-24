@@ -154,13 +154,7 @@ fn consumer_properties(
         let bytes = if fixed_width_bytes(&literal.value().data_type()).is_some() {
             0
         } else {
-            literal
-                .value()
-                .to_array()
-                .ok()?
-                .to_data()
-                .get_slice_memory_size()
-                .ok()?
+            literal_bytes(literal.value())?
         };
         return Some(ConsumerProperties {
             constant: true,
@@ -345,13 +339,7 @@ fn bounded_output_bytes(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option
         }
     }
     if let Some(literal) = expr.downcast_ref::<Literal>() {
-        return literal
-            .value()
-            .to_array()
-            .ok()?
-            .to_data()
-            .get_slice_memory_size()
-            .ok();
+        return literal_bytes(literal.value());
     }
     let dt = expr.data_type(schema).ok()?;
     if let Some(bytes) = fixed_width_bytes(&dt) {
@@ -414,6 +402,26 @@ fn bounded_output_bytes(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option
         });
     }
     None
+}
+
+fn literal_bytes(value: &ScalarValue) -> Option<usize> {
+    // Counting a scalar payload must not copy it into Arrow at every enclosing expression.
+    match value {
+        ScalarValue::Utf8(value) => Some(value.as_ref().map_or(0, |v| v.len()).saturating_add(9)),
+        ScalarValue::Binary(value) => Some(value.as_ref().map_or(0, |v| v.len()).saturating_add(9)),
+        ScalarValue::LargeUtf8(value) => {
+            Some(value.as_ref().map_or(0, |v| v.len()).saturating_add(17))
+        }
+        ScalarValue::LargeBinary(value) => {
+            Some(value.as_ref().map_or(0, |v| v.len()).saturating_add(17))
+        }
+        _ => value
+            .to_array()
+            .ok()?
+            .to_data()
+            .get_slice_memory_size()
+            .ok(),
+    }
 }
 
 fn variable_bytes(data: &ArrayData) -> usize {
@@ -543,5 +551,28 @@ impl PhysicalExpr for ScalarSubqueryConsumer {
             inner,
             Arc::clone(&self.input_schema),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literal_payload_bounds_include_offsets_and_nulls() {
+        for value in [
+            ScalarValue::Utf8(Some("λ".repeat(1024))),
+            ScalarValue::Utf8(None),
+            ScalarValue::LargeUtf8(Some("λ".repeat(1024))),
+            ScalarValue::LargeUtf8(None),
+            ScalarValue::Binary(Some(vec![7; 4096])),
+            ScalarValue::Binary(None),
+            ScalarValue::LargeBinary(Some(vec![7; 4096])),
+            ScalarValue::LargeBinary(None),
+        ] {
+            let array = value.to_array().unwrap();
+            let actual = array.to_data().get_slice_memory_size().unwrap();
+            assert!(literal_bytes(&value).unwrap() >= actual, "{value:?}");
+        }
     }
 }

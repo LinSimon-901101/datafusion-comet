@@ -2213,6 +2213,13 @@ trait CometBaseAggregate[T <: BaseAggregateExec] extends CometOperatorSerde[T] {
       builder: Operator.Builder,
       childOp: OperatorOuterClass.Operator*): Option[OperatorOuterClass.Operator] = {
 
+    org.apache.comet.serde.CometScalarSubquery
+      .groupedAggregateFallbackReason(aggregate)
+      .foreach { reason =>
+        withFallbackReason(aggregate, reason)
+        return None
+      }
+
     val modes = aggregate.aggregateExpressions.map(_.mode).distinct
     val modeSet = modes.toSet
     val hasPartialMerge = modeSet.contains(PartialMerge)
@@ -2870,6 +2877,16 @@ trait CometHashJoin {
     }
 
     val isNullAwareAntiJoin = isNullAware(join)
+
+    if (join.isInstanceOf[BroadcastHashJoinExec]) {
+      val buildKeys = if (join.buildSide == BuildLeft) join.leftKeys else join.rightKeys
+      org.apache.comet.serde.CometScalarSubquery
+        .broadcastBuildKeysFallbackReason(buildKeys)
+        .foreach { reason =>
+          withFallbackReason(join, reason)
+          return None
+        }
+    }
 
     val joinKeys = join.leftKeys ++ join.rightKeys
     if (joinKeys.exists(key => isStringCollationType(key.dataType))) {

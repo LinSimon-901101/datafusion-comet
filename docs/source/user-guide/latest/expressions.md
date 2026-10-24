@@ -739,10 +739,14 @@ comparisons, and supported epoch arithmetic remain native.
 String inputs to `lpad` and `rpad` that contain scalar subqueries and have no column references
 fall back to Spark. Conditional inputs such as `IF` and `CASE WHEN` that reference
 columns can run natively, including when every row selects a struct-subquery field.
-Column strings with scalar-subquery lengths, including NULL lengths, remain native.
+Column strings with plain scalar-subquery lengths, including NULL lengths, retain the native
+kernel. In struct-subquery plans, unknown merged lengths and unbounded intermediate values use
+Spark rows; finite, safe conditional padding remains native. Fallible row-dependent consumers,
+computed broadcast keys and ANSI grouped decimal sums also retain Spark evaluation where native
+batching or initialization would change the first error or evaluate rows skipped by Spark.
 Other expressions can also produce a scalar string for an entire batch, even when they
 reference columns. The native padding adapter broadcasts these runtime scalar strings
-through the existing array kernel, preserving scalar and per-row lengths.
+through the existing array kernel for admitted expressions, preserving scalar and per-row lengths.
 
 ## See also
 

@@ -3396,6 +3396,158 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar struct consumers retain first errors and prefix consumption") {
+    withSQLConf(
+      SQLConf.ANSI_ENABLED.key -> "true",
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+      withTempPath { dir =>
+        withTempView("error_rows", "error_source") {
+          withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+            Seq((0, "bad", "1", "300"), (1, "1", "bad", "bad"))
+              .toDF("id", "s", "t", "u")
+              .coalesce(1)
+              .write
+              .parquet(s"${dir.getCanonicalPath}/rows")
+            Seq(1).toDF("n").write.parquet(s"${dir.getCanonicalPath}/source")
+          }
+          spark.read
+            .parquet(s"${dir.getCanonicalPath}/rows")
+            .createOrReplaceTempView("error_rows")
+          spark.read
+            .parquet(s"${dir.getCanonicalPath}/source")
+            .createOrReplaceTempView("error_source")
+          val maximum = "(SELECT max(n) FROM error_source)"
+          val minimum = "(SELECT min(n) FROM error_source)"
+          val division = s"1D / ($maximum - 1)"
+          val cases = Seq(
+            (s"IF(id = 1, $division, CAST(s AS DOUBLE))", "CAST_INVALID_INPUT", "22018"),
+            (s"CAST(t AS INT), $division", "DIVIDE_BY_ZERO", "22012"),
+            (s"IF(CAST(t AS INT) = 1, $division, 0D)", "DIVIDE_BY_ZERO", "22012"),
+            ("CAST(CAST(u AS BIGINT) AS TINYINT)", "CAST_OVERFLOW", "22003"))
+          cases.foreach { case (expression, errorClass, sqlState) =>
+            Seq(false, true).foreach { comet =>
+              withSQLConf(CometConf.COMET_ENABLED.key -> comet.toString) {
+                val df = sql(s"SELECT $expression, $maximum, $minimum FROM error_rows")
+                assert(df.queryExecution.optimizedPlan.toString.contains("named_struct"))
+                val error = intercept[Exception](df.collect())
+                val first = Iterator
+                  .iterate[Throwable](error)(_.getCause)
+                  .takeWhile(_ != null)
+                  .collectFirst {
+                    case e: org.apache.spark.SparkThrowable if e.getErrorClass != null =>
+                      (e.getErrorClass, e.getSqlState)
+                  }
+                assert(first.contains((errorClass, sqlState)), error)
+              }
+            }
+          }
+          Seq(false, true).foreach { comet =>
+            withSQLConf(CometConf.COMET_ENABLED.key -> comet.toString) {
+              Seq("id = 0", "monotonically_increasing_id() = 0").foreach { condition =>
+                checkAnswer(
+                  sql(s"SELECT IF($condition, $maximum, CAST(t AS INT)), $minimum " +
+                    "FROM error_rows LIMIT 1"),
+                  Seq(Row(1, 1)))
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("scalar struct grouped decimal SUM retains the first aggregate error") {
+    withSQLConf(
+      SQLConf.ANSI_ENABLED.key -> "true",
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
+      withTempPath { dir =>
+        withTempView("sum_rows", "sum_source") {
+          withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+            Seq((0, 0L), (1, Long.MaxValue), (2, 0L))
+              .toDF("id", "a")
+              .selectExpr(
+                "id",
+                "a",
+                "CAST('99999999999999999999999999999999999999' AS DECIMAL(38,0)) d")
+              .coalesce(1)
+              .write
+              .parquet(s"${dir.getCanonicalPath}/rows")
+            Seq(1L)
+              .toDF("n")
+              .selectExpr("n", "CAST(n AS DECIMAL(38,0)) d")
+              .write
+              .parquet(s"${dir.getCanonicalPath}/source")
+          }
+          spark.read.parquet(s"${dir.getCanonicalPath}/rows").createOrReplaceTempView("sum_rows")
+          spark.read
+            .parquet(s"${dir.getCanonicalPath}/source")
+            .createOrReplaceTempView("sum_source")
+          val query = "SELECT id % 1 k, sum(IF(id = 0, (SELECT min(d) FROM sum_source), d)) sd, " +
+            "sum(IF(id = 2, (SELECT max(n) FROM sum_source), a)) sa FROM sum_rows GROUP BY id % 1"
+          val errors = ListBuffer.empty[(String, String, java.util.Map[String, String])]
+          Seq(false, true).foreach { comet =>
+            withSQLConf(CometConf.COMET_ENABLED.key -> comet.toString) {
+              val df = sql(query)
+              assert(df.queryExecution.optimizedPlan.toString.contains("named_struct"))
+              val error = intercept[Exception](df.collect())
+              errors += Iterator
+                .iterate[Throwable](error)(_.getCause)
+                .takeWhile(_ != null)
+                .collectFirst {
+                  case e: org.apache.spark.SparkThrowable if e.getErrorClass != null =>
+                    (e.getErrorClass, e.getSqlState, e.getMessageParameters)
+                }
+                .get
+            }
+          }
+          assert(errors.head._1 == "ARITHMETIC_OVERFLOW")
+          assert(errors.head._2 == "22003")
+          assert(errors.head._3.toString.contains("long overflow"))
+          assert(errors.head == errors.last, errors)
+        }
+      }
+    }
+  }
+
+  test("scalar struct broadcast build keys execute with zero streamed partitions") {
+    withSQLConf(
+      SQLConf.ANSI_ENABLED.key -> "true",
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      CometConf.COMET_CONVERT_FROM_RDD_ENABLED.key -> "true") {
+      withTempPath { dir =>
+        withTempView("empty_probe", "key_build") {
+          spark
+            .createDataFrame(
+              spark.sparkContext.emptyRDD[Row],
+              StructType(Seq(StructField("id", LongType, nullable = false))))
+            .createOrReplaceTempView("empty_probe")
+          withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+            Seq("bad").toDF("s").write.parquet(dir.getCanonicalPath)
+          }
+          spark.read.parquet(dir.getCanonicalPath).createOrReplaceTempView("key_build")
+          val scalar = "(SELECT max(named_struct('n', 1L, 'm', length(s))) FROM key_build).n"
+          Seq(false, true).foreach { comet =>
+            withSQLConf(CometConf.COMET_ENABLED.key -> comet.toString) {
+              val df = sql(
+                "SELECT /*+ BROADCAST(b) */ a.id FROM empty_probe a JOIN key_build b " +
+                  s"ON a.id = CAST(b.s AS BIGINT) + $scalar")
+              val error = intercept[Exception](df.collect())
+              val causes = Iterator.iterate[Throwable](error)(_.getCause).takeWhile(_ != null)
+              assert(
+                causes.exists {
+                  case e: org.apache.spark.SparkThrowable =>
+                    e.getErrorClass == "CAST_INVALID_INPUT"
+                  case _ => false
+                },
+                error)
+            }
+          }
+        }
+      }
+    }
+  }
+
   test("merged scalar subquery supplies a runtime Bloom filter") {
     withSQLConf(
       SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
@@ -3478,7 +3630,10 @@ class CometExecSuite extends CometTestBase {
               withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
                 checkAnswer(sql(query), Seq.empty)
               }
-              checkSparkAnswerAndOperator(sql(query), Seq(classOf[CometFilterExec]))
+              val df = sql(query)
+              checkSparkAnswer(df)
+              assert(
+                stripAQEPlan(df.queryExecution.executedPlan).exists(_.isInstanceOf[FilterExec]))
             }
           }
         }
@@ -3512,7 +3667,8 @@ class CometExecSuite extends CometTestBase {
               case _ => false
             })),
             df.queryExecution.optimizedPlan.toString)
-          checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+          checkSparkAnswer(df)
+          assert(stripAQEPlan(df.queryExecution.executedPlan).exists(_.isInstanceOf[ProjectExec]))
         }
       }
     }
@@ -3677,7 +3833,8 @@ class CometExecSuite extends CometTestBase {
             "arrays_zip(array(rand(42L)))",
             "map_from_arrays(array(id), array(rand(42L)))",
             "10D / CAST(rand(42L) * 2 AS INT)",
-            "10L DIV CAST(rand(42L) * 2 AS BIGINT)")
+            "10L DIV CAST(rand(42L) * 2 AS BIGINT)",
+            "10L % CAST(rand(42L) * 2 AS BIGINT)")
           for (mode <- Seq("CODEGEN_ONLY", "NO_CODEGEN"); expression <- expressions) {
             withSQLConf(SQLConf.CODEGEN_FACTORY_MODE.key -> mode) {
               val df = sql(
@@ -3700,7 +3857,6 @@ class CometExecSuite extends CometTestBase {
               "CAST(rand(42L) * 10 AS BIGINT))",
             "size(array(id))",
             "arrays_zip(array(id))",
-            "map_from_arrays(array(id), array(id))",
             "ln(CAST(id / id AS DOUBLE))")
           safe.foreach { expression =>
             checkSparkAnswerAndOperator(
@@ -3708,13 +3864,22 @@ class CometExecSuite extends CometTestBase {
                 "FROM stateful_items"),
               Seq(classOf[CometProjectExec]))
           }
+          Seq("map_from_arrays(array(id), array(id))").foreach { expression =>
+            val df = sql(
+              s"SELECT id, $expression AS v, $maximum AS hi, $minimum AS lo " +
+                "FROM stateful_items")
+            checkSparkAnswer(df)
+            assert(
+              stripAQEPlan(df.queryExecution.executedPlan).exists(_.isInstanceOf[ProjectExec]))
+          }
           withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
             Seq("10D / (rand(42L) + 1D)", "10L DIV CAST(rand(42L) * 2 + 1 AS BIGINT)")
               .foreach { expression =>
-                checkSparkAnswerAndOperator(
-                  sql(s"SELECT id, $expression AS v, $maximum AS hi, $minimum AS lo " +
-                    "FROM stateful_items"),
-                  Seq(classOf[CometProjectExec]))
+                val df = sql(s"SELECT id, $expression AS v, $maximum AS hi, $minimum AS lo " +
+                  "FROM stateful_items")
+                checkSparkAnswer(df)
+                assert(stripAQEPlan(df.queryExecution.executedPlan)
+                  .exists(_.isInstanceOf[ProjectExec]))
               }
           }
         }
@@ -3949,10 +4114,16 @@ class CometExecSuite extends CometTestBase {
 
   test("scalar review bounded integer casts remain native") {
     withScalarReviewTables {
+      val fallible = sql(
+        "SELECT octet_length(CAST(id + " +
+          "(SELECT max(n) FROM review_src) AS STRING)), " +
+          "(SELECT min(n) FROM review_src) FROM review_outer")
+      checkSparkAnswer(fallible)
+      assert(
+        stripAQEPlan(fallible.queryExecution.executedPlan).exists(_.isInstanceOf[ProjectExec]))
       checkSparkAnswerAndOperator(
         sql(
-          "SELECT octet_length(CAST(id + " +
-            "(SELECT max(n) FROM review_src) AS STRING)), " +
+          "SELECT octet_length(CAST(id AS STRING)), (SELECT max(n) FROM review_src), " +
             "(SELECT min(n) FROM review_src) FROM review_outer"),
         Seq(classOf[CometProjectExec]))
     }
@@ -4048,16 +4219,27 @@ class CometExecSuite extends CometTestBase {
               val right = "named_struct('s', CAST(CAST(bad AS INT) AS STRING), 'd', 0D)"
               Seq("=", "!=", "<", "<=", ">", ">=").foreach { op =>
                 val df = sql(s"SELECT $empty $op $right AS result FROM scalar_comparison_outer")
-                checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+                checkSparkAnswer(df)
                 checkAnswer(df, Seq(Row(null), Row(null)))
+                assert(stripAQEPlan(df.queryExecution.executedPlan)
+                  .exists(_.isInstanceOf[ProjectExec]))
+                checkSparkAnswerAndOperator(
+                  sql(s"SELECT $empty $op named_struct('s', bad, 'd', 0D) FROM scalar_comparison_outer"),
+                  Seq(classOf[CometProjectExec]))
               }
               val present = "(SELECT max(named_struct('s', s, 'd', 0D)) AS present_struct " +
                 "FROM scalar_comparison_source)"
               val mixed = sql(s"SELECT id, IF(id = 0, $empty, $present) = $right AS result " +
                 "FROM scalar_comparison_outer")
-              val (_, mixedPlan) =
-                checkSparkAnswerAndOperator(mixed, Seq(classOf[CometProjectExec]))
+              checkSparkAnswer(mixed)
               checkAnswer(mixed, Seq(Row(0L, null), Row(1L, true)))
+              assert(stripAQEPlan(mixed.queryExecution.executedPlan)
+                .exists(_.isInstanceOf[ProjectExec]))
+              val totalMixed = sql(s"SELECT id, IF(id = 0, $empty, $present) = " +
+                "named_struct('s', bad, 'd', 0D) AS result FROM scalar_comparison_outer")
+              val (_, mixedPlan) =
+                checkSparkAnswerAndOperator(totalMixed, Seq(classOf[CometProjectExec]))
+              checkAnswer(totalMixed, Seq(Row(0L, null), Row(1L, true)))
               val mixedProjects = stripAQEPlan(mixedPlan).collect {
                 case p: CometProjectExec if p.output.exists(_.name == "result") => p
               }
@@ -4073,8 +4255,10 @@ class CometExecSuite extends CometTestBase {
                 s"SELECT $empty = $right AS a, $empty < $right AS b FROM scalar_comparison_outer"
               withSQLConf(SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "false") {
                 val df = sql(shared)
-                checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+                checkSparkAnswer(df)
                 checkAnswer(df, Seq(Row(null, null), Row(null, null)))
+                assert(stripAQEPlan(df.queryExecution.executedPlan)
+                  .exists(_.isInstanceOf[ProjectExec]))
               }
               Seq(false, true).foreach { comet =>
                 withSQLConf(
@@ -4185,7 +4369,8 @@ class CometExecSuite extends CometTestBase {
                   assert(
                     structs.nonEmpty,
                     s"Expected a whole-struct subquery: ${df.queryExecution}")
-                  val (_, plan) = checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+                  checkSparkAnswer(df)
+                  val plan = df.queryExecution.executedPlan
                   val result = df.collect()
                   assert(result.length == numRows)
                   result.foreach { row =>
@@ -4194,7 +4379,13 @@ class CometExecSuite extends CometTestBase {
                   val projections = stripAQEPlan(plan).collect {
                     case p: CometProjectExec if p.output.exists(_.name == "n") => p
                   }
-                  assert(projections.nonEmpty, s"Expected native whole-struct consumer: $plan")
+                  if (consumer == s"(IF(id > 0, $maxStruct, $minStruct)).d") {
+                    assert(
+                      projections.nonEmpty,
+                      s"Expected native whole-struct field read: $plan")
+                  } else {
+                    assert(stripAQEPlan(plan).exists(_.isInstanceOf[ProjectExec]), plan.toString)
+                  }
                   projections.foreach { projection =>
                     val sizes = projection
                       .executeColumnar()

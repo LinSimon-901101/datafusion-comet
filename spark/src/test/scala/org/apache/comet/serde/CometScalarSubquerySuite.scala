@@ -44,6 +44,72 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
   private def supported(dt: DataType): Boolean =
     CometScalarSubquery.getSupportLevel(subquery(dt)) == Compatible()
 
+  test("struct context preserves row errors independently of width and NULL masks") {
+    val id = AttributeReference("id", LongType, nullable = false)()
+    val text = AttributeReference("text", StringType)()
+    val scalar = subquery(struct(LongType))
+    val value = GetStructField(scalar, 0)
+    val total = If(EqualTo(id, Literal(0L)), value, Literal(1L))
+    val cast = Cast(text, LongType, None, EvalMode.ANSI)
+    val fallible = If(EqualTo(id, Literal(0L)), value, cast)
+    val plan = ProjectExec(Seq(Alias(value, "scalar")(), Alias(id, "id")()), emptyInput)
+    CometScalarSubquery.tagPlanInputs(plan)
+    CometScalarSubquery.withPlanInputs(plan) {
+      assert(CometScalarSubquery.consumerFallbackReason(total).isEmpty)
+      assert(CometScalarSubquery.consumerFallbackReason(cast).isDefined)
+      assert(CometScalarSubquery.consumerFallbackReason(fallible).isDefined)
+      assert(CometScalarSubquery.broadcastBuildKeysFallbackReason(Seq(total)).isEmpty)
+      assert(CometScalarSubquery.broadcastBuildKeysFallbackReason(Seq(cast)).isDefined)
+      val pad = StringLPad(Literal("x"), Literal(8), Literal("0"))
+      assert(CometScalarSubquery.consumerFallbackReason(pad).isEmpty)
+      val unknownLength = pad.copy(len = AttributeReference("length", IntegerType)())
+      assert(CometScalarSubquery.consumerFallbackReason(unknownLength).isDefined)
+      val large = StringRepeat(Literal("xx"), Literal(Int.MaxValue))
+      assert(CometScalarSubquery.consumerFallbackReason(large).isDefined)
+      val wide = StringLPad(text, Literal(262144), Literal("x"))
+      assert(
+        CometScalarSubquery
+          .projectionConsumerFallbackReason(Seq(value, wide), Seq.empty)
+          .isDefined)
+      assert(CometScalarSubquery.operatorArgumentFallbackReason(wide).isDefined)
+      assert(
+        CometScalarSubquery.projectionConsumerFallbackReason(Seq(value, text), Seq.empty).isEmpty)
+      val selected =
+        If(EqualTo(id, Literal(0L)), GetStructField(subquery(struct(StringType)), 0), text)
+      val bounded = StringLPad(selected, Literal(8), Literal("0"))
+      assert(CometScalarSubquery.consumerFallbackReason(bounded).isEmpty)
+      assert(
+        CometScalarSubquery.projectionConsumerFallbackReason(Seq(bounded), Seq.empty).isEmpty)
+      val larger = bounded.copy(len = Literal(256))
+      assert(CometScalarSubquery.consumerFallbackReason(larger).isEmpty)
+      assert(CometScalarSubquery.projectionConsumerFallbackReason(Seq(larger), Seq.empty).isEmpty)
+      val fixed = StringLPad(
+        If(EqualTo(id, Literal(0L)), Literal("x"), Literal("y")),
+        Literal(8),
+        Literal("0"))
+      assert(
+        CometScalarSubquery
+          .projectionConsumerFallbackReason(Seq(value, fixed), Seq.empty)
+          .isEmpty)
+    }
+    assert(CometScalarSubquery.consumerFallbackReason(cast).isEmpty)
+    assert(CometScalarSubquery.broadcastBuildKeysFallbackReason(Seq(cast)).isEmpty)
+  }
+
+  test("conditional and broadcast Bloom initialization retain their own stage gates") {
+    val bloom =
+      BloomFilterMightContain(GetStructField(subquery(struct(BinaryType)), 0), Literal(1L))
+    val conditional = If(Literal(true), Literal(true), bloom)
+    Seq("CODEGEN_ONLY", "NO_CODEGEN").foreach { mode =>
+      withSQLConf("spark.sql.codegen.factoryMode" -> mode) {
+        assert(
+          CometScalarSubquery.consumerFallbackReason(conditional).isDefined ==
+            (mode == "NO_CODEGEN"))
+        assert(CometScalarSubquery.broadcastBuildKeysFallbackReason(Seq(bloom)).isDefined)
+      }
+    }
+  }
+
   private def versionSpecificTypes: Seq[DataType] = {
     val strings =
       if (isSpark40Plus) Seq(DataType.fromDDL("STRING COLLATE UTF8_LCASE")) else Seq.empty
@@ -831,7 +897,7 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
 
   test("shared Bloom keys retain lazy NO_CODEGEN evaluation despite non-null-intolerant class") {
     val input = AttributeReference("s", StringType)()
-    val key = Cast(input, LongType)
+    val key = Cast(input, LongType, None, EvalMode.ANSI)
     val filter = GetStructField(subquery(struct(BinaryType)), 0)
     val first = BloomFilterMightContain(filter, key)
     val second = BloomFilterMightContain(Literal.create(null, NullType), key)
@@ -841,12 +907,12 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
         "spark.sql.subexpressionElimination.enabled" -> enabled.toString) {
         QueryPlanSerde.withSharedSubexpressions(Seq(first, second), eagerSharing = true) {
           val proto = QueryPlanSerde.exprToProtoInternal(first, Seq(input), binding = false)
-          if (enabled && mode == "NO_CODEGEN") {
-            assert(proto.isEmpty)
-          } else {
-            assert(proto.isDefined)
-            assert(proto.get.getBloomFilterMightContain.getNullShortCircuit == !enabled)
-          }
+          assert(proto.isEmpty)
+          val lower = CometBloomFilterMightContain.convert(first, Seq(input), binding = false)
+          assert(lower.isDefined)
+          assert(lower.get.getBloomFilterMightContain.getNullShortCircuit == !enabled)
+          assert(
+            QueryPlanSerde.isEagerSharedSubexpression(key) == (enabled && mode == "CODEGEN_ONLY"))
         }
       }
     }
@@ -869,19 +935,25 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
         "spark.sql.subexpressionElimination.enabled" -> enabled.toString) {
         QueryPlanSerde.withSharedSubexpressions(Seq(left, right), eagerSharing = true) {
           Seq(left, right).foreach { padding =>
-            val proto = QueryPlanSerde.exprToProtoInternal(padding, inputs, binding = false)
-            if (enabled && mode == "NO_CODEGEN") {
-              assert(proto.isEmpty)
-            } else {
-              assert(proto.isDefined)
-              assert(proto.get.getScalarFunc.getNullShortCircuit == !enabled)
+            // The enclosing struct guard rejects an unknown length. Check the lower serializer's
+            // independent NULL-mask contract without using that fallback as its proof.
+            assert(QueryPlanSerde.exprToProtoInternal(padding, inputs, binding = false).isEmpty)
+            val proto = padding match {
+              case p: StringLPad => CometStringLPad.convert(p, inputs, binding = false)
+              case p: StringRPad => CometStringRPad.convert(p, inputs, binding = false)
             }
+            assert(proto.isDefined)
+            assert(proto.get.getScalarFunc.getNullShortCircuit == !enabled)
+            assert(
+              QueryPlanSerde.isEagerSharedSubexpression(
+                length) == (enabled && mode == "CODEGEN_ONLY"))
           }
         }
         QueryPlanSerde.withSharedSubexpressions(Seq(left, inner), eagerSharing = true) {
-          val proto = QueryPlanSerde.exprToProtoInternal(left, inputs, binding = false)
-          assert(proto.isEmpty == enabled)
-          if (!enabled) assert(proto.get.getScalarFunc.getNullShortCircuit)
+          val proto = CometStringLPad.convert(left, inputs, binding = false)
+          assert(proto.isDefined)
+          assert(proto.get.getScalarFunc.getNullShortCircuit == !enabled)
+          assert(!QueryPlanSerde.isEagerSharedSubexpression(length))
         }
       }
     }

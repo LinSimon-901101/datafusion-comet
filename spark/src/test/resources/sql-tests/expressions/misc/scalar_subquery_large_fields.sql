@@ -42,10 +42,17 @@ SELECT id, octet_length((SELECT max(s) FROM large_field_source)),
        octet_length((SELECT min(s) FROM large_field_source))
 FROM large_field_outer
 
--- Nested consumers must reduce the value before broadcasting any intermediate string.
-query expect_native(octet_length,concat)
+-- A single concatenated value can itself exceed the Arrow offset limit. Unknown
+-- runtime string widths retain Spark rows even when this fixture happens to be small.
+query expect_fallback(Unbounded struct scalar subquery constructors)
 SELECT id, octet_length(concat((SELECT max(s) FROM large_field_source), 'x')),
        octet_length((SELECT min(s) FROM large_field_source))
+FROM large_field_outer
+
+-- Primitive formatting supplies a finite concat bound and remains native.
+query expect_native(octet_length,concat)
+SELECT id, octet_length(concat(CAST((SELECT max(id) FROM large_field_source) AS STRING), 'x')),
+       (SELECT min(id) FROM large_field_source)
 FROM large_field_outer
 
 -- The reduced result must still work in mixed and homogeneous conditional branches.
@@ -56,6 +63,12 @@ FROM large_field_outer
 
 -- A column-dependent branch must be consumed on bounded slices, preserving row order and NULLs.
 query expect_native(octet_length)
+SELECT id, octet_length(IF(id >= 0, (SELECT max(s) FROM large_field_source), '')),
+       octet_length(IF(id % 2 = 0, (SELECT min(s) FROM large_field_source), NULL))
+FROM large_field_outer
+
+-- ANSI arithmetic is fallible independently of the width of its selected branch.
+query expect_fallback(Fallible struct scalar subquery consumers require Spark row evaluation)
 SELECT id, octet_length(IF(id + 1 > 0, (SELECT max(s) FROM large_field_source), '')),
        octet_length(IF(id % 2 = 0, (SELECT min(s) FROM large_field_source), NULL))
 FROM large_field_outer
@@ -73,7 +86,7 @@ SELECT id, octet_length(IF(rand(42) >= 0, (SELECT max(s) FROM large_field_source
 FROM large_field_outer
 
 -- A dispatched predicate has no subquery itself, but its surrounding consumer does.
-query expect_fallback(JVM-dispatched consumers of variable-width struct scalar subqueries require Spark)
+query expect_fallback(Unbounded struct scalar subquery constructors)
 SELECT id, octet_length(IF(upper(CAST(id AS STRING)) <> 'missing',
                           (SELECT max(s) FROM large_field_source), '')),
        octet_length((SELECT min(s) FROM large_field_source))
@@ -92,9 +105,9 @@ SELECT id, octet_length((SELECT max(s) FROM large_field_source WHERE id < 0)),
        octet_length((SELECT min(s) FROM large_field_source WHERE id < 0))
 FROM large_field_outer
 
--- Do not eagerly evaluate an ANSI cast inside an unselected branch. The predicate is a column
--- expression, so the optimizer cannot discard the failing branch as a constant IF.
-query expect_native(octet_length)
+-- A fallible arm must retain Spark row evaluation even when this input never selects it.
+-- Other inputs or a partial reader can expose a different first error.
+query expect_fallback(Fallible struct scalar subquery consumers require Spark row evaluation)
 SELECT id, IF(id < 0, octet_length(CAST(CAST((SELECT max(s) FROM large_field_source)
                                          AS INT) AS STRING)), 0),
        octet_length((SELECT min(s) FROM large_field_source))

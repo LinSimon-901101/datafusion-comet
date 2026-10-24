@@ -22,8 +22,10 @@ package org.apache.comet.serde
 import scala.jdk.CollectionConverters._
 import scala.util.DynamicVariable
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, And, ArrayContains, ArrayPosition, ArrayRemove, ArraysOverlap, ArraysZip, ArrayUnion, Attribute, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, Concat, CreateArray, CreateMap, CreateNamedStruct, DateFormatClass, DateFromUnixDate, DayOfWeek, Divide, DivModLike, ElementAt, EqualNullSafe, EqualTo, EvalMode, Expression, ExprId, GetArrayItem, GetArrayStructFields, GetMapValue, GetStructField, GreaterThan, GreaterThanOrEqual, Greatest, Hour, If, In, InSet, IntegralDivide, IsNotNull, IsNull, KnownNotNull, KnownNullable, LambdaFunction, Least, LessThan, LessThanOrEqual, Literal, Log, Log10, Log2, MapFromArrays, Minute, Murmur3Hash, NamedExpression, Not, Or, Pmod, PreciseTimestampConversion, RegExpExtract, RegExpExtractAll, Remainder, ScalaUDF, Second, Size, Slice, SortOrder, SpecifiedWindowFrame, StringLPad, StringRPad, ToUnixTimestamp, TryEval, UnixDate, UnixTimestamp, WeekDay, WindowSpecDefinition, XxHash64}
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, And, ArrayContains, ArrayPosition, ArrayRemove, ArraysOverlap, ArraysZip, ArrayUnion, Ascii, Attribute, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, Concat, ConcatWs, CreateArray, CreateMap, CreateNamedStruct, DateFormatClass, DateFromUnixDate, DayOfWeek, Divide, DivModLike, ElementAt, EqualNullSafe, EqualTo, EvalMode, Expression, ExprId, GetArrayItem, GetArrayStructFields, GetMapValue, GetStructField, GreaterThan, GreaterThanOrEqual, Greatest, Hour, If, In, InSet, IntegralDivide, IsNaN, IsNotNull, IsNull, KnownFloatingPointNormalized, KnownNotNull, KnownNullable, LambdaFunction, Least, Length, LessThan, LessThanOrEqual, Literal, Log, Log10, Log2, Lower, MapFromArrays, Minute, Multiply, Murmur3Hash, NamedExpression, Not, OctetLength, Or, Pmod, PreciseTimestampConversion, Rand, RegExpExtract, RegExpExtractAll, Remainder, Reverse, ScalaUDF, Second, Size, Slice, SortOrder, SpecifiedWindowFrame, StringLPad, StringRepeat, StringRPad, Subtract, ToUnixTimestamp, TryEval, UnixDate, UnixTimestamp, Upper, WeekDay, WindowSpecDefinition, XxHash64}
+import org.apache.spark.sql.catalyst.expressions.aggregate.Sum
 import org.apache.spark.sql.catalyst.expressions.objects.StaticInvoke
+import org.apache.spark.sql.catalyst.optimizer.NormalizeNaNAndZero
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.catalyst.trees.TreePattern.PLAN_EXPRESSION
 import org.apache.spark.sql.comet.CometExec
@@ -38,7 +40,7 @@ import com.google.protobuf.Message
 import org.apache.comet.CometConf
 import org.apache.comet.CometSparkSessionExtensions.withFallbackReason
 import org.apache.comet.serde.QueryPlanSerde.{serializeDataType, supportedDataType}
-import org.apache.comet.shims.CometExprTraitShim
+import org.apache.comet.shims.{CometEvalModeUtil, CometExprTraitShim}
 
 object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with CometExprTraitShim {
 
@@ -367,7 +369,31 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
             case _ => None
           }
           digits.map(_ + 5)
+        case padding: StringLPad => paddingBytes(padding.len)
+        case padding: StringRPad => paddingBytes(padding.len)
+        case repeat: StringRepeat =>
+          repeat.right match {
+            case Literal(count: Int, IntegerType) =>
+              boundedResultBytes(repeat.left)
+                .filter(_ <= Long.MaxValue / math.max(1, count))
+                .map(_ * math.max(0, count))
+            case _ => None
+          }
+        case concat: Concat => sumBounds(concat.children.map(boundedResultBytes), 5)
+        case concat: ConcatWs if concat.children.headOption.exists {
+              case Literal(null, _) => true
+              case _ => false
+            } =>
+          Some(0L)
         case array: CreateArray => sumBounds(array.children.map(boundedResultBytes), 5)
+        case zip: ArraysZip if zip.children.forall(_.isInstanceOf[CreateArray]) =>
+          val length = zip.children.map(_.children.length.toLong).foldLeft(0L)(math.max)
+          // NULL padding still allocates a full fixed-width slot in every result field.
+          sumBounds(
+            zip.children.map(a => fixedTypeBytes(a.dataType.asInstanceOf[ArrayType].elementType)),
+            1)
+            .filter(_ <= (Long.MaxValue - 5) / math.max(1L, length))
+            .map(_ * length + 5)
         case structure: CreateNamedStruct =>
           sumBounds(structure.valExprs.map(boundedResultBytes), 1)
         case conditional: If =>
@@ -393,13 +419,34 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
     boundedResultBytes(expr).exists(
       _ <= scalarInputBytes / math.max(1, CometConf.COMET_BATCH_SIZE.get()))
 
+  private def paddingBytes(length: Expression): Option[Long] = length match {
+    case Literal(value: Int, IntegerType) => Some(math.max(0L, value.toLong) * 4 + 5)
+    case Literal(null, _) => Some(0L)
+    case _ => None
+  }
+
   // Include intermediates such as repeat('x', numericSubquery), even when the source is integral.
   private def needsBoundedEvaluation(expr: Expression): Boolean =
     hasStructSubquery(expr) && expr.exists(e => !fitsConsumerBatch(e))
 
+  private def borrowedArray(expr: Expression): Boolean = expr match {
+    case _: Attribute | _: BoundReference => true
+    case _: Alias | _: KnownNotNull | _: KnownNullable | _: GetStructField =>
+      expr.children.forall(borrowedArray)
+    case _ => false
+  }
+
+  private def unprotectedBatchValue(expr: Expression, capped: Boolean): Boolean = {
+    val protectedBySource = capped || hasStructSubquery(expr)
+    (!protectedBySource && !fitsConsumerBatch(expr) && !borrowedArray(expr)) ||
+    expr.children.exists(unprotectedBatchValue(_, protectedBySource))
+  }
+
   /** Physical accumulators and partitioners request their arguments as complete batch arrays. */
   def operatorArgumentFallbackReason(expr: Expression): Option[String] =
-    if (hasStructSubquery(expr) && !fitsConsumerBatch(expr)) {
+    if (hasStructSubqueryContext(expr) && unprotectedBatchValue(expr, capped = false)) {
+      Some("Unbounded operator siblings of struct scalar subqueries require Spark")
+    } else if (hasStructSubquery(expr) && !fitsConsumerBatch(expr)) {
       Some("Variable-width struct scalar subquery operator arguments require Spark")
     } else {
       None
@@ -473,6 +520,10 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
   def projectionConsumerFallbackReason(
       expressions: Seq[Expression],
       protos: Seq[ExprOuterClass.Expr]): Option[String] = {
+    if (expressions.exists(hasStructSubqueryContext) &&
+      expressions.exists(unprotectedBatchValue(_, capped = false))) {
+      return Some("Unbounded projection siblings of struct scalar subqueries require Spark")
+    }
     val source = expressions.find(e => hasStructSubquery(e) && !fitsConsumerBatch(e))
     source.flatMap { context =>
       if (expressions.exists(!_.deterministic)) {
@@ -524,6 +575,15 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
   private val primitiveNumericTypes: Set[DataType] =
     Set(ByteType, ShortType, IntegerType, LongType, FloatType, DoubleType)
 
+  private def positiveIntegralLiteral(expr: Expression): Boolean = expr match {
+    case Literal(value: Number, dt)
+        if Set[DataType](ByteType, ShortType, IntegerType, LongType).contains(dt) =>
+      value.longValue() > 0
+    case cast: Cast if Cast.canUpCast(cast.child.dataType, cast.dataType) =>
+      positiveIntegralLiteral(cast.child)
+    case _ => false
+  }
+
   private def canEvaluateForSkippedRows(expr: Expression): Boolean = expr match {
     case _: Literal | _: Attribute | _: BoundReference | _: ExecSubqueryExpression => true
     case field: GetStructField => canEvaluateForSkippedRows(field.child)
@@ -535,10 +595,7 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
       expr.children.forall(canEvaluateForSkippedRows)
     case remainder: Remainder
         if Set[DataType](ByteType, ShortType, IntegerType, LongType)
-          .contains(remainder.left.dataType) && (remainder.right match {
-          case Literal(value: Number, _) => value.longValue() > 0
-          case _ => false
-        }) =>
+          .contains(remainder.left.dataType) && positiveIntegralLiteral(remainder.right) =>
       canEvaluateForSkippedRows(remainder.left)
     case _: XxHash64 | _: Murmur3Hash
         if expr.children.forall(child => primitiveNumericTypes.contains(child.dataType)) =>
@@ -559,6 +616,110 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
       canEvaluateForSkippedRows(cast.child)
     case _ => false
   }
+
+  private def formatsWithoutErrors(dt: DataType): Boolean = dt match {
+    case StringType | BooleanType | NullType => true
+    case _: DecimalType => true
+    case _ => primitiveNumericTypes.contains(dt)
+  }
+
+  // A vectorized consumer can visit a later row before Spark asks for it, even under LIMIT.
+  // NULL masks alone do not prove that all other rows/arguments are free of errors.
+  // Existing byte/shape gates still govern allocation failures; this checks SQL evaluation.
+  private def canEvaluateInAnyRowOrder(expr: Expression): Boolean =
+    canEvaluateForSkippedRows(expr) || (expr match {
+      case _: Alias | _: KnownNotNull | _: KnownNullable | _: KnownFloatingPointNormalized |
+          _: NormalizeNaNAndZero | _: IsNaN | _: SortOrder | _: GetStructField | _: If |
+          _: CaseWhen | _: Coalesce | _: Greatest | _: Least | _: CreateNamedStruct |
+          _: CreateArray | _: Concat | _: ConcatWs | _: Length | _: OctetLength | _: Ascii |
+          _: Lower | _: Upper | _: XxHash64 | _: Murmur3Hash | _: Reverse | _: IsNull |
+          _: IsNotNull | _: Not | _: And | _: Or | _: EqualTo | _: EqualNullSafe | _: LessThan |
+          _: LessThanOrEqual | _: GreaterThan | _: GreaterThanOrEqual | _: In | _: InSet |
+          _: ArrayContains | _: ArrayPosition | _: ArrayRemove | _: ArraysOverlap |
+          _: ArrayUnion | _: GetMapValue | _: GetArrayStructFields | _: Size | _: ArraysZip |
+          _: Log | _: Log2 | _: Log10 | _: Rand =>
+        expr.children.forall(canEvaluateInAnyRowOrder)
+      case _: StringLPad | _: StringRPad =>
+        boundedResultBytes(expr).exists(_ <= Int.MaxValue) &&
+        expr.children.forall(canEvaluateInAnyRowOrder)
+      case _: StringRepeat =>
+        boundedResultBytes(expr).exists(_ <= Int.MaxValue) &&
+        expr.children.forall(canEvaluateInAnyRowOrder)
+      case _: UnixDate | _: DateFromUnixDate | _: DayOfWeek | _: WeekDay =>
+        expr.children.forall(canEvaluateInAnyRowOrder)
+      case hour: Hour if clockFallbackReason(hour.child, hour.timeZoneId).isEmpty =>
+        canEvaluateInAnyRowOrder(hour.child)
+      case minute: Minute if clockFallbackReason(minute.child, minute.timeZoneId).isEmpty =>
+        canEvaluateInAnyRowOrder(minute.child)
+      case second: Second if clockFallbackReason(second.child, second.timeZoneId).isEmpty =>
+        canEvaluateInAnyRowOrder(second.child)
+      case unix: UnixTimestamp if isTimestamp(unix.timeExp.dataType) =>
+        unix.children.forall(canEvaluateInAnyRowOrder)
+      case unix: ToUnixTimestamp if isTimestamp(unix.timeExp.dataType) =>
+        unix.children.forall(canEvaluateInAnyRowOrder)
+      case conversion: PreciseTimestampConversion
+          if isEpochCast(conversion.fromType, conversion.toType) =>
+        conversion.children.forall(canEvaluateInAnyRowOrder)
+      case cast: Cast
+          if cast.child.dataType == cast.dataType ||
+            isEpochCast(cast.child.dataType, cast.dataType) ||
+            (cast.child.dataType.isInstanceOf[DecimalType] &&
+              Set[DataType](FloatType, DoubleType).contains(cast.dataType)) ||
+            (cast.evalMode != EvalMode.ANSI && primitiveNumericTypes.contains(cast.dataType) &&
+              (primitiveNumericTypes.contains(cast.child.dataType) ||
+                cast.child.dataType == StringType)) ||
+            (primitiveNumericTypes.contains(cast.child.dataType) &&
+              primitiveNumericTypes.contains(cast.dataType) &&
+              Cast.canUpCast(cast.child.dataType, cast.dataType)) ||
+            (cast.dataType == StringType && formatsWithoutErrors(cast.child.dataType)) =>
+        canEvaluateInAnyRowOrder(cast.child)
+      case arithmetic: Add
+          if primitiveNumericTypes.contains(arithmetic.dataType) &&
+            arithmetic.evalMode != EvalMode.ANSI =>
+        arithmetic.children.forall(canEvaluateInAnyRowOrder)
+      case arithmetic: Subtract
+          if primitiveNumericTypes.contains(arithmetic.dataType) &&
+            arithmetic.evalMode != EvalMode.ANSI =>
+        arithmetic.children.forall(canEvaluateInAnyRowOrder)
+      case arithmetic: Multiply
+          if primitiveNumericTypes.contains(arithmetic.dataType) &&
+            arithmetic.evalMode != EvalMode.ANSI =>
+        arithmetic.children.forall(canEvaluateInAnyRowOrder)
+      case arithmetic: Divide if arithmetic.evalMode != EvalMode.ANSI =>
+        arithmetic.children.forall(canEvaluateInAnyRowOrder)
+      case arithmetic: IntegralDivide if arithmetic.evalMode != EvalMode.ANSI =>
+        arithmetic.children.forall(canEvaluateInAnyRowOrder)
+      case arithmetic: Remainder if arithmetic.evalMode != EvalMode.ANSI =>
+        arithmetic.children.forall(canEvaluateInAnyRowOrder)
+      case _ => false
+    })
+
+  def broadcastBuildKeysFallbackReason(keys: Seq[Expression]): Option[String] =
+    if (keys.exists(hasStructSubqueryContext) && keys.exists { key =>
+        !canEvaluateInAnyRowOrder(key) || key.exists(_.isInstanceOf[BloomFilterMightContain])
+      }) {
+      // Spark hashes the build keys while broadcasting; native tasks may never run on an
+      // empty streamed RDD. Bloom deserialization is also required at that initialization.
+      Some("Fallible struct scalar subquery broadcast keys require Spark build evaluation")
+    } else {
+      None
+    }
+
+  def groupedAggregateFallbackReason(plan: BaseAggregateExec): Option[String] =
+    if (plan.groupingExpressions.nonEmpty &&
+      plan.aggregateExpressions.exists(hasStructSubqueryContext) &&
+      plan.aggregateExpressions.exists(_.aggregateFunction match {
+        case sum: Sum =>
+          sum.dataType.isInstanceOf[DecimalType] &&
+          CometEvalModeUtil.sumEvalMode(sum) == EvalMode.ANSI
+        case _ => false
+      })) {
+      // Spark defers decimal SUM overflow until final evaluation; the native grouped
+      // accumulator raises during update, ahead of other rows/aggregates' errors.
+      Some("ANSI grouped decimal SUM in struct scalar subquery plans requires Spark evaluation")
+    } else {
+      None
+    }
 
   private def skippedObservableArguments(expr: Expression): Seq[Expression] =
     expr.children.zipWithIndex.collect {
@@ -617,16 +778,23 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
       !division.right.deterministic
     case division: IntegralDivide if division.evalMode != EvalMode.ANSI =>
       !division.right.deterministic
+    case remainder: Remainder if remainder.evalMode != EvalMode.ANSI =>
+      !remainder.right.deterministic
     case _ => false
   }
 
   private def evaluationFallbackReason(expr: Expression): Option[String] = {
     if (!hasStructSubqueryContext(expr)) return None
-    if (repeatsStatefulOperand(expr)) {
-      return Some(
-        "Repeated stateful evaluation of struct scalar subquery consumers requires Spark")
+    val readsRows = expr.references.nonEmpty || !expr.deterministic ||
+      expr.exists(_.isInstanceOf[BoundReference])
+    if (readsRows && !canEvaluateInAnyRowOrder(expr)) {
+      return Some("Fallible struct scalar subquery consumers require Spark row evaluation")
     }
     expr match {
+      case _: If | _: CaseWhen
+          if !QueryPlanSerde.usesGeneratedExpressionEvaluation &&
+            expr.exists(_.isInstanceOf[BloomFilterMightContain]) =>
+        Some("Conditional Bloom initialization of struct scalar subqueries requires Spark")
       // IN skips candidates after a NULL value or a matching candidate. Native dynamic IN only
       // stops after a batch-wide match, and Spark may evaluate shared candidates eagerly.
       case in: In
@@ -674,6 +842,20 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
       (!expr.containsPattern(PLAN_EXPRESSION) || !ExecSubqueryExpression.hasSubquery(expr))) {
       return None
     }
+    if (hasStructSubqueryContext(expr) && repeatsStatefulOperand(expr)) {
+      return Some(
+        "Repeated stateful evaluation of struct scalar subquery consumers requires Spark")
+    }
+    val selectsValue = expr match {
+      case _: Attribute | _: BoundReference | _: Literal | _: ExecSubqueryExpression |
+          _: GetStructField | _: Alias | _: KnownNotNull | _: KnownNullable | _: If |
+          _: CaseWhen | _: Coalesce | _: Greatest | _: Least | _: CreateNamedStruct =>
+        true
+      case _ => false
+    }
+    val unboundedConstructor = hasStructSubqueryContext(expr) && !selectsValue &&
+      fixedTypeBytes(expr.dataType).isEmpty &&
+      !boundedResultBytes(expr).exists(_ <= Int.MaxValue)
 
     // Native consumers may change batch boundaries to avoid repeating a large scalar field.
     // Stateful consumers must retain Spark's evaluation order and their pre-existing fallback.
@@ -726,6 +908,11 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
 
     // An allowed wrapper must not hide an unreviewed consumer in its children.
     reason
+      .orElse {
+        if (unboundedConstructor) {
+          Some("Unbounded struct scalar subquery constructors require Spark row evaluation")
+        } else None
+      }
       .orElse {
         expr.children.iterator.map(consumerFallbackReason).collectFirst {
           case Some(childReason) =>

@@ -202,22 +202,22 @@ query expect_fallback(Scalar values are not supported for the `str` argument)
 SELECT id, lpad(concat((SELECT max(payload.text) AS maximum FROM test_struct_subq), ''), 8, '0')
 FROM test_struct_subq
 
--- Column strings still run natively with plain or paired scalar subquery lengths.
+-- Plain lengths retain the column kernel. Unknown merged lengths use Spark rows.
 query expect_native(lpad)
 SELECT id, lpad(payload.text, (SELECT max(id) AS maximum FROM test_struct_subq), '0')
 FROM test_struct_subq
 
-query expect_native(lpad)
+query expect_fallback(Unbounded struct scalar subquery constructors)
 SELECT id, lpad(payload.text, (SELECT max(id) AS maximum FROM test_struct_subq), '0'),
        lpad(payload.text, (SELECT min(id) AS minimum FROM test_struct_subq), '0')
 FROM test_struct_subq
 
--- Runtime NULL lengths must reach the column kernel without becoming literal NULLs.
+-- Plain runtime NULL lengths reach the column kernel; merged unknown lengths use Spark rows.
 query expect_native(lpad)
 SELECT id, lpad(payload.text, (SELECT max(id) AS maximum FROM test_struct_subq WHERE id < 0), '0')
 FROM test_struct_subq
 
-query expect_native(lpad)
+query expect_fallback(Unbounded struct scalar subquery constructors)
 SELECT id, lpad(payload.text, (SELECT max(id) AS maximum FROM test_struct_subq WHERE id < 0), '0'),
        lpad(payload.text, (SELECT min(id) AS minimum FROM test_struct_subq WHERE id < 0), '0')
 FROM test_struct_subq
@@ -251,22 +251,22 @@ query expect_fallback(Scalar values are not supported for the `str` argument)
 SELECT id, rpad(concat((SELECT max(payload.text) AS maximum FROM test_struct_subq), ''), 8, '0')
 FROM test_struct_subq
 
--- Column strings still run natively with plain or paired scalar subquery lengths.
+-- Plain lengths retain the column kernel. Unknown merged lengths use Spark rows.
 query expect_native(rpad)
 SELECT id, rpad(payload.text, (SELECT max(id) AS maximum FROM test_struct_subq), '0')
 FROM test_struct_subq
 
-query expect_native(rpad)
+query expect_fallback(Unbounded struct scalar subquery constructors)
 SELECT id, rpad(payload.text, (SELECT max(id) AS maximum FROM test_struct_subq), '0'),
        rpad(payload.text, (SELECT min(id) AS minimum FROM test_struct_subq), '0')
 FROM test_struct_subq
 
--- Runtime NULL lengths must reach the column kernel without becoming literal NULLs.
+-- Plain runtime NULL lengths reach the column kernel; merged unknown lengths use Spark rows.
 query expect_native(rpad)
 SELECT id, rpad(payload.text, (SELECT max(id) AS maximum FROM test_struct_subq WHERE id < 0), '0')
 FROM test_struct_subq
 
-query expect_native(rpad)
+query expect_fallback(Unbounded struct scalar subquery constructors)
 SELECT id, rpad(payload.text, (SELECT max(id) AS maximum FROM test_struct_subq WHERE id < 0), '0'),
        rpad(payload.text, (SELECT min(id) AS minimum FROM test_struct_subq WHERE id < 0), '0')
 FROM test_struct_subq
