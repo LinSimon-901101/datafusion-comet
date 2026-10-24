@@ -20,7 +20,7 @@
 package org.apache.comet.serde
 
 import org.apache.spark.sql.{CometTestBase, Row}
-import org.apache.spark.sql.catalyst.expressions.{Add, Alias, AttributeReference, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, FromUTCTimestamp, GetStructField, GreaterThan, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Minute, NamedExpression, Not, OctetLength, PreciseTimestampConversion, Rand, Second, SecondsToTimestamp, StringLPad, StringRepeat, StringRPad, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, UnixTimestamp, WeekDay}
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Ascending, AttributeReference, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, FromUTCTimestamp, GetStructField, GreaterThan, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Minute, NamedExpression, Not, OctetLength, PreciseTimestampConversion, Rand, Second, SecondsToTimestamp, SortOrder, StringLPad, StringRepeat, StringRPad, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, UnixTimestamp, WeekDay}
 import org.apache.spark.sql.execution.{FilterExec, ProjectExec, ScalarSubquery, SubqueryExec}
 import org.apache.spark.sql.types._
 
@@ -72,6 +72,12 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
           .projectionConsumerFallbackReason(Seq(value, wide), Seq.empty)
           .isDefined)
       assert(CometScalarSubquery.operatorArgumentFallbackReason(wide).isDefined)
+      val order = SortOrder(text, Ascending)
+      assert(CometScalarSubquery.operatorArgumentFallbackReason(order).isEmpty)
+      assert(CometScalarSubquery.consumerFallbackReason(order).isEmpty)
+      assert(
+        CometScalarSubquery.operatorArgumentFallbackReason(SortOrder(wide, Ascending)).isDefined)
+      assert(CometScalarSubquery.consumerFallbackReason(SortOrder(large, Ascending)).isDefined)
       assert(
         CometScalarSubquery.projectionConsumerFallbackReason(Seq(value, text), Seq.empty).isEmpty)
       val selected =

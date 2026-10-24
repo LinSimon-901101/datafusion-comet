@@ -431,7 +431,7 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
 
   private def borrowedArray(expr: Expression): Boolean = expr match {
     case _: Attribute | _: BoundReference => true
-    case _: Alias | _: KnownNotNull | _: KnownNullable | _: GetStructField =>
+    case _: Alias | _: KnownNotNull | _: KnownNullable | _: GetStructField | _: SortOrder =>
       expr.children.forall(borrowedArray)
     case _ => false
   }
@@ -849,7 +849,8 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
     val selectsValue = expr match {
       case _: Attribute | _: BoundReference | _: Literal | _: ExecSubqueryExpression |
           _: GetStructField | _: Alias | _: KnownNotNull | _: KnownNullable | _: If |
-          _: CaseWhen | _: Coalesce | _: Greatest | _: Least | _: CreateNamedStruct =>
+          _: CaseWhen | _: Coalesce | _: Greatest | _: Least | _: CreateNamedStruct |
+          _: SortOrder =>
         true
       case _ => false
     }

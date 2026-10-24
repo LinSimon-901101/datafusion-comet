@@ -78,7 +78,9 @@ SELECT id, lpad(IF(id = 0, (SELECT max(s) FROM conditional_pad_subq), s), 8, '0'
 FROM conditional_pad_subq
 
 -- Wrappers and runtime NULL fields retain native padding and NULL semantics.
-query expect_native(lpad,rpad)
+-- Spark4.2 merges these different filtered subplans and uses constructor fallback.
+-- The Scala wrapper regression asserts the actual version-specific plan as well.
+query spark_answer_only
 SELECT lpad(concat(IF(p, (SELECT max(s) FROM conditional_pad_subq), s), ''), 8, '0'),
        rpad(IF(p, (SELECT min(s) FROM conditional_pad_subq WHERE id < 0), s), 8, '0')
 FROM conditional_pad_subq

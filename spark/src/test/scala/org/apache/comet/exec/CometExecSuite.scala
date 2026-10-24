@@ -3503,7 +3503,8 @@ class CometExecSuite extends CometTestBase {
           }
           assert(errors.head._1 == "ARITHMETIC_OVERFLOW")
           assert(errors.head._2 == "22003")
-          assert(errors.head._3.toString.contains("long overflow"))
+          assert(Set("long overflow", "overflow").contains(errors.head._3.get("message")))
+          assert(errors.head._3.get("alternative").contains("try_add"))
           assert(errors.head == errors.last, errors)
         }
       }
@@ -3716,6 +3717,28 @@ class CometExecSuite extends CometTestBase {
             }
           body
         }
+      }
+    }
+  }
+
+  test("scalar review padding wrappers track subplan merging across versions") {
+    withScalarReviewTables {
+      val df = sql(
+        "SELECT lpad(concat(IF(id > 0, (SELECT max(txt) FROM review_items), txt), ''), 8, '0'), " +
+          "rpad(IF(id > 0, (SELECT min(txt) FROM review_items WHERE id < 0), txt), 8, '0') FROM review_items")
+      if (isSpark42Plus) {
+        assert(
+          df.queryExecution.optimizedPlan.exists(_.expressions.exists(_.exists {
+            case GetStructField(_: LogicalScalarSubquery, _, _) => true
+            case _ => false
+          })),
+          df.queryExecution.optimizedPlan.toString)
+        checkSparkAnswer(df)
+        val reason =
+          new ExtendedExplainInfo().generateExtendedInfo(df.queryExecution.executedPlan)
+        assert(reason.contains("Unbounded struct scalar subquery constructors"), reason)
+      } else {
+        checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
       }
     }
   }
