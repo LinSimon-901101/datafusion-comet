@@ -151,11 +151,16 @@ fn consumer_properties(
         });
     }
     if let Some(literal) = expr.downcast_ref::<Literal>() {
-        let bytes = match literal.value() {
-            ScalarValue::Utf8(Some(value)) | ScalarValue::LargeUtf8(Some(value)) => value.len(),
-            ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value)) => value.len(),
-            ScalarValue::Struct(value) => variable_bytes(&value.to_data()),
-            _ => 0,
+        let bytes = if fixed_width_bytes(&literal.value().data_type()).is_some() {
+            0
+        } else {
+            literal
+                .value()
+                .to_array()
+                .ok()?
+                .to_data()
+                .get_slice_memory_size()
+                .ok()?
         };
         return Some(ConsumerProperties {
             constant: true,
@@ -166,12 +171,12 @@ fn consumer_properties(
     }
     // Spark materializes and registers this execution-context value before native execution.
     // Lookup still happens at runtime; it is independent of the current input row or batch.
-    if expr.is::<Subquery>() {
+    if let Some(subquery) = expr.downcast_ref::<Subquery>() {
         return Some(ConsumerProperties {
             constant: true,
             has_scalar_struct: false,
             bytes: 0,
-            unbounded_output: false,
+            unbounded_output: fixed_width_bytes(&subquery.data_type).is_none(),
         });
     }
     if expr.is::<Column>() {

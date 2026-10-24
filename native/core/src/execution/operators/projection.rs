@@ -673,8 +673,43 @@ mod tests {
             ));
         for (value, inline) in [
             (growing, false),
-            (Arc::new(Literal::new(wide)) as Arc<dyn PhysicalExpr>, false),
+            (
+                Arc::new(Literal::new(wide.clone())) as Arc<dyn PhysicalExpr>,
+                false,
+            ),
             (ordinary_field, false),
+            (
+                Arc::new(Literal::new(ScalarValue::List(ScalarValue::new_list(
+                    &[wide],
+                    &DataType::Utf8,
+                    false,
+                )))) as Arc<dyn PhysicalExpr>,
+                false,
+            ),
+            (
+                Arc::new(Subquery::new(0, 0, DataType::Utf8)) as Arc<dyn PhysicalExpr>,
+                false,
+            ),
+            (
+                Arc::new(Subquery::new(0, 0, DataType::Binary)) as Arc<dyn PhysicalExpr>,
+                false,
+            ),
+            (
+                Arc::new(Subquery::new(0, 0, DataType::Int64)) as Arc<dyn PhysicalExpr>,
+                true,
+            ),
+            (
+                Arc::new(Literal::new(ScalarValue::List(ScalarValue::new_list(
+                    &[
+                        ScalarValue::Int64(Some(1)),
+                        ScalarValue::Int64(Some(2)),
+                        ScalarValue::Int64(Some(3)),
+                    ],
+                    &DataType::Int64,
+                    false,
+                )))) as Arc<dyn PhysicalExpr>,
+                true,
+            ),
             (small, true),
         ] {
             let outer = ProjectionExprs::from(vec![
