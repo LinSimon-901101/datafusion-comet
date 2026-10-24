@@ -1507,3 +1507,166 @@ fn bounded_boolean_and_decimal_casts_keep_full_batches() {
         }
     }
 }
+
+#[test]
+fn bounded_conditional_projection_does_not_split_to_single_rows() {
+    use datafusion::logical_expr::Operator;
+    use datafusion::physical_expr::expressions::{BinaryExpr, Column};
+    use datafusion_comet_spark_expr::{Cast, EvalMode, IfExpr, SparkCastOptions};
+    let rows = 8192;
+    let batch = batch(rows);
+    let schema = batch.schema();
+    let field = ScalarSubqueryConsumer::wrap_with_schema(
+        field(ScalarValue::Int64(Some(262144))),
+        Arc::clone(&schema),
+    );
+    let cast = ScalarSubqueryConsumer::wrap_with_schema(
+        Arc::new(Cast::new(
+            field,
+            DataType::Utf8,
+            SparkCastOptions::new(EvalMode::Legacy, "UTC"),
+            None,
+            None,
+        )),
+        Arc::clone(&schema),
+    );
+    // The signed integer formatting bound already preserves a complete input batch.
+    assert!(ScalarSubqueryConsumer::projection_max_rows(&cast, &schema)
+        .is_some_and(|max_rows| max_rows >= rows));
+    let condition: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::new(Column::new("id", 0)),
+        Operator::Lt,
+        Arc::new(Literal::new(ScalarValue::Int64(Some(4096)))),
+    ));
+    let conditional = ScalarSubqueryConsumer::wrap_with_schema(
+        Arc::new(IfExpr::new(
+            condition,
+            cast,
+            Arc::new(Literal::new(ScalarValue::Utf8(Some("x".into())))),
+        )),
+        Arc::clone(&schema),
+    );
+    // Expression evaluation is correct. This check alone does not test ProjectionBuilder.
+    let output = conditional
+        .evaluate(&batch)
+        .unwrap()
+        .into_array(rows)
+        .unwrap();
+    let output = output.as_any().downcast_ref::<StringArray>().unwrap();
+    assert_eq!(output.value(0), "262144");
+    assert_eq!(output.value(4095), "262144");
+    assert_eq!(output.value(4096), "x");
+    assert_eq!(output.value(8191), "x");
+    let cap = ScalarSubqueryConsumer::projection_max_rows(&conditional, &schema);
+    assert!(
+        cap.is_some_and(|max_rows| max_rows >= rows),
+        "both branches have a small upper bound, got {cap:?}"
+    );
+}
+
+#[test]
+fn bounded_selection_and_array_outputs_keep_full_batches() {
+    use datafusion::functions_nested::make_array::MakeArray;
+    use datafusion::logical_expr::{Operator, Volatility};
+    use datafusion::physical_expr::expressions::{BinaryExpr, Column};
+    use datafusion_comet_spark_expr::{CaseWhenExpr, Cast, EvalMode, SparkCastOptions};
+    use datafusion_functions::core::{greatest::GreatestFunc, least::LeastFunc};
+
+    let input = batch(8192);
+    let schema = input.schema();
+    let sum: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        field(ScalarValue::Int64(Some(262144))),
+        Operator::Plus,
+        Arc::new(Column::new("id", 0)),
+    ));
+    let text = ScalarSubqueryConsumer::wrap_with_schema(
+        Arc::new(Cast::new(
+            sum,
+            DataType::Utf8,
+            SparkCastOptions::new(EvalMode::Legacy, "UTC"),
+            None,
+            None,
+        )),
+        schema.clone(),
+    );
+    let literal: Arc<dyn PhysicalExpr> =
+        Arc::new(Literal::new(ScalarValue::Utf8(Some("x".into()))));
+    let predicate: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::new(Column::new("id", 0)),
+        Operator::Lt,
+        Arc::new(Literal::new(ScalarValue::Int64(Some(4096)))),
+    ));
+    // COALESCE uses the same native CaseWhen expression after Scala serialization.
+    let choice: Arc<dyn PhysicalExpr> = Arc::new(
+        CaseWhenExpr::try_new(
+            vec![(predicate.clone(), text.clone())],
+            Some(literal.clone()),
+        )
+        .unwrap(),
+    );
+    let greatest: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+        "greatest",
+        Arc::new(ScalarUDF::new_from_impl(GreatestFunc::new())),
+        vec![text.clone(), literal.clone()],
+        Arc::new(Field::new("greatest", DataType::Utf8, true)),
+        Arc::new(ConfigOptions::default()),
+    ));
+    let least: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+        "least",
+        Arc::new(ScalarUDF::new_from_impl(LeastFunc::new())),
+        vec![text.clone(), literal.clone()],
+        Arc::new(Field::new("least", DataType::Utf8, true)),
+        Arc::new(ConfigOptions::default()),
+    ));
+    let array: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+        "make_array",
+        Arc::new(ScalarUDF::new_from_impl(MakeArray::new())),
+        vec![choice.clone(), literal],
+        Arc::new(Field::new(
+            "array",
+            DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+            true,
+        )),
+        Arc::new(ConfigOptions::default()),
+    ));
+    for original in [choice, greatest, least, array] {
+        let expected = original.evaluate(&input).unwrap().into_array(8192).unwrap();
+        let wrapped = ScalarSubqueryConsumer::wrap_with_schema(original, schema.clone());
+        assert!(
+            ScalarSubqueryConsumer::projection_max_rows(&wrapped, &schema)
+                .is_some_and(|rows| rows >= 8192),
+            "a bounded selection/constructor should retain a complete input batch: {wrapped}"
+        );
+        let actual = wrapped.evaluate(&input).unwrap().into_array(8192).unwrap();
+        assert_eq!(actual.to_data(), expected.to_data());
+    }
+
+    let unknown_schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("unknown", DataType::Utf8, true),
+    ]);
+    let unknown: Arc<dyn PhysicalExpr> = Arc::new(
+        CaseWhenExpr::try_new(
+            vec![(predicate, text.clone())],
+            Some(Arc::new(Column::new("unknown", 1))),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        ScalarSubqueryConsumer::projection_max_rows(&unknown, &unknown_schema),
+        Some(1),
+        "one known branch must not hide an unconstrained string branch"
+    );
+    let opaque = udf(
+        "greatest",
+        vec![text],
+        DataType::Utf8,
+        Volatility::Immutable,
+        Arc::new(|args| Ok(args[0].clone())),
+    );
+    assert_eq!(
+        ScalarSubqueryConsumer::projection_max_rows(&opaque, &schema),
+        Some(1),
+        "a function name must not authorize an opaque implementation's output bound"
+    );
+}

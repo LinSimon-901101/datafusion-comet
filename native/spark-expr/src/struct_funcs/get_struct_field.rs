@@ -54,7 +54,7 @@ impl GetStructField {
 
     /// Read only an already-materialized literal field for consumer sizing. Do not evaluate
     /// expressions or include unrelated sibling fields in the repeated-input estimate.
-    pub(crate) fn literal_field(&self) -> Option<ArrayRef> {
+    pub fn literal_field(&self) -> Option<ArrayRef> {
         let value: ArrayRef = if let Some(literal) = self.child.downcast_ref::<Literal>() {
             let ScalarValue::Struct(value) = literal.value() else {
                 return None;

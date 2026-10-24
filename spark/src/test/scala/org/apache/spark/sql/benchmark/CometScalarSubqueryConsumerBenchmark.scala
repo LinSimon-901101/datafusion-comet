@@ -60,10 +60,13 @@ object CometScalarSubqueryConsumerBenchmark extends CometBenchmarkBase {
     CometConf.COMET_ENABLED.key -> comet.toString,
     CometConf.COMET_EXEC_ENABLED.key -> comet.toString)
 
-  private def consume(query: String, comet: Boolean): Seq[Row] =
+  private def consume(query: String, comet: Boolean): Seq[Row] = {
+    var result = Seq.empty[Row]
     withSQLConf(configs(comet): _*) {
-      spark.sql(query).collect().toSeq
+      result = spark.sql(query).collect().toSeq
     }
+    result
+  }
 
   private def measure(name: String, query: String, merged: Boolean, rows: Long): Unit = {
     runBenchmark(name) {

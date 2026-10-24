@@ -3810,6 +3810,22 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar review row aggregates avoid materializing retained wide aliases") {
+    withScalarReviewTables {
+      val query = "SELECT count(s), sum(octet_length(s)), sum(octet_length(m)) FROM " +
+        "(SELECT (SELECT max(s) FROM review_wide) s, " +
+        "(SELECT min(s) FROM review_wide) m FROM review_outer) q"
+      val df = sql(query)
+      checkSparkAnswer(df)
+      assert(
+        df.queryExecution.executedPlan.exists {
+          case p: ProjectExec => p.projectList.exists(_.name == "s")
+          case _ => false
+        },
+        df.queryExecution.executedPlan)
+    }
+  }
+
   test("scalar review integer subqueries cannot hide wide stateful or dispatched intermediates") {
     withScalarReviewTables {
       Seq("monotonically_increasing_id() >= 0", "upper(CAST(id AS STRING)) <> 'missing'")

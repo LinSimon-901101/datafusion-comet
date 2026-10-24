@@ -54,6 +54,15 @@ pub struct ScalarSubqueryConsumer {
 const SCALAR_INPUT_BYTES: usize = 1024 * 1024;
 
 impl ScalarSubqueryConsumer {
+    pub fn inner(&self) -> &Arc<dyn PhysicalExpr> {
+        &self.inner
+    }
+
+    /// Projection inlining must not move opaque or stateful consumers onto a new batch.
+    pub fn supports_sliced_evaluation(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+        consumer_properties(expr, schema).is_some()
+    }
+
     /// Cap a producing projection's input before a scalar value becomes an output column.
     /// Reducing expressions and ordinary literals/columns retain their normal batch size.
     pub fn projection_max_rows(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option<usize> {
@@ -318,15 +327,29 @@ fn bounded_output_bytes(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option
     }
     if let Some(field) = expr.downcast_ref::<GetStructField>() {
         if let Some(value) = field.literal_field() {
-            return Some(value.get_buffer_memory_size());
+            return value.to_data().get_slice_memory_size().ok();
         }
     }
     if let Some(literal) = expr.downcast_ref::<Literal>() {
-        return Some(literal.value().to_array().ok()?.get_buffer_memory_size());
+        return literal
+            .value()
+            .to_array()
+            .ok()?
+            .to_data()
+            .get_slice_memory_size()
+            .ok();
     }
     let dt = expr.data_type(schema).ok()?;
     if let Some(bytes) = fixed_width_bytes(&dt) {
         return Some(bytes);
+    }
+    let choice = expr
+        .downcast_ref::<CaseWhenExpr>()
+        .or_else(|| expr.downcast_ref::<IfExpr>().map(IfExpr::case_when));
+    if let Some(choice) = choice {
+        return choice.values().try_fold(0usize, |bound, value| {
+            Some(bound.max(bounded_output_bytes(value, schema)?))
+        });
     }
     let cast_child = expr
         .downcast_ref::<Cast>()
@@ -355,6 +378,15 @@ fn bounded_output_bytes(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option
         }
     }
     if let Some(fun) = expr.downcast_ref::<ScalarFunctionExpr>() {
+        let implementation = fun.fun().inner();
+        if implementation.is::<datafusion_functions::core::greatest::GreatestFunc>()
+            || implementation.is::<datafusion_functions::core::least::LeastFunc>()
+            || implementation.is::<crate::SparkGreatestLeast>()
+        {
+            return fun.args().iter().try_fold(0usize, |bound, value| {
+                Some(bound.max(bounded_output_bytes(value, schema)?))
+            });
+        }
         if fun.fun().name() == "make_array" {
             // Arity bounds the list cardinality; each child bounds its one element's bytes.
             return fun.args().iter().try_fold(5usize, |total, child| {

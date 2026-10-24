@@ -240,6 +240,14 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
           (!original.isInstanceOf[ProjectExec] ||
             wideChildren.exists(_.getTagValue(structSubqueryRowPath).contains(true))))) {
         plan.setTagValue(structSubqueryRowPath, true)
+        // Avoid copying wide aliases into Arrow immediately before their Spark row consumer.
+        def keepWideInputsOnRows(p: SparkPlan): Unit = {
+          if (wideOutput(p)) {
+            p.setTagValue(structSubqueryRowPath, true)
+            provenanceChildren(p).foreach(keepWideInputsOnRows)
+          }
+        }
+        wideChildren.foreach(keepWideInputsOnRows)
       }
       val outputs = plan.output.iterator.map(_.exprId).filter(sources.contains).toSet
       remember(plan, outputs)
@@ -278,13 +286,6 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
     case ArrayType(elementType, _) => containsCalendarType(elementType)
     case MapType(keyType, valueType, _) =>
       containsCalendarType(keyType) || containsCalendarType(valueType)
-    case _ => false
-  }
-
-  private def containsVariableWidth(dt: DataType): Boolean = dt match {
-    case StringType | BinaryType => true
-    case s: StructType => s.fields.exists(f => containsVariableWidth(f.dataType))
-    case ArrayType(elementType, _) => containsVariableWidth(elementType)
     case _ => false
   }
 
@@ -353,6 +354,9 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
         case conditional: CaseWhen =>
           val values = conditional.branches.map(_._2) ++ conditional.elseValue.toSeq
           val bounds = values.map(boundedResultBytes)
+          if (bounds.forall(_.isDefined)) Some(bounds.flatten.foldLeft(0L)(math.max)) else None
+        case _: Coalesce | _: Greatest | _: Least =>
+          val bounds = expr.children.map(boundedResultBytes)
           if (bounds.forall(_.isDefined)) Some(bounds.flatten.foldLeft(0L)(math.max)) else None
         case _: Alias | _: KnownNotNull | _: KnownNullable | _: TryEval | _: SortOrder =>
           expr.children.headOption.flatMap(boundedResultBytes)

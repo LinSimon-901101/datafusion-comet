@@ -600,7 +600,7 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     val reducer = ProjectExec(Seq(reduced), consumer)
     val ancestor = ProjectExec(Seq(Alias(reduced.toAttribute, "result")()), reducer)
     CometScalarSubquery.tagPlanInputs(ancestor)
-    assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty)
+    assert(CometScalarSubquery.rowPathFallbackReason(producer).isDefined)
     assert(CometScalarSubquery.rowPathFallbackReason(consumer).isDefined)
     assert(CometScalarSubquery.rowPathFallbackReason(reducer).isDefined)
     assert(CometScalarSubquery.rowPathFallbackReason(ancestor).isEmpty)
@@ -632,7 +632,9 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
       }
       val reducer = ProjectExec(Seq(Alias(OctetLength(repeated), "length")()), producer)
       CometScalarSubquery.tagPlanInputs(reducer)
-      assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty, dt)
+      assert(
+        CometScalarSubquery.rowPathFallbackReason(producer).isDefined == (dt == StringType),
+        dt)
       assert(CometScalarSubquery.rowPathFallbackReason(reducer).isDefined, dt)
     }
   }
@@ -739,7 +741,7 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     val union = UnionExec(Seq(wide, bounded))
     val consumer = ProjectExec(Seq(Alias(OctetLength(union.output.head), "length")()), union)
     CometScalarSubquery.tagPlanInputs(consumer)
-    assert(CometScalarSubquery.rowPathFallbackReason(wide).isEmpty)
+    assert(CometScalarSubquery.rowPathFallbackReason(wide).isDefined)
     assert(CometScalarSubquery.rowPathFallbackReason(union).isDefined)
     assert(CometScalarSubquery.rowPathFallbackReason(consumer).isDefined)
     assert(CometScalarSubquery.rowPathFallbackReason(bounded).isEmpty)
@@ -758,7 +760,7 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
         val consumer = FilterExec(IsNotNull(reused.output.head), reused)
         CometScalarSubquery.tagPlanInputs(consumer)
         val wide = value.dataType == StringType && !value.isInstanceOf[Cast]
-        assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty, value)
+        assert(CometScalarSubquery.rowPathFallbackReason(producer).isDefined == wide, value)
         assert(CometScalarSubquery.rowPathFallbackReason(consumer).isDefined == wide, value)
         CometScalarSubquery.withPlanInputs(consumer) {
           assert(
