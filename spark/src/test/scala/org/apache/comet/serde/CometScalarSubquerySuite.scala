@@ -20,7 +20,7 @@
 package org.apache.comet.serde
 
 import org.apache.spark.sql.{CometTestBase, Row}
-import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Ascending, AttributeReference, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, FromUTCTimestamp, GetStructField, GreaterThan, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Minute, NamedExpression, Not, OctetLength, PreciseTimestampConversion, Rand, Second, SecondsToTimestamp, SortOrder, StringLPad, StringRepeat, StringRPad, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, UnixTimestamp, WeekDay}
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Ascending, AttributeReference, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, ConcatWs, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, FromUTCTimestamp, GetStructField, GreaterThan, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Minute, NamedExpression, Not, OctetLength, PreciseTimestampConversion, Rand, Second, SecondsToTimestamp, SortOrder, StringLPad, StringRepeat, StringRPad, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, UnixTimestamp, WeekDay}
 import org.apache.spark.sql.execution.{FilterExec, ProjectExec, ScalarSubquery, SubqueryExec}
 import org.apache.spark.sql.types._
 
@@ -60,6 +60,14 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
       assert(CometScalarSubquery.consumerFallbackReason(fallible).isDefined)
       assert(CometScalarSubquery.broadcastBuildKeysFallbackReason(Seq(total)).isEmpty)
       assert(CometScalarSubquery.broadcastBuildKeysFallbackReason(Seq(cast)).isDefined)
+      val scalarText = GetStructField(subquery(struct(StringType)), 0)
+      val concat = ConcatWs(Seq(Literal.create(null, StringType), scalarText))
+      assert(CometScalarSubquery.consumerFallbackReason(concat).isEmpty)
+      val parsed = Cast(Cast(scalarText, IntegerType, None, EvalMode.ANSI), StringType)
+      assert(
+        CometScalarSubquery
+          .consumerFallbackReason(concat.copy(children = Seq(concat.children.head, parsed)))
+          .isDefined)
       val pad = StringLPad(Literal("x"), Literal(8), Literal("0"))
       assert(CometScalarSubquery.consumerFallbackReason(pad).isEmpty)
       val unknownLength = pad.copy(len = AttributeReference("length", IntegerType)())

@@ -815,6 +815,13 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
       // Generated string concat skips after NULL; interpreted string concat evaluates every arg.
       case _: Concat if hasSkippedObservableArgument(expr) =>
         Some("Ordered concat consumers of struct scalar subqueries require Spark")
+      // Spark evaluates concat_ws arguments even when its separator is NULL. The native
+      // literal-NULL rewrite must not erase an error or stateful evaluation in those arguments.
+      case concat: ConcatWs if concat.children.headOption.exists {
+            case Literal(null, _) => true
+            case _ => false
+          } && hasSkippedObservableArgument(concat) =>
+        Some("NULL-separator concat_ws struct scalar subquery arguments require Spark evaluation")
       case _
           if (isNullIntolerant(expr) || isNativeNullShortCircuitFamily(expr)) &&
             hasSkippedObservableArgument(expr) && !hasNativeNullShortCircuit(expr) =>

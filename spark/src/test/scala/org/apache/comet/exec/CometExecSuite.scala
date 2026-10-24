@@ -3721,6 +3721,48 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar review NULL concat_ws preserves eager scalar errors") {
+    withScalarReviewTables {
+      val maximum = "(SELECT max(txt) FROM review_items)"
+      val minimum = "(SELECT min(txt) FROM review_items)"
+      for {
+        dispatch <- Seq(false, true)
+        comet <- Seq(false, true)
+      } {
+        withSQLConf(
+          CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key -> dispatch.toString,
+          CometConf.COMET_ENABLED.key -> comet.toString) {
+          val df = sql(
+            s"SELECT concat_ws(CAST(NULL AS STRING), CAST(CAST($maximum AS INT) AS STRING)), " +
+              s"$minimum FROM review_items")
+          assert(
+            df.queryExecution.optimizedPlan.exists(_.expressions.exists(_.exists {
+              case GetStructField(_: LogicalScalarSubquery, _, _) => true
+              case _ => false
+            })),
+            df.queryExecution.optimizedPlan.toString)
+          if (comet) {
+            val reason =
+              new ExtendedExplainInfo().generateExtendedInfo(df.queryExecution.executedPlan)
+            assert(reason.contains("NULL-separator concat_ws"), reason)
+          }
+          val error = intercept[Exception](df.collect())
+          val first = Iterator
+            .iterate[Throwable](error)(_.getCause)
+            .takeWhile(_ != null)
+            .collectFirst {
+              case e: org.apache.spark.SparkThrowable if e.getErrorClass != null =>
+                (e.getErrorClass, e.getSqlState)
+            }
+          assert(first.contains(("CAST_INVALID_INPUT", "22018")), error)
+        }
+      }
+      val safe =
+        sql(s"SELECT concat_ws(CAST(NULL AS STRING), $maximum), $minimum FROM review_items")
+      checkSparkAnswerAndOperator(safe, Seq(classOf[CometProjectExec]))
+    }
+  }
+
   test("scalar review padding wrappers track subplan merging across versions") {
     withScalarReviewTables {
       val df = sql(
