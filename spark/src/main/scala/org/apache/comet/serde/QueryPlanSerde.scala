@@ -1439,7 +1439,9 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
   }
 
   private[serde] def usesGeneratedExpressionEvaluation: Boolean =
-    SQLConf.get.codegenFactoryMode.toString != CodegenObjectFactoryMode.NO_CODEGEN.toString
+    !SQLConf.get
+      .getConfString("spark.sql.codegen.factoryMode", "FALLBACK")
+      .equalsIgnoreCase("NO_CODEGEN")
 
   /** A common child or operator-wide discovery alone does not prove eager evaluation. */
   private[serde] def isEagerSharedSubexpression(expr: Expression): Boolean =
