@@ -22,7 +22,7 @@ package org.apache.comet.serde
 import scala.jdk.CollectionConverters._
 import scala.util.DynamicVariable
 
-import org.apache.spark.sql.catalyst.expressions.{Add, Alias, And, ArrayContains, ArrayPosition, ArrayRemove, ArraysOverlap, ArraysZip, ArrayUnion, Ascii, Attribute, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, Concat, ConcatWs, CreateArray, CreateMap, CreateNamedStruct, DateFormatClass, DateFromUnixDate, DayOfWeek, Divide, DivModLike, ElementAt, EqualNullSafe, EqualTo, EvalMode, Expression, ExprId, GetArrayItem, GetArrayStructFields, GetMapValue, GetStructField, GreaterThan, GreaterThanOrEqual, Greatest, Hour, If, In, InSet, IntegralDivide, IsNaN, IsNotNull, IsNull, KnownFloatingPointNormalized, KnownNotNull, KnownNullable, LambdaFunction, Least, Length, LessThan, LessThanOrEqual, Literal, Log, Log10, Log2, Lower, MapFromArrays, Minute, Multiply, Murmur3Hash, NamedExpression, Not, OctetLength, Or, Pmod, PreciseTimestampConversion, Rand, RegExpExtract, RegExpExtractAll, Remainder, Reverse, ScalaUDF, Second, Size, Slice, SortOrder, SpecifiedWindowFrame, StringLPad, StringRepeat, StringRPad, Subtract, ToUnixTimestamp, TryEval, UnixDate, UnixTimestamp, Upper, WeekDay, WindowSpecDefinition, XxHash64}
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, And, ArrayContains, ArrayPosition, ArrayRemove, ArraysOverlap, ArraysZip, ArrayUnion, Ascii, Attribute, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, Concat, ConcatWs, CreateArray, CreateMap, CreateNamedStruct, DateFormatClass, DateFromUnixDate, DayOfWeek, Divide, DivModLike, ElementAt, EqualNullSafe, EqualTo, EvalMode, Expression, ExprId, GetArrayItem, GetArrayStructFields, GetMapValue, GetStructField, GreaterThan, GreaterThanOrEqual, Greatest, Hour, If, In, InSet, IntegralDivide, IsNaN, IsNotNull, IsNull, KnownFloatingPointNormalized, KnownNotNull, KnownNullable, LambdaFunction, Least, Length, LessThan, LessThanOrEqual, Literal, Log, Log10, Log2, Lower, MapFromArrays, Minute, Multiply, Murmur3Hash, NamedExpression, Not, OctetLength, Or, Pmod, PreciseTimestampConversion, Rand, RegExpExtract, RegExpExtractAll, Remainder, Reverse, Round, ScalaUDF, Second, Size, Slice, SortOrder, SpecifiedWindowFrame, StringLPad, StringRepeat, StringRPad, Subtract, ToUnixTimestamp, TryEval, UnixDate, UnixTimestamp, Upper, WeekDay, WindowSpecDefinition, XxHash64}
 import org.apache.spark.sql.catalyst.expressions.aggregate.Sum
 import org.apache.spark.sql.catalyst.expressions.objects.StaticInvoke
 import org.apache.spark.sql.catalyst.optimizer.NormalizeNaNAndZero
@@ -380,10 +380,7 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
             case _ => None
           }
         case concat: Concat => sumBounds(concat.children.map(boundedResultBytes), 5)
-        case concat: ConcatWs if concat.children.headOption.exists {
-              case Literal(null, _) => true
-              case _ => false
-            } =>
+        case concat: ConcatWs if hasLiteralNullSeparator(concat) =>
           Some(0L)
         case array: CreateArray => sumBounds(array.children.map(boundedResultBytes), 5)
         case zip: ArraysZip if zip.children.forall(_.isInstanceOf[CreateArray]) =>
@@ -418,6 +415,12 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
   private def fitsConsumerBatch(expr: Expression): Boolean =
     boundedResultBytes(expr).exists(
       _ <= scalarInputBytes / math.max(1, CometConf.COMET_BATCH_SIZE.get()))
+
+  private def hasLiteralNullSeparator(concat: ConcatWs): Boolean =
+    concat.children.headOption match {
+      case Some(Literal(null, _)) => true
+      case _ => false
+    }
 
   private def paddingBytes(length: Expression): Option[Long] = length match {
     case Literal(value: Int, IntegerType) => Some(math.max(0L, value.toLong) * 4 + 5)
@@ -817,11 +820,16 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
         Some("Ordered concat consumers of struct scalar subqueries require Spark")
       // Spark evaluates concat_ws arguments even when its separator is NULL. The native
       // literal-NULL rewrite must not erase an error or stateful evaluation in those arguments.
-      case concat: ConcatWs if concat.children.headOption.exists {
-            case Literal(null, _) => true
-            case _ => false
-          } && hasSkippedObservableArgument(concat) =>
+      case concat: ConcatWs
+          if hasLiteralNullSeparator(concat) &&
+            (hasSkippedObservableArgument(concat) ||
+              concat.exists(_.isInstanceOf[BloomFilterMightContain])) =>
         Some("NULL-separator concat_ws struct scalar subquery arguments require Spark evaluation")
+      // Round's NULL-scale rewrite also erases child code generation and its Bloom setup.
+      case round: Round
+          if QueryPlanSerde.usesGeneratedExpressionEvaluation && round.scale.nullable &&
+            round.child.exists(_.isInstanceOf[BloomFilterMightContain]) =>
+        Some("Nullable-scale round initialization of struct scalar subqueries requires Spark")
       case _
           if (isNullIntolerant(expr) || isNativeNullShortCircuitFamily(expr)) &&
             hasSkippedObservableArgument(expr) && !hasNativeNullShortCircuit(expr) =>

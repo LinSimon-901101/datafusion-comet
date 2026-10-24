@@ -3726,10 +3726,12 @@ class CometExecSuite extends CometTestBase {
       val maximum = "(SELECT max(txt) FROM review_items)"
       val minimum = "(SELECT min(txt) FROM review_items)"
       for {
+        mode <- Seq("CODEGEN_ONLY", "NO_CODEGEN")
         dispatch <- Seq(false, true)
         comet <- Seq(false, true)
       } {
         withSQLConf(
+          "spark.sql.codegen.factoryMode" -> mode,
           CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key -> dispatch.toString,
           CometConf.COMET_ENABLED.key -> comet.toString) {
           val df = sql(

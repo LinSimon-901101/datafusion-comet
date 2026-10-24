@@ -20,7 +20,7 @@
 package org.apache.comet.serde
 
 import org.apache.spark.sql.{CometTestBase, Row}
-import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Ascending, AttributeReference, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, ConcatWs, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, FromUTCTimestamp, GetStructField, GreaterThan, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Minute, NamedExpression, Not, OctetLength, PreciseTimestampConversion, Rand, Second, SecondsToTimestamp, SortOrder, StringLPad, StringRepeat, StringRPad, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, UnixTimestamp, WeekDay}
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Ascending, AttributeReference, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, ConcatWs, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, FromUTCTimestamp, GetStructField, GreaterThan, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Minute, NamedExpression, Not, OctetLength, PreciseTimestampConversion, Rand, Round, Second, SecondsToTimestamp, SortOrder, StringLPad, StringRepeat, StringRPad, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, UnixTimestamp, WeekDay}
 import org.apache.spark.sql.execution.{FilterExec, ProjectExec, ScalarSubquery, SubqueryExec}
 import org.apache.spark.sql.types._
 
@@ -120,6 +120,15 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
           CometScalarSubquery.consumerFallbackReason(conditional).isDefined ==
             (mode == "NO_CODEGEN"))
         assert(CometScalarSubquery.broadcastBuildKeysFallbackReason(Seq(bloom)).isDefined)
+        val text = If(bloom, Literal("x"), Literal("y"))
+        val concat = ConcatWs(Seq(Literal.create(null, StringType), text))
+        assert(CometScalarSubquery.consumerFallbackReason(concat).isDefined)
+        val round = Round(Cast(bloom, LongType), Literal.create(null, IntegerType))
+        assert(
+          CometScalarSubquery.consumerFallbackReason(round).isDefined == (mode != "NO_CODEGEN"))
+        assert(CometScalarSubquery.consumerFallbackReason(round.copy(scale = Literal(0))).isEmpty)
+        val parsed = Cast(GetStructField(subquery(struct(StringType)), 0), LongType)
+        assert(CometScalarSubquery.consumerFallbackReason(round.copy(child = parsed)).isEmpty)
       }
     }
   }
