@@ -58,9 +58,18 @@ impl ScalarSubqueryConsumer {
         &self.inner
     }
 
-    /// Projection inlining must not move opaque or stateful consumers onto a new batch.
-    pub fn supports_sliced_evaluation(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
-        consumer_properties(expr, schema).is_some()
+    /// Inlining retires an input cap. Marked roots regain their consumer guard; unmarked
+    /// siblings must be pure and fit a full batch without relying on the retired cap.
+    pub fn supports_sliced_evaluation(
+        expr: &Arc<dyn PhysicalExpr>,
+        schema: &Schema,
+        batch_size: usize,
+    ) -> bool {
+        consumer_properties(expr, schema).is_some_and(|properties| {
+            properties.has_scalar_struct
+                || (!properties.unbounded_output
+                    && properties.bytes <= SCALAR_INPUT_BYTES / batch_size.max(1))
+        })
     }
 
     /// Cap a producing projection's input before a scalar value becomes an output column.

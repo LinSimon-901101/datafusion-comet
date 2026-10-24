@@ -91,12 +91,10 @@ impl OperatorBuilder for ProjectionBuilder {
                 }
             }
         }
-        let (input, exprs) = inline_scalar_alias_projection(Arc::clone(&child.native_plan), exprs)?;
-        let input = bound_projection_input(
-            input,
-            &exprs,
-            planner.session_ctx().copied_config().batch_size(),
-        );
+        let batch_size = planner.session_ctx().copied_config().batch_size();
+        let (input, exprs) =
+            inline_scalar_alias_projection(Arc::clone(&child.native_plan), exprs, batch_size)?;
+        let input = bound_projection_input(input, &exprs, batch_size);
         let projection = Arc::new(ProjectionExec::try_new(exprs.iter().cloned(), input)?);
 
         let spark_plan = if child.plan_id == spark_plan.plan_id {
@@ -121,6 +119,7 @@ impl OperatorBuilder for ProjectionBuilder {
 fn inline_scalar_alias_projection(
     mut input: Arc<dyn ExecutionPlan>,
     mut exprs: ProjectionExprs,
+    batch_size: usize,
 ) -> Result<(Arc<dyn ExecutionPlan>, ProjectionExprs)> {
     while let Some(inner) = input.downcast_ref::<ProjectionExec>() {
         let Some(cap) = inner.input().downcast_ref::<ProjectionInputBatchExec>() else {
@@ -155,10 +154,9 @@ fn inline_scalar_alias_projection(
         })?;
         let mapped = inner.projection_expr().try_merge(&unwrapped)?;
         let schema = cap.input.schema();
-        if !mapped
-            .iter()
-            .all(|expr| ScalarSubqueryConsumer::supports_sliced_evaluation(&expr.expr, &schema))
-        {
+        if !mapped.iter().all(|expr| {
+            ScalarSubqueryConsumer::supports_sliced_evaluation(&expr.expr, &schema, batch_size)
+        }) {
             break;
         }
         exprs = mapped.try_map_exprs(|expr| {
@@ -273,11 +271,12 @@ mod tests {
     use arrow::buffer::NullBuffer;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use datafusion::common::ScalarValue;
+    use datafusion::common::{config::ConfigOptions, ScalarValue};
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::execution::context::SessionContext;
-    use datafusion::logical_expr::Operator;
+    use datafusion::logical_expr::{Operator, ScalarUDF};
     use datafusion::physical_expr::expressions::{BinaryExpr, IsNotNullExpr, IsNullExpr, Literal};
+    use datafusion::physical_expr::ScalarFunctionExpr;
     use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use datafusion_comet_spark_expr::{
         Cast, EvalMode, GetStructField, IfExpr, RandExpr, SparkCastOptions, Subquery,
@@ -534,7 +533,7 @@ mod tests {
                                 .unwrap()
                                 .schema();
                         let (base, mapped) =
-                            inline_scalar_alias_projection(producer, outer).unwrap();
+                            inline_scalar_alias_projection(producer, outer, rows).unwrap();
                         assert!(
                             Arc::ptr_eq(&base, &input),
                             "retire the producer and its obsolete cap"
@@ -618,7 +617,10 @@ mod tests {
             ))),
             0,
         ));
-        let pure = ProjectionExprs::from(vec![ProjectionExpr::new(Arc::clone(&field), "alias")]);
+        let pure = ProjectionExprs::from(vec![
+            ProjectionExpr::new(Arc::clone(&field), "alias"),
+            ProjectionExpr::new(Arc::new(Column::new("id", 0)), "id"),
+        ]);
         let cap = bound_projection_input(Arc::clone(&input), &pure, 8192);
         assert!(cap.is::<ProjectionInputBatchExec>());
         let producer: Arc<dyn ExecutionPlan> =
@@ -635,8 +637,63 @@ mod tests {
             reducer().as_ref()[0].clone(),
             ProjectionExpr::new(Arc::new(RandExpr::new(42)), "random"),
         ]);
-        let (kept, _) = inline_scalar_alias_projection(Arc::clone(&producer), opaque).unwrap();
+        let (kept, _) =
+            inline_scalar_alias_projection(Arc::clone(&producer), opaque, 8192).unwrap();
         assert!(Arc::ptr_eq(&kept, &producer));
+
+        // Retiring the cap must not expose independent unmarked payloads or growing siblings.
+        let growing: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+            "repeat",
+            Arc::new(ScalarUDF::new_from_impl(
+                datafusion::functions::string::repeat::RepeatFunc::new(),
+            )),
+            vec![
+                Arc::new(Literal::new(ScalarValue::Utf8(Some("x".to_owned())))),
+                Arc::new(Column::new("id", 1)),
+            ],
+            Arc::new(Field::new("repeat", DataType::Utf8, true)),
+            Arc::new(ConfigOptions::default()),
+        ));
+        let wide = ScalarValue::Utf8(Some("w".repeat(65536)));
+        let ordinary_field: Arc<dyn PhysicalExpr> = Arc::new(GetStructField::new(
+            Arc::new(Literal::new(ScalarValue::Struct(Arc::new(
+                StructArray::new(
+                    vec![Field::new("ordinary", DataType::Utf8, false)].into(),
+                    vec![wide.to_array().unwrap()],
+                    None,
+                ),
+            )))),
+            0,
+        ));
+        let small: Arc<dyn PhysicalExpr> =
+            Arc::new(datafusion::physical_expr::expressions::CastExpr::new(
+                Arc::new(Column::new("id", 1)),
+                DataType::Utf8,
+                None,
+            ));
+        for (value, inline) in [
+            (growing, false),
+            (Arc::new(Literal::new(wide)) as Arc<dyn PhysicalExpr>, false),
+            (ordinary_field, false),
+            (small, true),
+        ] {
+            let outer = ProjectionExprs::from(vec![
+                reducer().as_ref()[0].clone(),
+                ProjectionExpr::new(value, "sibling"),
+            ]);
+            let (base, _) =
+                inline_scalar_alias_projection(Arc::clone(&producer), outer, 8192).unwrap();
+            assert_eq!(Arc::ptr_eq(&base, &input), inline);
+            assert_eq!(Arc::ptr_eq(&base, &producer), !inline);
+        }
+        let output = ProjectionExprs::from(vec![ProjectionExpr::new(
+            Arc::new(Column::new("alias", 0)),
+            "wide",
+        )]);
+        let (base, mapped) =
+            inline_scalar_alias_projection(Arc::clone(&producer), output, 8192).unwrap();
+        assert!(Arc::ptr_eq(&base, &input));
+        assert!(bound_projection_input(base, &mapped, 8192).is::<ProjectionInputBatchExec>());
 
         // Even a pure computed producer may throw or change work when duplicated or removed.
         let computed = ProjectionExprs::from(vec![ProjectionExpr::new(
@@ -655,13 +712,17 @@ mod tests {
         assert!(computed_input.is::<ProjectionInputBatchExec>());
         let computed: Arc<dyn ExecutionPlan> =
             Arc::new(ProjectionExec::try_new(computed.iter().cloned(), computed_input).unwrap());
-        let (kept, _) = inline_scalar_alias_projection(Arc::clone(&computed), reducer()).unwrap();
+        let (kept, _) =
+            inline_scalar_alias_projection(Arc::clone(&computed), reducer(), 8192).unwrap();
         assert!(Arc::ptr_eq(&kept, &computed));
 
         // Public metadata overrides cannot be reconstructed from the producer expressions.
         let overridden_schema = Schema::new_with_metadata(
-            vec![Field::new("alias", DataType::Utf8, false)
-                .with_metadata([("comment".to_owned(), "override".to_owned())].into())],
+            vec![
+                Field::new("alias", DataType::Utf8, false)
+                    .with_metadata([("comment".to_owned(), "override".to_owned())].into()),
+                Field::new("id", DataType::Int64, false),
+            ],
             [("schema-marker".to_owned(), "keep".to_owned())].into(),
         );
         let overridden: Arc<dyn ExecutionPlan> = Arc::new(
@@ -672,7 +733,8 @@ mod tests {
             )
             .unwrap(),
         );
-        let (kept, _) = inline_scalar_alias_projection(Arc::clone(&overridden), reducer()).unwrap();
+        let (kept, _) =
+            inline_scalar_alias_projection(Arc::clone(&overridden), reducer(), 8192).unwrap();
         assert!(Arc::ptr_eq(&kept, &overridden));
         assert_eq!(kept.schema().field(0).metadata()["comment"], "override");
         assert_eq!(kept.schema().metadata()["schema-marker"], "keep");
