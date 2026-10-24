@@ -32,7 +32,7 @@ import org.apache.comet.CometSparkSessionExtensions.withFallbackReason
 import org.apache.comet.ConfigEntry
 import org.apache.comet.serde.{CometOperatorSerde, Compatible, OperatorOuterClass, SupportLevel, Unsupported}
 import org.apache.comet.serde.OperatorOuterClass.{MergeInstruction, MergeOutputRow, Operator}
-import org.apache.comet.serde.QueryPlanSerde.{exprToProto, serializeDataType}
+import org.apache.comet.serde.QueryPlanSerde.{exprToProto, operatorExprToProto, serializeDataType}
 
 /**
  * Serde for Spark's `MergeRowsExec` (Spark 3.5+). An instruction is encoded as a condition plus
@@ -67,7 +67,7 @@ object CometMergeRows extends CometOperatorSerde[MergeRowsExec] {
 
       val condition = exprToProto(instr.condition, input)
       val outputs = instr.outputs.map { row =>
-        val exprs = row.map(exprToProto(_, input))
+        val exprs = row.map(operatorExprToProto(_, input))
         if (exprs.forall(_.isDefined)) {
           Some(MergeOutputRow.newBuilder().addAllExprs(exprs.map(_.get).asJava).build())
         } else {

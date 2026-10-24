@@ -348,7 +348,9 @@ class CometNativeShuffleWriter[K, V](
         // Spark evaluates the keys in one projection, whose subexpression elimination sees what
         // they share (see QueryPlanSerde.canShortCircuitNulls)
         val partitionExprs =
-          QueryPlanSerde.withSharedSubexpressions(hashPartitioning.expressions) {
+          QueryPlanSerde.withSharedSubexpressions(
+            hashPartitioning.expressions,
+            eagerSharing = true) {
             hashPartitioning.expressions
               .flatMap(e => QueryPlanSerde.exprToProto(e, outputAttributes))
           }
@@ -386,7 +388,9 @@ class CometNativeShuffleWriter[K, V](
         {
           // As for hash partitioning, Spark evaluates the keys in one projection
           val orderingExprs =
-            QueryPlanSerde.withSharedSubexpressions(rangePartitioning.ordering.map(_.child)) {
+            QueryPlanSerde.withSharedSubexpressions(
+              rangePartitioning.ordering.map(_.child),
+              eagerSharing = true) {
               rangePartitioning.ordering
                 .flatMap(e => QueryPlanSerde.exprToProto(e, outputAttributes))
             }

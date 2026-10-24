@@ -3518,6 +3518,345 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  private def withScalarReviewTables(body: => Unit): Unit = {
+    withSQLConf(
+      SQLConf.ANSI_ENABLED.key -> "true",
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      SQLConf.SUBQUERY_REUSE_ENABLED.key -> "true",
+      SQLConf.SHUFFLE_PARTITIONS.key -> "1",
+      CometConf.COMET_BATCH_SIZE.key -> "8192") {
+      withTempPath { dir =>
+        withTempView("review_items", "review_nums", "review_outer", "review_wide", "review_src") {
+          withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+            Seq((1, "bad"), (2, "2"))
+              .toDF("id", "txt")
+              .coalesce(1)
+              .write
+              .parquet(s"${dir.getCanonicalPath}/review_items")
+            Seq(0, 1)
+              .toDF("k")
+              .coalesce(1)
+              .write
+              .parquet(s"${dir.getCanonicalPath}/review_nums")
+            spark
+              .range(8192)
+              .coalesce(1)
+              .write
+              .parquet(s"${dir.getCanonicalPath}/review_outer")
+            Seq("a" * 262144, "b" * 262144)
+              .toDF("s")
+              .coalesce(1)
+              .write
+              .parquet(s"${dir.getCanonicalPath}/review_wide")
+            Seq(262144)
+              .toDF("n")
+              .coalesce(1)
+              .write
+              .parquet(s"${dir.getCanonicalPath}/review_src")
+          }
+          Seq("review_items", "review_nums", "review_outer", "review_wide", "review_src")
+            .foreach { name =>
+              spark.read.parquet(s"${dir.getCanonicalPath}/$name").createOrReplaceTempView(name)
+            }
+          body
+        }
+      }
+    }
+  }
+
+  test("scalar review Boolean conditional shared children preserve lazy evaluation") {
+    withScalarReviewTables {
+      val query = "SELECT id >= (SELECT max(k) FROM review_nums) OR CAST(txt AS INT)=2 a, " +
+        "id > (SELECT min(k) FROM review_nums) OR CAST(txt AS INT)=2 b FROM review_items"
+      for (mode <- Seq("CODEGEN_ONLY", "NO_CODEGEN"); shared <- Seq(false, true)) {
+        withSQLConf(
+          SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
+          "spark.sql.codegen.factoryMode" -> mode,
+          SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> shared.toString) {
+          val df = sql(query)
+          checkSparkAnswer(df)
+          checkAnswer(df, Seq(Row(true, true), Row(true, true)))
+        }
+      }
+    }
+  }
+
+  test("scalar review shared NULL Bloom keys preserve generated and interpreted evaluation") {
+    withScalarReviewTables {
+      def query: DataFrame = {
+        val source = sql(
+          "SELECT txt, (SELECT max(k) FROM review_nums) hi, " +
+            "(SELECT min(k) FROM review_nums) lo FROM review_items")
+        val key = org.apache.spark.sql.catalyst.expressions.Cast(source.col("txt").expr, LongType)
+        def bloom(dt: DataType): Column = getColumnFromExpression(
+          org.apache.spark.sql.catalyst.expressions
+            .BloomFilterMightContain(Literal.create(null, dt), key))
+        source.select(bloom(BinaryType).as("a"), bloom(NullType).as("b"), col("hi"), col("lo"))
+      }
+      for (mode <- Seq("CODEGEN_ONLY", "NO_CODEGEN"); shared <- Seq(false, true)) {
+        withSQLConf(
+          SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
+          "spark.sql.codegen.factoryMode" -> mode,
+          SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> shared.toString) {
+          if (shared && mode == "CODEGEN_ONLY") {
+            val (expected, actual) = checkSparkAnswerMaybeThrows(query)
+            assert(expected.isDefined && actual.isDefined, s"$expected / $actual")
+            Seq(expected.get, actual.get).foreach { error =>
+              assert(causeChain(error).exists(_.getMessage.contains("CAST_INVALID_INPUT")), error)
+            }
+          } else {
+            val df = query
+            checkSparkAnswer(df)
+            checkAnswer(df, Seq(Row(null, null, 1, 0), Row(null, null, 1, 0)))
+          }
+        }
+      }
+    }
+  }
+
+  test("scalar review whole-stage filters do not eagerly evaluate shared Slice arguments") {
+    withScalarReviewTables {
+      for (filterSharing <- Seq(false, true))
+        withSQLConf(
+          "spark.sql.subexpressionElimination.filterExec.enabled" -> filterSharing.toString,
+          SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true",
+          "spark.sql.codegen.factoryMode" -> "CODEGEN_ONLY",
+          SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true") {
+          val query = """
+          |SELECT id FROM review_items
+          |WHERE slice(
+          |  IF(id = 1, CAST(NULL AS ARRAY<INT>),
+          |     array((SELECT max(k) FROM review_nums), (SELECT min(k) FROM review_nums))),
+          |  CAST(txt AS INT), CAST(txt AS INT)) IS NULL
+          |""".stripMargin
+          val df = sql(query)
+          assert(
+            df.queryExecution.optimizedPlan.exists(_.expressions.exists(_.exists {
+              case GetStructField(_: LogicalScalarSubquery, _, _) => true
+              case _ => false
+            })),
+            df.queryExecution.optimizedPlan.toString)
+          // Spark 4.2 added predicate-local Filter CSE; both its enabled and lazy paths matter.
+          val (expected, actual) = checkSparkAnswerMaybeThrows(df)
+          assert(expected.isDefined == actual.isDefined, s"$expected / $actual")
+          if (expected.isDefined) {
+            Seq(expected.get, actual.get).foreach { error =>
+              assert(causeChain(error).exists(_.getMessage.contains("CAST_INVALID_INPUT")), error)
+            }
+          } else {
+            checkAnswer(df, Seq(Row(1)))
+          }
+        }
+    }
+  }
+
+  test("scalar review primitive and fixed-width IN preserve row evaluation") {
+    withScalarReviewTables {
+      Seq(
+        "id IN ((SELECT max(k) FROM review_nums), CAST(txt AS INT))",
+        "named_struct('k', id) IN " +
+          "((SELECT max(named_struct('k', k)) FROM review_nums), " +
+          "named_struct('k', CAST(txt AS INT)))").foreach { predicate =>
+        checkSparkAnswer(
+          s"SELECT id, $predicate, (SELECT min(k) FROM review_nums) FROM review_items")
+      }
+    }
+  }
+
+  test("scalar review fixed-width IN retains shared candidate errors") {
+    withScalarReviewTables {
+      val value = "(SELECT max(k) FROM review_nums)"
+      val query = s"SELECT 1 IN ($value, CAST(txt AS INT)) a, " +
+        s"1 IN (abs($value), CAST(txt AS INT)) b, " +
+        "(SELECT min(k) FROM review_nums) m FROM review_items"
+      withSQLConf(SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "false") {
+        checkSparkAnswer(query)
+      }
+      withSQLConf(SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true") {
+        val (expected, actual) = checkSparkAnswerMaybeThrows(sql(query))
+        assert(expected.isDefined && actual.isDefined, s"$expected / $actual")
+      }
+    }
+  }
+
+  test("scalar review Boolean consumers preserve row short circuiting") {
+    withScalarReviewTables {
+      Seq(
+        "id = (SELECT max(k) FROM review_nums) OR CAST(txt AS INT) = 2",
+        "id <> (SELECT max(k) FROM review_nums) AND CAST(txt AS INT) = 2")
+        .foreach { predicate =>
+          checkSparkAnswer(
+            s"SELECT id, $predicate, (SELECT min(k) FROM review_nums) FROM review_items")
+        }
+    }
+  }
+
+  test("scalar review NULL membership skips observable candidates in both evaluation modes") {
+    withScalarReviewTables {
+      val value = "(SELECT max(named_struct('k', k)) FROM review_nums WHERE k < 0).k"
+      val query = s"SELECT $value IN (CAST(txt AS INT), id), " +
+        "(SELECT min(k) FROM review_nums) FROM review_items"
+      Seq("CODEGEN_ONLY", "NO_CODEGEN").foreach { mode =>
+        withSQLConf(SQLConf.CODEGEN_FACTORY_MODE.key -> mode) {
+          checkSparkAnswer(query)
+          checkAnswer(sql(query), Seq(Row(null, 0), Row(null, 0)))
+        }
+      }
+    }
+  }
+
+  test("scalar review nullable consumers preserve argument order") {
+    withScalarReviewTables {
+      val z = "(SELECT max(named_struct('f', k)) FROM review_nums WHERE k < 0).f"
+      Seq(
+        s"$z + CAST(txt AS INT)",
+        s"CAST(txt AS INT) DIV $z",
+        s"startswith(CAST($z AS STRING), CAST(CAST(txt AS INT) AS STRING))",
+        s"substring(CAST($z AS STRING), CAST(txt AS INT), 1)").foreach { expression =>
+        checkSparkAnswer(s"SELECT $expression FROM review_items")
+      }
+    }
+  }
+
+  test("scalar review skipped stateful arguments do not advance later rows") {
+    withScalarReviewTables {
+      val z = "(SELECT max(named_struct('f', k)) FROM review_nums WHERE k < 0).f"
+      checkSparkAnswer(
+        s"SELECT id, IF(id = 1, $z, id) + monotonically_increasing_id() FROM review_items")
+    }
+  }
+
+  test("scalar review concat preserves generated and interpreted evaluation") {
+    withScalarReviewTables {
+      val z = "(SELECT max(named_struct('f', k)) FROM review_nums WHERE k < 0).f"
+      val query = s"SELECT id, concat(IF(id = 1, CAST($z AS STRING), CAST(id AS STRING)), " +
+        "CAST(CAST(txt AS INT) AS STRING)) FROM review_items"
+      withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
+        checkSparkAnswer(query)
+      }
+      withSQLConf(
+        SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
+        "spark.sql.codegen.factoryMode" -> "NO_CODEGEN") {
+        val (expected, actual) = checkSparkAnswerMaybeThrows(sql(query))
+        assert(expected.isDefined && actual.isDefined, s"$expected / $actual")
+        Seq(expected.get, actual.get).foreach { error =>
+          assert(causeChain(error).exists(_.getMessage.contains("CAST_INVALID_INPUT")), error)
+        }
+      }
+    }
+  }
+
+  test("scalar review regional clock conditionals use the requested instant") {
+    withScalarReviewTables {
+      withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "America/Los_Angeles") {
+        val instant = "IF(id > 0, timestamp_micros(9089364630896000000L), " +
+          "timestamp_micros(CAST(id AS BIGINT)))"
+        Seq("hour", "minute", "second").foreach { function =>
+          checkSparkAnswer(s"SELECT $function($instant) FROM review_items")
+        }
+        checkAnswer(sql(s"SELECT hour($instant) FROM review_items"), Seq(Row(5), Row(5)))
+      }
+    }
+  }
+
+  test("scalar review date unix timestamp preserves overflow and regional midnight") {
+    withScalarReviewTables {
+      withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+        val query = "SELECT unix_timestamp(IF(id > 0, date_from_unix_date(2147483647), " +
+          "date_from_unix_date(id))) FROM review_items"
+        val (expected, actual) = checkSparkAnswerMaybeThrows(sql(query))
+        assert(expected.isDefined && actual.isDefined, s"$expected / $actual")
+        Seq(expected.get, actual.get).foreach { error =>
+          assert(causeChain(error).exists(_.getMessage.contains("long overflow")), error)
+        }
+      }
+      withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "America/Los_Angeles") {
+        val query = "SELECT unix_timestamp(IF(id > 0, DATE '2200-07-01', " +
+          "date_from_unix_date(id))) FROM review_items"
+        checkSparkAnswer(query)
+        checkAnswer(sql(query), Seq(Row(7273782000L), Row(7273782000L)))
+      }
+    }
+  }
+
+  test("scalar review direct wide fields stay bounded at aggregate and shuffle boundaries") {
+    withScalarReviewTables {
+      checkSparkAnswer(
+        "SELECT id % 2 AS k, count((SELECT max(s) FROM review_wide)), " +
+          "count((SELECT min(s) FROM review_wide)) FROM review_outer GROUP BY id % 2")
+      checkSparkAnswer(
+        "SELECT id FROM review_outer DISTRIBUTE BY " +
+          "(SELECT max(s) FROM review_wide), (SELECT min(s) FROM review_wide)")
+    }
+  }
+
+  test("scalar review integer division does not disable bounded IF evaluation") {
+    withScalarReviewTables {
+      checkSparkAnswer("SELECT id, octet_length(IF(id DIV 2 >= 0, " +
+        "(SELECT max(s) FROM review_wide), (SELECT min(s) FROM review_wide))) FROM review_outer")
+    }
+  }
+
+  test("scalar review pure projections preserve bounded retained wide aliases") {
+    withScalarReviewTables {
+      // Reusing a non-cheap scalar source prevents CollapseProject from inlining the alias.
+      val query = "SELECT id, octet_length(s), ascii(s), octet_length(m) FROM " +
+        "(SELECT id, (SELECT max(s) FROM review_wide) s, " +
+        "(SELECT min(s) FROM review_wide) m FROM review_outer) q"
+      val df = sql(query)
+      checkSparkAnswer(df)
+      val projects = df.queryExecution.executedPlan.collect { case p: CometProjectExec => p }
+      assert(projects.size >= 2, df.queryExecution.executedPlan)
+    }
+  }
+
+  test("scalar review integer subqueries cannot hide wide stateful or dispatched intermediates") {
+    withScalarReviewTables {
+      Seq("monotonically_increasing_id() >= 0", "upper(CAST(id AS STRING)) <> 'missing'")
+        .foreach { condition =>
+          checkSparkAnswer(
+            "SELECT sum(y), min(m) FROM (SELECT octet_length(IF(" +
+              s"$condition, repeat('x', 2 * (SELECT max(n) FROM review_src)), 'z')) y, " +
+              "(SELECT min(n) FROM review_src) m FROM review_outer) q")
+        }
+    }
+  }
+
+  test("scalar review ordinary struct literals keep native column execution") {
+    withScalarReviewTables {
+      checkSparkAnswerAndOperator(
+        sql(
+          "SELECT array(IF(id % 2 = 0, named_struct('k', id), " +
+            "CAST(NULL AS STRUCT<k:BIGINT>))) FROM review_outer"),
+        Seq(classOf[CometProjectExec]))
+    }
+  }
+
+  test("scalar review bounded integer casts remain native") {
+    withScalarReviewTables {
+      checkSparkAnswerAndOperator(
+        sql(
+          "SELECT octet_length(CAST(id + " +
+            "(SELECT max(n) FROM review_src) AS STRING)), " +
+            "(SELECT min(n) FROM review_src) FROM review_outer"),
+        Seq(classOf[CometProjectExec]))
+    }
+  }
+
+  test("scalar review fixed-cardinality arrays remain native") {
+    withScalarReviewTables {
+      val value = "hash(array(id, " +
+        "CAST((SELECT max(k) FROM review_nums) AS BIGINT), " +
+        "CAST((SELECT min(k) FROM review_nums) AS BIGINT)))"
+      checkSparkAnswerAndOperator(
+        sql(s"SELECT sum(CAST($value AS BIGINT)) FROM review_outer"),
+        Seq(classOf[CometHashAggregateExec]))
+      checkSparkAnswerAndOperator(
+        sql(s"SELECT id, $value FROM review_outer"),
+        Seq(classOf[CometProjectExec]))
+    }
+  }
+
   test("large merged scalar fields are consumed before broadcast") {
     val numRows = 8192
     val bytes = 262144
@@ -3663,7 +4002,11 @@ class CometExecSuite extends CometTestBase {
                 s"$value IN ($value, $invalid) AS b FROM range(2)"
               withSQLConf(SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "false") {
                 val df = sql(query)
-                checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+                // The nullable value may skip a failing candidate even without shared codegen.
+                checkSparkAnswer(df)
+                val reason =
+                  new ExtendedExplainInfo().generateExtendedInfo(df.queryExecution.executedPlan)
+                assert(reason.contains("Nested membership"), reason)
                 checkAnswer(df, Seq(Row(true, true), Row(true, true)))
               }
               Seq(false, true).foreach { comet =>

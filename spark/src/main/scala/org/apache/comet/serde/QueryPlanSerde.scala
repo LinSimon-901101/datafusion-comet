@@ -822,6 +822,16 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
       return None
     }
 
+    aggExpr.aggregateFunction.children.iterator
+      .flatMap(CometScalarSubquery.operatorArgumentFallbackReason)
+      .take(1)
+      .toSeq
+      .headOption
+      .foreach { reason =>
+        withFallbackReason(aggExpr, reason)
+        return None
+      }
+
     val fn = aggExpr.aggregateFunction
     val cometExpr = aggrSerdeMap.get(fn.getClass)
     val protoAggExprOpt = cometExpr match {
@@ -951,6 +961,20 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
         }
       }
       result
+    }
+
+  /** Serialize a full-batch operator argument, rather than an ordinary projection output. */
+  def operatorExprToProto(
+      expr: Expression,
+      inputs: Seq[Attribute],
+      binding: Boolean = true): Option[Expr] =
+    CometExplainInfo.withExpressionFallbackReasonScope {
+      CometScalarSubquery.operatorArgumentFallbackReason(expr) match {
+        case Some(reason) =>
+          withFallbackReason(expr, reason)
+          None
+        case None => exprToProto(expr, inputs, binding)
+      }
     }
 
   /**
@@ -1129,7 +1153,9 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
           }
       })
       .filter { protoExpr =>
-        CometScalarSubquery.dispatchedConsumerFallbackReason(expr, protoExpr) match {
+        CometScalarSubquery
+          .dispatchedConsumerFallbackReason(expr, protoExpr)
+          .orElse(CometScalarSubquery.unknownConsumerFallbackReason(expr, protoExpr)) match {
           case Some(reason) =>
             withFallbackReason(expr, reason)
             false
@@ -1352,7 +1378,10 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
    */
   private val sharedSubexpressions = new DynamicVariable[Option[SharedSubexpressions]](None)
 
-  private final class SharedSubexpressions(expressions: Seq[Expression], alwaysShared: Boolean) {
+  private final class SharedSubexpressions(
+      expressions: Seq[Expression],
+      alwaysShared: Boolean,
+      val eagerSharing: Boolean) {
     // Find shared nodes in Spark's original trees, then compare them after decimal promotion.
     lazy val common: Seq[Expression] =
       if (alwaysShared || SQLConf.get.subexpressionEliminationEnabled) {
@@ -1371,10 +1400,16 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
    * for an aggregation, whose shared subexpressions Spark's generated code evaluates for every
    * row whatever `spark.sql.subexpressionElimination.enabled` says. An aggregation that Spark
    * runs without generated code shares none when it is off, and stays eager in Comet.
+   * `eagerSharing` separately authorizes the new scalar-consumer fallback to accept eager
+   * evaluation of an entire shared argument. Set it only for expressions that Spark evaluates
+   * together with eager CSE; whole-stage filters do not, even when CSE is enabled.
    */
-  def withSharedSubexpressions[T](expressions: Seq[Expression], alwaysShared: Boolean = false)(
-      f: => T): T =
-    sharedSubexpressions.withValue(Some(new SharedSubexpressions(expressions, alwaysShared)))(f)
+  def withSharedSubexpressions[T](
+      expressions: Seq[Expression],
+      alwaysShared: Boolean = false,
+      eagerSharing: Boolean = false)(f: => T): T =
+    sharedSubexpressions.withValue(
+      Some(new SharedSubexpressions(expressions, alwaysShared, eagerSharing)))(f)
 
   /**
    * Whether native execution may skip the arguments of `expr` after the first on the rows where
@@ -1402,6 +1437,16 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
       }
     }
   }
+
+  private[serde] def usesGeneratedExpressionEvaluation: Boolean =
+    SQLConf.get.codegenFactoryMode.toString != CodegenObjectFactoryMode.NO_CODEGEN.toString
+
+  /** A common child or operator-wide discovery alone does not prove eager evaluation. */
+  private[serde] def isEagerSharedSubexpression(expr: Expression): Boolean =
+    usesGeneratedExpressionEvaluation && sharedSubexpressions.value.exists { shared =>
+      val promoted = DecimalPrecision.promote(expr)
+      shared.eagerSharing && shared.common.exists(_.semanticEquals(promoted))
+    }
 
   /**
    * Has native execution evaluate the arguments of `scalarFunc`, the serialized `expr`, the way

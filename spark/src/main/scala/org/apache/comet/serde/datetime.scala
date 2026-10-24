@@ -166,10 +166,13 @@ object CometQuarter extends CometExpressionSerde[Quarter] with CometExprGetDateF
   }
 }
 
-object CometHour extends CometExpressionSerde[Hour] {
+object CometHour extends CometExpressionSerde[Hour] with CodegenDispatchFallback {
+
+  override def getUnsupportedReasons(): Seq[String] =
+    Seq(CometTimeZone.clockInputUnsupportedReason)
 
   override def getSupportLevel(expr: Hour): SupportLevel =
-    CometTimeZone.supportLevel(expr.timeZoneId)
+    CometTimeZone.clockSupportLevel(expr.child, expr.timeZoneId)
 
   override def convert(
       expr: Hour,
@@ -194,10 +197,13 @@ object CometHour extends CometExpressionSerde[Hour] {
   }
 }
 
-object CometMinute extends CometExpressionSerde[Minute] {
+object CometMinute extends CometExpressionSerde[Minute] with CodegenDispatchFallback {
+
+  override def getUnsupportedReasons(): Seq[String] =
+    Seq(CometTimeZone.clockInputUnsupportedReason)
 
   override def getSupportLevel(expr: Minute): SupportLevel =
-    CometTimeZone.supportLevel(expr.timeZoneId)
+    CometTimeZone.clockSupportLevel(expr.child, expr.timeZoneId)
 
   override def convert(
       expr: Minute,
@@ -222,10 +228,13 @@ object CometMinute extends CometExpressionSerde[Minute] {
   }
 }
 
-object CometSecond extends CometExpressionSerde[Second] {
+object CometSecond extends CometExpressionSerde[Second] with CodegenDispatchFallback {
+
+  override def getUnsupportedReasons(): Seq[String] =
+    Seq(CometTimeZone.clockInputUnsupportedReason)
 
   override def getSupportLevel(expr: Second): SupportLevel =
-    CometTimeZone.supportLevel(expr.timeZoneId)
+    CometTimeZone.clockSupportLevel(expr.child, expr.timeZoneId)
 
   override def convert(
       expr: Second,
@@ -266,20 +275,25 @@ object CometUnixTimestamp
     extends CometExpressionSerde[UnixTimestamp]
     with CodegenDispatchFallback {
 
+  private val dateInputUnsupportedReason =
+    "unix_timestamp date inputs require Spark for checked timezone conversion"
+
   override def getUnsupportedReasons(): Seq[String] = Seq(
-    "String inputs, including collated strings, have no native implementation.")
+    "String inputs, including collated strings, have no native implementation.",
+    dateInputUnsupportedReason)
 
   private def isSupportedInputType(expr: UnixTimestamp): Boolean = {
     expr.children.head.dataType match {
-      case TimestampType | DateType => true
-      case TimestampNTZType => true
+      case TimestampType | TimestampNTZType => true
       case _ => false
     }
   }
 
   override def getSupportLevel(expr: UnixTimestamp): SupportLevel = {
-    // Strings have no native path, even when incompatible expressions are allowed.
-    if (!isSupportedInputType(expr)) {
+    // Date conversion must preserve Spark's checked, zoned start-of-day calculation.
+    if (expr.timeExp.dataType == DateType) {
+      Unsupported(Some(dateInputUnsupportedReason))
+    } else if (!isSupportedInputType(expr)) {
       val inputType = expr.children.head.dataType
       Unsupported(Some(s"unix_timestamp does not support input type: $inputType"))
     } else {

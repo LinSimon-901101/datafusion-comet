@@ -677,6 +677,11 @@ object CometShuffleExchangeExec
             s"${CometConf.COMET_SHUFFLE_NATIVE_HASH_PARTITIONING_ENABLED.key} is disabled"
         }
         for (expr <- expressions) {
+          org.apache.comet.serde.CometScalarSubquery
+            .operatorArgumentFallbackReason(expr)
+            .foreach { reason =>
+              reasons += reason
+            }
           if (QueryPlanSerde.exprToProto(expr, inputs).isEmpty) {
             reasons += s"unsupported hash partitioning expression: $expr"
           }
@@ -717,6 +722,9 @@ object CometShuffleExchangeExec
           return reasons.toSeq
         }
         for (o <- orderings) {
+          org.apache.comet.serde.CometScalarSubquery.operatorArgumentFallbackReason(o).foreach {
+            reason => reasons += reason
+          }
           val (result, expressionReasons) =
             QueryPlanSerde.exprToProtoWithFallbackReasons(o, inputs)
           if (result.isEmpty) {
@@ -784,6 +792,11 @@ object CometShuffleExchangeExec
     partitioning match {
       case HashPartitioning(expressions, _) =>
         for (expr <- expressions) {
+          org.apache.comet.serde.CometScalarSubquery
+            .operatorArgumentFallbackReason(expr)
+            .foreach { reason =>
+              reasons += reason
+            }
           if (QueryPlanSerde.exprToProto(expr, inputs).isEmpty) {
             reasons += s"unsupported hash partitioning expression: $expr"
           }
@@ -799,6 +812,9 @@ object CometShuffleExchangeExec
       // we already checked that the input types are supported
       case RangePartitioning(orderings, _) =>
         for (o <- orderings) {
+          org.apache.comet.serde.CometScalarSubquery.operatorArgumentFallbackReason(o).foreach {
+            reason => reasons += reason
+          }
           if (QueryPlanSerde.exprToProto(o, inputs).isEmpty) {
             reasons += s"unsupported range partitioning sort order: $o"
           }

@@ -24,7 +24,7 @@ use datafusion::common::{config::ConfigOptions, ScalarValue};
 use datafusion::logical_expr::{ColumnarValue, ScalarUDF};
 use datafusion::physical_expr::expressions::Literal;
 use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
-use datafusion_comet_spark_expr::{GetStructField, ScalarSubqueryConsumer};
+use datafusion_comet_spark_expr::{GetStructField, ScalarSubqueryConsumer, Subquery};
 use datafusion_functions::string::octet_length::OctetLengthFunc;
 
 #[test]
@@ -36,7 +36,10 @@ fn large_scalar_struct_field_is_consumed_before_broadcast() {
         vec![Arc::new(StringArray::from(vec!["x".repeat(bytes)]))],
         None,
     )));
-    let field = Arc::new(GetStructField::new(Arc::new(Literal::new(scalar)), 0));
+    let field = Arc::new(GetStructField::new(
+        Arc::new(Subquery::resolved_struct_literal(scalar)),
+        0,
+    ));
     let consumer = Arc::new(ScalarFunctionExpr::new(
         "octet_length",
         Arc::new(ScalarUDF::new_from_impl(OctetLengthFunc::new())),
@@ -104,9 +107,13 @@ fn expanding_constant_child_is_consumed_before_its_conditional_broadcasts() {
 fn field(value: ScalarValue) -> Arc<dyn PhysicalExpr> {
     let fields = vec![Field::new("value", value.data_type(), true)].into();
     Arc::new(GetStructField::new(
-        Arc::new(Literal::new(ScalarValue::Struct(Arc::new(
-            StructArray::new(fields, vec![value.to_array().unwrap()], None),
-        )))),
+        Arc::new(Subquery::resolved_struct_literal(ScalarValue::Struct(
+            Arc::new(StructArray::new(
+                fields,
+                vec![value.to_array().unwrap()],
+                None,
+            )),
+        ))),
         0,
     ))
 }
@@ -446,7 +453,7 @@ fn non_null_count_consumes_scalar_fields_and_whole_structs_before_broadcast() {
         (field(large), true),
         (field(ScalarValue::Utf8(None)), false),
         (
-            Arc::new(Literal::new(structure)) as Arc<dyn PhysicalExpr>,
+            Arc::new(Subquery::resolved_struct_literal(structure)) as Arc<dyn PhysicalExpr>,
             true,
         ),
         (field(ScalarValue::Float64(Some(f64::NAN))), false),
@@ -954,11 +961,15 @@ fn unused_wide_sibling_does_not_split_numeric_consumers() {
                 None,
             );
             Arc::new(GetStructField::new(
-                Arc::new(Literal::new(ScalarValue::Struct(Arc::new(outer)))),
+                Arc::new(Subquery::resolved_struct_literal(ScalarValue::Struct(
+                    Arc::new(outer),
+                ))),
                 0,
             ))
         } else {
-            Arc::new(Literal::new(ScalarValue::Struct(structure.clone())))
+            Arc::new(Subquery::resolved_struct_literal(ScalarValue::Struct(
+                structure.clone(),
+            )))
         };
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
@@ -1002,7 +1013,9 @@ fn literal_field_chain_preserves_each_parent_null_and_empty_shape() {
             );
             let expr = GetStructField::new(
                 Arc::new(GetStructField::new(
-                    Arc::new(Literal::new(ScalarValue::Struct(Arc::new(outer)))),
+                    Arc::new(Subquery::resolved_struct_literal(ScalarValue::Struct(
+                        Arc::new(outer),
+                    ))),
                     0,
                 )),
                 0,
@@ -1043,7 +1056,8 @@ fn whole_struct_conditional_is_consumed_in_bounded_batches() {
                 ],
                 parent_null.then(|| NullBuffer::new_null(1)),
             )));
-            let literal: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(structure));
+            let literal: Arc<dyn PhysicalExpr> =
+                Arc::new(Subquery::resolved_struct_literal(structure));
             // The planner wraps at each construction point. Keep the source scalar, so a
             // surrounding field read can still select its field before broadcasting it.
             let source = ScalarSubqueryConsumer::wrap(literal.clone());
@@ -1108,7 +1122,8 @@ fn field_reads_bound_computed_structs_before_selecting_narrow_fields() {
         None,
     )));
     for cast in [false, true] {
-        let literal: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(structure.clone()));
+        let literal: Arc<dyn PhysicalExpr> =
+            Arc::new(Subquery::resolved_struct_literal(structure.clone()));
         let computed: Arc<dyn PhysicalExpr> = if cast {
             Arc::new(Cast::new(
                 literal,
@@ -1131,7 +1146,7 @@ fn field_reads_bound_computed_structs_before_selecting_narrow_fields() {
                     Arc::new(Literal::new(ScalarValue::Int64(Some(0)))),
                 )),
                 literal,
-                Arc::new(Literal::new(structure.clone())),
+                Arc::new(Subquery::resolved_struct_literal(structure.clone())),
             ))
         };
         let child = ScalarSubqueryConsumer::wrap(computed);
@@ -1153,6 +1168,342 @@ fn field_reads_bound_computed_structs_before_selecting_narrow_fields() {
                 output.as_ref(),
                 expected.to_array_of_size(rows).unwrap().as_ref()
             );
+        }
+    }
+}
+
+#[test]
+fn bounded_integer_casts_keep_full_batches() {
+    use datafusion::logical_expr::{Operator, Volatility};
+    use datafusion::physical_expr::expressions::{BinaryExpr, CastExpr, Column};
+    use datafusion_comet_spark_expr::{Cast, EvalMode, SparkCastOptions};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let input = batch(8192);
+    for comet_cast in [false, true] {
+        let sum: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            field(ScalarValue::Int64(Some(i64::MIN))),
+            Operator::Plus,
+            Arc::new(Column::new("id", 0)),
+        ));
+        let cast: Arc<dyn PhysicalExpr> = if comet_cast {
+            Arc::new(Cast::new(
+                sum,
+                DataType::Utf8,
+                SparkCastOptions::new(EvalMode::Legacy, "UTC"),
+                None,
+                None,
+            ))
+        } else {
+            Arc::new(CastExpr::new(sum, DataType::Utf8, None))
+        };
+        let cast = ScalarSubqueryConsumer::wrap_with_schema(cast, input.schema());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let check = udf(
+            "check_batch",
+            vec![octet(cast)],
+            DataType::Int32,
+            Volatility::Immutable,
+            Arc::new(move |args| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                let ColumnarValue::Array(a) = &args[0] else {
+                    panic!("array required")
+                };
+                assert_eq!(a.len(), 8192);
+                Ok(args[0].clone())
+            }),
+        );
+        let output = ScalarSubqueryConsumer::wrap_with_schema(check, input.schema())
+            .evaluate(&input)
+            .unwrap()
+            .into_array(8192)
+            .unwrap();
+        assert_eq!(output.as_ref(), &Int32Array::from(vec![20; 8192]));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn fixed_cardinality_arrays_keep_full_batches() {
+    use datafusion::functions_nested::make_array::MakeArray;
+    use datafusion::logical_expr::Volatility;
+    use datafusion::physical_expr::expressions::Column;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let input = batch(8192);
+    let array: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+        "make_array",
+        Arc::new(ScalarUDF::new_from_impl(MakeArray::new())),
+        vec![
+            Arc::new(Column::new("id", 0)),
+            field(ScalarValue::Int64(Some(1))),
+            field(ScalarValue::Int64(Some(2))),
+        ],
+        Arc::new(Field::new(
+            "array",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            true,
+        )),
+        Arc::new(ConfigOptions::default()),
+    ));
+    let array = ScalarSubqueryConsumer::wrap_with_schema(array, input.schema());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let check = udf(
+        "check_batch",
+        vec![array, Arc::new(Column::new("id", 0))],
+        DataType::Int64,
+        Volatility::Immutable,
+        Arc::new(move |args| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            let ColumnarValue::Array(a) = &args[0] else {
+                panic!("array required")
+            };
+            assert_eq!(a.len(), 8192);
+            Ok(args[1].clone())
+        }),
+    );
+    let output = ScalarSubqueryConsumer::wrap_with_schema(check, input.schema())
+        .evaluate(&input)
+        .unwrap()
+        .into_array(8192)
+        .unwrap();
+    assert_eq!(output.as_ref(), input.column(0).as_ref());
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn ordinary_null_struct_does_not_acquire_subquery_provenance() {
+    use arrow::array::BooleanArray;
+    use datafusion::functions_nested::make_array::MakeArray;
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion_comet_spark_expr::IfExpr;
+    let fields = vec![Field::new("k", DataType::Int64, true)].into();
+    let payload: Arc<dyn Array> = Arc::new(StructArray::new(
+        fields,
+        vec![Arc::new(Int64Array::from_iter_values(0..8192))],
+        None,
+    ));
+    let dt = payload.data_type().clone();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("p", DataType::Boolean, false),
+        Field::new("payload", dt.clone(), true),
+    ]));
+    let input = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(BooleanArray::from(
+                (0..8192).map(|id| id % 2 == 0).collect::<Vec<_>>(),
+            )),
+            payload,
+        ],
+    )
+    .unwrap();
+    let branch = Arc::new(IfExpr::new(
+        Arc::new(Column::new("p", 0)),
+        Arc::new(Column::new("payload", 1)),
+        Arc::new(Literal::new(ScalarValue::try_from(&dt).unwrap())),
+    ));
+    let original: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+        "make_array",
+        Arc::new(ScalarUDF::new_from_impl(MakeArray::new())),
+        vec![branch],
+        Arc::new(Field::new(
+            "array",
+            DataType::List(Arc::new(Field::new("item", dt, true))),
+            true,
+        )),
+        Arc::new(ConfigOptions::default()),
+    ));
+    let wrapped = ScalarSubqueryConsumer::wrap_with_schema(original.clone(), input.schema());
+    assert!(Arc::ptr_eq(&wrapped, &original));
+    let output = wrapped.evaluate(&input).unwrap().into_array(8192).unwrap();
+    assert_eq!(output.len(), 8192);
+}
+
+#[test]
+fn bounded_comet_float_casts_keep_full_batches() {
+    use arrow::array::{Float32Array, Float64Array};
+    use datafusion::logical_expr::{Operator, Volatility};
+    use datafusion::physical_expr::expressions::{BinaryExpr, Column};
+    use datafusion_comet_spark_expr::{Cast, EvalMode, SparkCastOptions};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for single in [false, true] {
+        let samples = [
+            0.0,
+            -0.0,
+            f64::MIN,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            f32::MIN as f64,
+            f32::MAX as f64,
+            f32::MIN_POSITIVE as f64,
+            f32::from_bits(1) as f64,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.001,
+            -0.001,
+            1e7,
+        ];
+        let values = (0..8192).map(|row| samples[row % samples.len()]);
+        let (dt, zero, values): (DataType, ScalarValue, Arc<dyn Array>) = if single {
+            (
+                DataType::Float32,
+                ScalarValue::Float32(Some(0.0)),
+                Arc::new(Float32Array::from_iter_values(
+                    values.map(|value| value as f32),
+                )),
+            )
+        } else {
+            (
+                DataType::Float64,
+                ScalarValue::Float64(Some(0.0)),
+                Arc::new(Float64Array::from_iter_values(values)),
+            )
+        };
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", dt, false),
+        ]));
+        let input = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from_iter_values(0..8192)), values],
+        )
+        .unwrap();
+        // The column makes this row-dependent; a constant scalar would legitimately run once.
+        let sum = Arc::new(BinaryExpr::new(
+            field(zero),
+            Operator::Plus,
+            Arc::new(Column::new("value", 1)),
+        ));
+        let original: Arc<dyn PhysicalExpr> = Arc::new(Cast::new(
+            sum,
+            DataType::Utf8,
+            SparkCastOptions::new(EvalMode::Legacy, "UTC"),
+            None,
+            None,
+        ));
+        let expected = original.evaluate(&input).unwrap().into_array(8192).unwrap();
+        let expected_strings = expected.as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(expected_strings
+            .iter()
+            .flatten()
+            .all(|value| value.len() <= 32));
+        let cast = ScalarSubqueryConsumer::wrap_with_schema(original, input.schema());
+        assert!(
+            ScalarSubqueryConsumer::projection_max_rows(&cast, input.schema().as_ref())
+                .is_some_and(|rows| rows >= 8192)
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let check = udf(
+            "check_float_batch",
+            vec![cast, Arc::new(Column::new("id", 0))],
+            DataType::Int64,
+            Volatility::Immutable,
+            Arc::new(move |args| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                let ColumnarValue::Array(actual) = &args[0] else {
+                    panic!("array required")
+                };
+                assert_eq!(actual.len(), 8192);
+                assert_eq!(actual.as_ref(), expected.as_ref());
+                Ok(args[1].clone())
+            }),
+        );
+        let output = ScalarSubqueryConsumer::wrap_with_schema(check, input.schema())
+            .evaluate(&input)
+            .unwrap()
+            .into_array(8192)
+            .unwrap();
+        assert_eq!(output.as_ref(), input.column(0).as_ref());
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn bounded_boolean_and_decimal_casts_keep_full_batches() {
+    use datafusion::logical_expr::{Operator, Volatility};
+    use datafusion::physical_expr::expressions::{BinaryExpr, CastExpr, Column};
+    use datafusion_comet_spark_expr::{Cast, EvalMode, IfExpr, SparkCastOptions};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let input = batch(8192);
+    let condition: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+        Arc::new(Column::new("id", 0)),
+        Operator::Lt,
+        field(ScalarValue::Int64(Some(4096))),
+    ));
+    let mut values = vec![Arc::clone(&condition)];
+    for (scale, value) in [
+        (0, 10i128.pow(38) - 1),
+        (18, 10i128.pow(38) - 1),
+        (38, 1),
+        (38, 0),
+    ] {
+        values.push(Arc::new(IfExpr::new(
+            Arc::clone(&condition),
+            field(ScalarValue::Decimal128(Some(value), 38, scale)),
+            Arc::new(Literal::new(ScalarValue::Decimal128(
+                Some(-value),
+                38,
+                scale,
+            ))),
+        )));
+    }
+    for value in values {
+        for mode in [EvalMode::Legacy, EvalMode::Ansi, EvalMode::Try] {
+            for comet_cast in [false, true] {
+                let original: Arc<dyn PhysicalExpr> = if comet_cast {
+                    Arc::new(Cast::new(
+                        Arc::clone(&value),
+                        DataType::Utf8,
+                        SparkCastOptions::new(mode, "UTC"),
+                        None,
+                        None,
+                    ))
+                } else {
+                    Arc::new(CastExpr::new(Arc::clone(&value), DataType::Utf8, None))
+                };
+                let expected = original.evaluate(&input).unwrap().into_array(8192).unwrap();
+                let expected_strings = expected.as_any().downcast_ref::<StringArray>().unwrap();
+                assert!(expected_strings
+                    .iter()
+                    .flatten()
+                    .all(|value| value.len() <= 45));
+                let cast = ScalarSubqueryConsumer::wrap_with_schema(original, input.schema());
+                assert!(ScalarSubqueryConsumer::projection_max_rows(
+                    &cast,
+                    input.schema().as_ref()
+                )
+                .is_some_and(|rows| rows >= 8192));
+                let calls = Arc::new(AtomicUsize::new(0));
+                let counter = calls.clone();
+                let check = udf(
+                    "check_finite_cast_batch",
+                    vec![cast, Arc::new(Column::new("id", 0))],
+                    DataType::Int64,
+                    Volatility::Immutable,
+                    Arc::new(move |args| {
+                        counter.fetch_add(1, Ordering::Relaxed);
+                        let ColumnarValue::Array(actual) = &args[0] else {
+                            panic!("array required")
+                        };
+                        assert_eq!(actual.len(), 8192);
+                        assert_eq!(actual.as_ref(), expected.as_ref());
+                        Ok(args[1].clone())
+                    }),
+                );
+                let output = ScalarSubqueryConsumer::wrap_with_schema(check, input.schema())
+                    .evaluate(&input)
+                    .unwrap()
+                    .into_array(8192)
+                    .unwrap();
+                assert_eq!(output.as_ref(), input.column(0).as_ref());
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
+            }
         }
     }
 }

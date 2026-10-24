@@ -31,7 +31,7 @@ import org.apache.comet.{CometConf, ConfigEntry}
 import org.apache.comet.CometSparkSessionExtensions.withFallbackReason
 import org.apache.comet.serde.{CometOperatorSerde, OperatorOuterClass}
 import org.apache.comet.serde.OperatorOuterClass.{Operator, RankLikeFunction}
-import org.apache.comet.serde.QueryPlanSerde.{exprToProto, hasNonDefaultStringCollation}
+import org.apache.comet.serde.QueryPlanSerde.{hasNonDefaultStringCollation, operatorExprToProto}
 import org.apache.comet.shims.ShimCometWindowGroupLimit
 
 /**
@@ -106,8 +106,8 @@ object CometWindowGroupLimitExec extends CometOperatorSerde[SparkPlan] {
     // comparison for `ASC NULLS LAST` and `DESC NULLS FIRST` on nullable nested keys.
 
     val childOutput = op.children.head.output
-    val partitionProtos = fields.partitionSpec.map(e => e -> exprToProto(e, childOutput))
-    val orderProtos = fields.orderSpec.map(e => e -> exprToProto(e, childOutput))
+    val partitionProtos = fields.partitionSpec.map(e => e -> operatorExprToProto(e, childOutput))
+    val orderProtos = fields.orderSpec.map(e => e -> operatorExprToProto(e, childOutput))
 
     val failing = (partitionProtos ++ orderProtos).collect { case (e, None) => e }
     if (failing.nonEmpty) {

@@ -36,7 +36,7 @@ import org.apache.comet.{CometConf, ConfigEntry}
 import org.apache.comet.CometSparkSessionExtensions.withFallbackReason
 import org.apache.comet.serde.{AggSerde, CometOperatorSerde, CometSortOrder, LiteralOuterClass, OperatorOuterClass}
 import org.apache.comet.serde.OperatorOuterClass.Operator
-import org.apache.comet.serde.QueryPlanSerde.{aggExprToProto, exprToProto, liftFallbackReasons, scalarFunctionExprToProto, serializeDataType}
+import org.apache.comet.serde.QueryPlanSerde.{aggExprToProto, exprToProto, liftFallbackReasons, operatorExprToProto, scalarFunctionExprToProto, serializeDataType}
 
 object CometWindowExec extends CometOperatorSerde[WindowExec] {
 
@@ -75,9 +75,9 @@ object CometWindowExec extends CometOperatorSerde[WindowExec] {
         }
     }
 
-    val partitionExprs = op.partitionSpec.map(exprToProto(_, op.child.output))
+    val partitionExprs = op.partitionSpec.map(operatorExprToProto(_, op.child.output))
 
-    val sortOrders = op.orderSpec.map(exprToProto(_, op.child.output))
+    val sortOrders = op.orderSpec.map(operatorExprToProto(_, op.child.output))
 
     if (windowExprProto.forall(_.isDefined) && partitionExprs.forall(_.isDefined)
       && sortOrders.forall(_.isDefined)) {
@@ -302,7 +302,7 @@ object CometWindowExec extends CometOperatorSerde[WindowExec] {
           withFallbackReason(windowExpr, "Lag default value must be a literal")
           (None, None, false)
         case lag: Lag =>
-          val inputExpr = exprToProto(lag.input, output)
+          val inputExpr = operatorExprToProto(lag.input, output)
           val offsetExpr = exprToProto(lag.inputOffset, output)
           val defaultExpr = exprToProto(lag.default, output)
           val func = scalarFunctionExprToProto("lag", inputExpr, offsetExpr, defaultExpr)
@@ -312,7 +312,7 @@ object CometWindowExec extends CometOperatorSerde[WindowExec] {
           withFallbackReason(windowExpr, "Lead default value must be a literal")
           (None, None, false)
         case lead: Lead =>
-          val inputExpr = exprToProto(lead.input, output)
+          val inputExpr = operatorExprToProto(lead.input, output)
           val offsetExpr = exprToProto(lead.offset, output)
           val defaultExpr = exprToProto(lead.default, output)
           val func = scalarFunctionExprToProto("lead", inputExpr, offsetExpr, defaultExpr)
@@ -331,7 +331,7 @@ object CometWindowExec extends CometOperatorSerde[WindowExec] {
           val func = scalarFunctionExprToProto("ntile", exprToProto(nt.buckets, output))
           (None, func, false)
         case nv: NthValue =>
-          val inputExpr = exprToProto(nv.input, output)
+          val inputExpr = operatorExprToProto(nv.input, output)
 
           val offsetExpr = nv.offset.eval() match {
             case n: Number =>

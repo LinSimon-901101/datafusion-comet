@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::Subquery;
 use arrow::array::{Array, ArrayRef, StructArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -67,6 +68,16 @@ impl GetStructField {
             return None;
         }
         child_with_parent_nulls(structure, self.ordinal).ok()
+    }
+
+    pub(crate) fn is_subquery_field(&self) -> bool {
+        if let Some(literal) = self.child.downcast_ref::<Literal>() {
+            Subquery::is_resolved_struct_literal(literal)
+        } else {
+            self.child
+                .downcast_ref::<Self>()
+                .is_some_and(Self::is_subquery_field)
+        }
     }
 
     fn broadcast_field(child: ArrayRef, rows: usize) -> DataFusionResult<ColumnarValue> {

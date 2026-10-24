@@ -31,6 +31,6 @@ INSERT INTO test_session_tz_seconds VALUES (TIMESTAMP'2024-01-15 18:30:45Z'), (N
 query
 SELECT CAST(ts AS STRING), CAST(ts AS DATE) FROM test_session_tz_seconds
 
--- hour has no dispatcher path, so it falls back to Spark
-query expect_fallback(cannot be represented in native code)
+-- hour also uses the codegen dispatcher for offsets with seconds
+query expect_dispatch(hour)
 SELECT hour(ts) FROM test_session_tz_seconds

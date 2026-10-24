@@ -18,9 +18,9 @@
 use arrow::array::{Array, ArrayRef, RecordBatch, StructArray};
 use arrow::datatypes::{DataType, Schema, TimeUnit};
 use arrow::ipc::reader::StreamReader;
-use datafusion::common::{internal_err, ScalarValue};
+use datafusion::common::{internal_err, metadata::FieldMetadata, ScalarValue};
 use datafusion::logical_expr::ColumnarValue;
-use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::{expressions::Literal, PhysicalExpr};
 use datafusion_comet_common::bytes_to_i128;
 use datafusion_comet_jni_bridge::errors::CometError;
 use datafusion_comet_jni_bridge::{jni_static_call, BinaryWrapper, JVMClasses, StringWrapper};
@@ -46,7 +46,29 @@ pub struct Subquery {
     pub data_type: DataType,
 }
 
+const STRUCT_SUBQUERY_LITERAL: &str = "comet.resolved_struct_subquery";
+
 impl Subquery {
+    /// Keep the source distinct from SQL struct literals after resolving its owned value.
+    pub fn resolved_struct_literal(value: ScalarValue) -> Literal {
+        Literal::new_with_metadata(
+            value,
+            Some(FieldMetadata::from(std::collections::BTreeMap::from([(
+                STRUCT_SUBQUERY_LITERAL.to_owned(),
+                "true".to_owned(),
+            )]))),
+        )
+    }
+
+    pub(crate) fn is_resolved_struct_literal(literal: &Literal) -> bool {
+        literal.return_field(&Schema::empty()).is_ok_and(|field| {
+            field
+                .metadata()
+                .get(STRUCT_SUBQUERY_LITERAL)
+                .is_some_and(|v| v == "true")
+        })
+    }
+
     pub fn new(exec_context_id: i64, id: i64, data_type: DataType) -> Self {
         Self {
             exec_context_id,

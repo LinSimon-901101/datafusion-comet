@@ -20,10 +20,11 @@
 package org.apache.comet.serde
 
 import org.apache.spark.sql.{CometTestBase, Row}
-import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Cast, Coalesce, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, GetStructField, GreaterThanOrEqual, Hour, If, In, LessThan, Literal, NamedExpression, Not, OctetLength, Rand, TruncDate, UnixDate, WeekDay}
-import org.apache.spark.sql.execution.{ProjectExec, ScalarSubquery, SubqueryExec}
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, AttributeReference, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, FromUTCTimestamp, GetStructField, GreaterThan, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Minute, NamedExpression, Not, OctetLength, PreciseTimestampConversion, Rand, Second, SecondsToTimestamp, StringLPad, StringRepeat, StringRPad, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, UnixTimestamp, WeekDay}
+import org.apache.spark.sql.execution.{FilterExec, ProjectExec, ScalarSubquery, SubqueryExec}
 import org.apache.spark.sql.types._
 
+import org.apache.comet.CometConf
 import org.apache.comet.CometSparkSessionExtensions.{isSpark40Plus, isSpark41Plus}
 import org.apache.comet.shims.CometTypeShim
 
@@ -210,7 +211,7 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     }
   }
 
-  test("constant scalar membership requires shared-expression authorization") {
+  test("nullable scalar membership preserves skipped candidates with and without sharing") {
     val dt = StructType(Seq(StructField("s", StringType), StructField("f", DoubleType)))
     val scalar = subquery(dt)
     val literal = Literal.create(Row("x", 0.0d), dt)
@@ -228,9 +229,8 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
       withSQLConf("spark.sql.subexpressionElimination.enabled" -> shared.toString) {
         QueryPlanSerde.withSharedSubexpressions(Seq(first, second)) {
           Seq(first, second).foreach { expr =>
-            assert(CometScalarSubquery.consumerFallbackReason(expr).isDefined == shared)
-            if (shared)
-              assert(QueryPlanSerde.exprToProtoInternal(expr, Seq.empty, binding = false).isEmpty)
+            assert(CometScalarSubquery.consumerFallbackReason(expr).isDefined)
+            assert(QueryPlanSerde.exprToProtoInternal(expr, Seq.empty, binding = false).isEmpty)
           }
         }
       }
@@ -345,4 +345,487 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
         .consumerFallbackReason(Hour(timestamp, Some("America/Los_Angeles")))
         .exists(_.contains("non-fixed timezones")))
   }
+
+  private def clocks(child: Expression, zone: String): Seq[Expression] =
+    Seq(Hour(child, Some(zone)), Minute(child, Some(zone)), Second(child, Some(zone)))
+
+  private def nativeClockInput(
+      expr: Expression,
+      proto: ExprOuterClass.Expr): ExprOuterClass.Expr =
+    expr match {
+      case _: Hour =>
+        assert(proto.hasHour)
+        proto.getHour.getChild
+      case _: Minute =>
+        assert(proto.hasMinute)
+        proto.getMinute.getChild
+      case _: Second =>
+        assert(proto.hasSecond)
+        proto.getSecond.getChild
+      case other => fail(s"Expected a clock expression, got $other")
+    }
+
+  test("clock offsets with seconds dispatch or retain a clear Spark fallback") {
+    val timestamp = AttributeReference("ts", TimestampType)()
+    val zone = "+05:45:30"
+    for (enabled <- Seq(false, true)) {
+      withSQLConf(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key -> enabled.toString) {
+        clocks(timestamp, zone).foreach { clock =>
+          val (proto, reasons) =
+            QueryPlanSerde.exprToProtoWithFallbackReasons(Alias(clock, "clock")(), Seq(timestamp))
+          if (enabled) {
+            assert(proto.exists(_.hasJvmScalarUdf), s"$clock: $proto $reasons")
+            assert(reasons.isEmpty, reasons)
+          } else {
+            assert(proto.isEmpty, clock)
+            assert(reasons.contains(CometTimeZone.unsupportedReason(Some(zone))), reasons)
+            assert(
+              reasons.exists(_.contains(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key)),
+              reasons)
+          }
+        }
+      }
+    }
+  }
+
+  test("ordinary computed regional clocks dispatch before native serialization") {
+    val id = AttributeReference("id", IntegerType)()
+    val timestamp = AttributeReference("ts", TimestampType)()
+    val scalar = Literal.create(9089364630896000000L, TimestampType)
+    val seconds = AttributeReference("seconds", LongType)()
+    val date = AttributeReference("date", DateType)()
+    val scalarNull = Cast(date, LongType, Some("UTC"), EvalMode.LEGACY)
+    val predicate = GreaterThan(id, Literal(0))
+    val conditional = If(predicate, scalar, timestamp)
+    val conditionalSeconds = If(predicate, Literal(1800L), seconds)
+    for (enabled <- Seq(false, true)) {
+      withSQLConf(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key -> enabled.toString) {
+        val children = Seq(
+          scalar,
+          Literal.create(null, TimestampType),
+          conditional,
+          CaseWhen(Seq(predicate -> scalar), Some(timestamp)),
+          Coalesce(Seq(timestamp, scalar)),
+          Cast(conditional, TimestampType, Some("UTC")),
+          Cast(scalarNull, TimestampType, Some("UTC")),
+          SecondsToTimestamp(conditionalSeconds),
+          PreciseTimestampConversion(conditionalSeconds, LongType, TimestampType),
+          TruncTimestamp(Literal("HOUR"), conditional, Some("America/Los_Angeles")),
+          FromUTCTimestamp(conditional, Literal("UTC")),
+          ToUTCTimestamp(conditional, Literal("UTC")))
+        children.flatMap(clocks(_, "America/Los_Angeles")).foreach { clock =>
+          // There is no subquery: the general serde gate must reject every scalar-capable shape.
+          assert(CometScalarSubquery.consumerFallbackReason(clock).isEmpty)
+          val (proto, reasons) = QueryPlanSerde
+            .exprToProtoWithFallbackReasons(
+              Alias(clock, "clock")(),
+              Seq(id, timestamp, seconds, date))
+          if (enabled) {
+            assert(proto.exists(_.hasJvmScalarUdf), s"$clock: $proto")
+            assert(reasons.isEmpty, reasons)
+          } else {
+            assert(proto.isEmpty, clock)
+            assert(reasons.exists(_.contains(CometTimeZone.clockInputUnsupportedReason)), reasons)
+            assert(
+              reasons.exists(_.contains(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key)),
+              reasons)
+          }
+        }
+      }
+    }
+  }
+
+  test("clock serialization retains column arrays and full-range fixed-offset and NTZ inputs") {
+    val id = AttributeReference("id", IntegerType)()
+    for {
+      enabled <- Seq(false, true)
+      dt <- Seq(TimestampType, TimestampNTZType)
+      zone <- Seq("UTC", "+01:00", "America/Los_Angeles")
+    } {
+      withSQLConf(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key -> enabled.toString) {
+        val timestamp = AttributeReference("ts", dt)()
+        val scalar = Literal.create(Long.MaxValue, dt)
+        val computed = Seq(
+          scalar,
+          Literal.create(Long.MinValue, dt),
+          Literal.create(null, dt),
+          If(GreaterThan(id, Literal(0)), scalar, timestamp))
+        val children =
+          if (dt == TimestampNTZType || zone != "America/Los_Angeles") timestamp +: computed
+          else Seq(timestamp)
+        children.foreach { child =>
+          clocks(child, zone).foreach { clock =>
+            val (proto, reasons) = QueryPlanSerde.exprToProtoWithFallbackReasons(
+              Alias(clock, "clock")(),
+              Seq(id, timestamp))
+            assert(proto.isDefined, s"$clock: $reasons")
+            assert(reasons.isEmpty, reasons)
+            val input = nativeClockInput(clock, proto.get)
+            if (child eq timestamp) assert(input.hasBound, input)
+          }
+        }
+        // Native input binding is emitted by AttributeReference's serde. A raw BoundReference
+        // has no standalone serde, but must remain accepted by the clock support-level gate.
+        val bound = BoundReference(0, dt, nullable = true)
+        assert(CometHour.getSupportLevel(Hour(bound, Some(zone))) == Compatible())
+        assert(CometMinute.getSupportLevel(Minute(bound, Some(zone))) == Compatible())
+        assert(CometSecond.getSupportLevel(Second(bound, Some(zone))) == Compatible())
+      }
+    }
+  }
+
+  test("regional clocks retain array shapes through timestamp producers") {
+    for {
+      enabled <- Seq(false, true)
+      allowIncompatible <- Seq(false, true)
+      zone <- Seq("America/Los_Angeles", "Asia/Kolkata")
+    } {
+      val optIns = Seq("TruncTimestamp", "FromUTCTimestamp", "ToUTCTimestamp")
+        .map { name =>
+          s"spark.comet.expression.$name.allowIncompatible" -> allowIncompatible.toString
+        }
+      val confs = Seq(
+        CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key -> enabled.toString,
+        "spark.sql.ansi.enabled" -> "false") ++ optIns
+      withSQLConf(confs: _*) {
+        val timestamp = AttributeReference("ts", TimestampType)()
+        val inputs = Seq(
+          StringType,
+          DateType,
+          TimestampNTZType,
+          IntegerType,
+          LongType,
+          FloatType,
+          DoubleType,
+          DecimalType(20, 6),
+          BooleanType).map(dt => AttributeReference(s"input_${dt.typeName}", dt)())
+        val nativeSeconds = inputs.filter(a =>
+          Seq(IntegerType, LongType, FloatType, DoubleType).contains(a.dataType))
+        val casts = inputs.map(Cast(_, TimestampType, Some(zone)))
+        val micros = inputs.find(_.dataType == LongType).get
+        val precise = PreciseTimestampConversion(micros, LongType, TimestampType)
+        val decimal = inputs.find(_.dataType.isInstanceOf[DecimalType]).get
+        val arrayProducers =
+          (nativeSeconds.map(SecondsToTimestamp(_)) ++ casts ++ Seq(
+            precise,
+            Cast(SecondsToTimestamp(micros), TimestampType, Some(zone))))
+            .map(_ -> false)
+        val text = inputs.find(_.dataType == StringType).get
+        val scalar = Literal.create(0L, TimestampType)
+        val optInProducers = Seq(
+          TruncTimestamp(Literal("HOUR"), timestamp, Some(zone)),
+          TruncTimestamp(Literal.create(null, StringType), timestamp, Some(zone)),
+          TruncTimestamp(text, scalar, Some(zone)),
+          FromUTCTimestamp(timestamp, Literal("Asia/Tokyo")),
+          FromUTCTimestamp(scalar, text),
+          ToUTCTimestamp(timestamp, Literal("Asia/Tokyo")),
+          ToUTCTimestamp(scalar, text)).map(_ -> !allowIncompatible)
+        val producers = arrayProducers ++ optInProducers ++
+          Seq(SecondsToTimestamp(decimal) -> true)
+        producers.foreach { case (producer, dispatchedChild) =>
+          clocks(producer, zone).foreach { clock =>
+            val (proto, reasons) = QueryPlanSerde.exprToProtoWithFallbackReasons(
+              Alias(clock, "clock")(),
+              timestamp +: inputs)
+            if (dispatchedChild && !enabled) {
+              assert(proto.isEmpty, clock)
+              assert(
+                reasons.exists(_.contains(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key)),
+                reasons)
+              assert(
+                !reasons.exists(_.contains(CometTimeZone.clockInputUnsupportedReason)),
+                reasons)
+            } else {
+              assert(proto.isDefined, s"$clock: $reasons")
+              assert(reasons.isEmpty, reasons)
+              val input = nativeClockInput(clock, proto.get)
+              assert(input.hasJvmScalarUdf == dispatchedChild, s"$clock: $input")
+            }
+          }
+        }
+      }
+    }
+  }
+
+  test("date unix_timestamp dispatches while timestamp epoch extraction remains native") {
+    val id = AttributeReference("id", IntegerType)()
+    for {
+      enabled <- Seq(false, true)
+      zone <- Seq("UTC", "+01:00", "America/Los_Angeles")
+      dt <- Seq(DateType, TimestampType, TimestampNTZType)
+    } {
+      withSQLConf(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key -> enabled.toString) {
+        val column = AttributeReference("value", dt)()
+        val scalar =
+          if (dt == DateType) Literal.create(Int.MaxValue, dt)
+          else Literal.create(Long.MaxValue, dt)
+        val children = Seq(
+          column,
+          scalar,
+          Literal.create(null, dt),
+          If(GreaterThan(id, Literal(0)), scalar, column))
+        children.foreach { child =>
+          val unix = UnixTimestamp(child, Literal("yyyy-MM-dd"), Some(zone), failOnError = false)
+          assert(CometScalarSubquery.consumerFallbackReason(unix).isEmpty)
+          val (proto, reasons) =
+            QueryPlanSerde.exprToProtoWithFallbackReasons(Alias(unix, "epoch")(), Seq(id, column))
+          if (dt != DateType) {
+            assert(proto.exists(_.hasUnixTimestamp), s"$unix: $proto $reasons")
+            assert(reasons.isEmpty, reasons)
+            if (child eq column) assert(proto.get.getUnixTimestamp.getChild.hasBound)
+          } else if (enabled) {
+            assert(proto.exists(_.hasJvmScalarUdf), s"$unix: $proto $reasons")
+            assert(reasons.isEmpty, reasons)
+          } else {
+            assert(proto.isEmpty, unix)
+            assert(
+              reasons.exists(
+                _.contains("date inputs require Spark for checked timezone conversion")),
+              reasons)
+            assert(
+              reasons.exists(_.contains(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key)),
+              reasons)
+          }
+        }
+      }
+    }
+  }
+
+  test("wide scalar aliases retain a Spark row path through consumers") {
+    val text = GetStructField(subquery(struct(StringType)), 0)
+    val alias = Alias(text, "wide")()
+    val producer = ProjectExec(Seq(alias), emptyInput)
+    val consumer = FilterExec(IsNotNull(alias.toAttribute), producer)
+    val reduced = Alias(OctetLength(alias.toAttribute), "length")()
+    val reducer = ProjectExec(Seq(reduced), consumer)
+    val ancestor = ProjectExec(Seq(Alias(reduced.toAttribute, "result")()), reducer)
+    CometScalarSubquery.tagPlanInputs(ancestor)
+    assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty)
+    assert(CometScalarSubquery.rowPathFallbackReason(consumer).isDefined)
+    assert(CometScalarSubquery.rowPathFallbackReason(reducer).isDefined)
+    assert(CometScalarSubquery.rowPathFallbackReason(ancestor).isEmpty)
+    // Recompute on the same node: a standalone scalar projection retains its native contract.
+    CometScalarSubquery.tagPlanInputs(producer)
+    assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty)
+  }
+
+  test("pure projections preserve bounded native producer batches") {
+    val scalar = Alias(subquery(struct(StringType)), "scalar")()
+    val producer = ProjectExec(Seq(scalar), emptyInput)
+    val field = Alias(GetStructField(scalar.toAttribute, 0), "text")()
+    val fields = ProjectExec(Seq(field), producer)
+    val reducer = ProjectExec(Seq(Alias(OctetLength(field.toAttribute), "length")()), fields)
+    CometScalarSubquery.tagPlanInputs(reducer)
+    Seq(producer, fields, reducer).foreach { plan =>
+      assert(CometScalarSubquery.rowPathFallbackReason(plan).isEmpty, plan)
+    }
+  }
+
+  test("a retained scalar alias cannot grow an unbounded projection intermediate") {
+    Seq[DataType](StringType, LongType).foreach { dt =>
+      val scalar = Alias(GetStructField(subquery(struct(dt)), 0), "scalar")()
+      val producer = ProjectExec(Seq(scalar), emptyInput)
+      val repeated = if (dt == StringType) {
+        StringRepeat(scalar.toAttribute, Literal(2048))
+      } else {
+        StringRepeat(Literal("x"), Cast(scalar.toAttribute, IntegerType))
+      }
+      val reducer = ProjectExec(Seq(Alias(OctetLength(repeated), "length")()), producer)
+      CometScalarSubquery.tagPlanInputs(reducer)
+      assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty, dt)
+      assert(CometScalarSubquery.rowPathFallbackReason(reducer).isDefined, dt)
+    }
+  }
+
+  test("retained alias roots check growing constant branches and bounded choices") {
+    val number = Alias(GetStructField(subquery(struct(LongType)), 0), "number")()
+    val id = emptyInput.output.head
+    val producer = ProjectExec(Seq(number, id), emptyInput)
+    val growing = If(
+      IsNotNull(id),
+      StringRepeat(Literal("x"), Literal(512000)),
+      Cast(number.toAttribute, StringType))
+    val reducer = ProjectExec(Seq(Alias(OctetLength(growing), "length")()), producer)
+    CometScalarSubquery.tagPlanInputs(reducer)
+    assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty)
+    assert(CometScalarSubquery.rowPathFallbackReason(reducer).isDefined)
+
+    val predicate = FilterExec(IsNotNull(OctetLength(growing)), producer)
+    CometScalarSubquery.tagPlanInputs(predicate)
+    assert(CometScalarSubquery.rowPathFallbackReason(predicate).isDefined)
+    val topK = org.apache.spark.sql.execution.TakeOrderedAndProjectExec(
+      8192,
+      Seq.empty,
+      Seq(Alias(OctetLength(growing), "length")()),
+      producer)
+    CometScalarSubquery.tagPlanInputs(topK)
+    assert(CometScalarSubquery.rowPathFallbackReason(topK).isDefined)
+
+    val bounded = If(IsNotNull(id), Cast(id, StringType), Cast(number.toAttribute, StringType))
+    val native = ProjectExec(Seq(Alias(bounded, "text")()), producer)
+    val consumer = FilterExec(IsNotNull(native.output.head), native)
+    CometScalarSubquery.tagPlanInputs(consumer)
+    Seq(producer, native, consumer).foreach { plan =>
+      assert(CometScalarSubquery.rowPathFallbackReason(plan).isEmpty, plan)
+    }
+  }
+
+  test("retained numeric aliases check window values without evaluating frame data types") {
+    import org.apache.spark.sql.catalyst.expressions.{CurrentRow, RowFrame, RowNumber, SpecifiedWindowFrame, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
+    import org.apache.spark.sql.catalyst.expressions.aggregate.CollectList
+    import org.apache.spark.sql.execution.window.WindowExec
+    val number = Alias(GetStructField(subquery(struct(LongType)), 0), "number")()
+    val producer = ProjectExec(Seq(number), emptyInput)
+    val spec = WindowSpecDefinition(
+      Seq(number.toAttribute),
+      Seq.empty,
+      SpecifiedWindowFrame(RowFrame, UnboundedPreceding, CurrentRow))
+    val rank = WindowExec(
+      Seq(Alias(WindowExpression(RowNumber(), spec), "rank")()),
+      Seq(number.toAttribute),
+      Seq.empty,
+      producer)
+    CometScalarSubquery.tagPlanInputs(rank)
+    assert(CometScalarSubquery.rowPathFallbackReason(rank).isEmpty)
+    val collect = WindowExec(
+      Seq(
+        Alias(
+          WindowExpression(CollectList(number.toAttribute).toAggregateExpression(), spec),
+          "values")()),
+      Seq(number.toAttribute),
+      Seq.empty,
+      producer)
+    CometScalarSubquery.tagPlanInputs(collect)
+    assert(CometScalarSubquery.rowPathFallbackReason(collect).isDefined)
+  }
+
+  test("float field formatting preserves the native struct projection contract") {
+    val dt = StructType(Seq(StructField("text", StringType), StructField("number", DoubleType)))
+    val scalar = Alias(subquery(dt), "scalar")()
+    val producer = ProjectExec(Seq(scalar), emptyInput)
+    val formatted = Cast(GetStructField(scalar.toAttribute, 1), StringType)
+    val consumer = ProjectExec(Seq(Alias(formatted, "formatted")()), producer)
+    CometScalarSubquery.tagPlanInputs(consumer)
+    assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty)
+    assert(CometScalarSubquery.rowPathFallbackReason(consumer).isEmpty)
+  }
+
+  test("bounded scalar aliases do not force a Spark row path") {
+    val number = GetStructField(subquery(struct(LongType)), 0)
+    val values =
+      Seq(number, Cast(number, StringType), CreateArray(Seq(number, Literal(1L), Literal(2L))))
+    values.foreach { value =>
+      val alias = Alias(value, "bounded")()
+      val producer = ProjectExec(Seq(alias), emptyInput)
+      val consumer = FilterExec(IsNotNull(alias.toAttribute), producer)
+      CometScalarSubquery.tagPlanInputs(consumer)
+      assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty, value)
+      assert(CometScalarSubquery.rowPathFallbackReason(consumer).isEmpty, value)
+      CometScalarSubquery.withPlanInputs(consumer) {
+        assert(
+          CometScalarSubquery.operatorArgumentFallbackReason(alias.toAttribute).isEmpty,
+          value)
+      }
+    }
+  }
+
+  test("wide row paths mark only the affected union branch") {
+    import org.apache.spark.sql.execution.UnionExec
+    val text = Alias(GetStructField(subquery(struct(StringType)), 0), "value")()
+    val wide = ProjectExec(Seq(text), emptyInput)
+    val number = GetStructField(subquery(struct(LongType)), 0)
+    val boundedText = Alias(Cast(number, StringType), "value")()
+    val bounded = ProjectExec(Seq(boundedText), emptyInput)
+    val union = UnionExec(Seq(wide, bounded))
+    val consumer = ProjectExec(Seq(Alias(OctetLength(union.output.head), "length")()), union)
+    CometScalarSubquery.tagPlanInputs(consumer)
+    assert(CometScalarSubquery.rowPathFallbackReason(wide).isEmpty)
+    assert(CometScalarSubquery.rowPathFallbackReason(union).isDefined)
+    assert(CometScalarSubquery.rowPathFallbackReason(consumer).isDefined)
+    assert(CometScalarSubquery.rowPathFallbackReason(bounded).isEmpty)
+  }
+
+  test("reused exchanges remap source bounds without depending on attribute identity") {
+    import org.apache.spark.sql.catalyst.plans.physical.SinglePartition
+    import org.apache.spark.sql.execution.exchange.{ReusedExchangeExec, ShuffleExchangeExec}
+    val number = GetStructField(subquery(struct(LongType)), 0)
+    Seq(Cast(number, StringType), GetStructField(subquery(struct(StringType)), 0))
+      .foreach { value =>
+        val alias = Alias(value, "value")()
+        val producer = ProjectExec(Seq(alias), emptyInput)
+        val exchange = ShuffleExchangeExec(SinglePartition, producer)
+        val reused = ReusedExchangeExec(exchange.output.map(_.newInstance()), exchange)
+        val consumer = FilterExec(IsNotNull(reused.output.head), reused)
+        CometScalarSubquery.tagPlanInputs(consumer)
+        val wide = value.dataType == StringType && !value.isInstanceOf[Cast]
+        assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty, value)
+        assert(CometScalarSubquery.rowPathFallbackReason(consumer).isDefined == wide, value)
+        CometScalarSubquery.withPlanInputs(consumer) {
+          assert(
+            CometScalarSubquery
+              .operatorArgumentFallbackReason(reused.output.head)
+              .isDefined == wide,
+            value)
+        }
+      }
+  }
+
+  test("shared Bloom keys retain lazy NO_CODEGEN evaluation despite non-null-intolerant class") {
+    val input = AttributeReference("s", StringType)()
+    val key = Cast(input, LongType)
+    val filter = GetStructField(subquery(struct(BinaryType)), 0)
+    val first = BloomFilterMightContain(filter, key)
+    val second = BloomFilterMightContain(Literal.create(null, NullType), key)
+    for (mode <- Seq("CODEGEN_ONLY", "NO_CODEGEN"); enabled <- Seq(false, true)) {
+      withSQLConf(
+        "spark.sql.codegen.factoryMode" -> mode,
+        "spark.sql.subexpressionElimination.enabled" -> enabled.toString) {
+        QueryPlanSerde.withSharedSubexpressions(Seq(first, second), eagerSharing = true) {
+          val proto = QueryPlanSerde.exprToProtoInternal(first, Seq(input), binding = false)
+          if (enabled && mode == "NO_CODEGEN") {
+            assert(proto.isEmpty)
+          } else {
+            assert(proto.isDefined)
+            assert(proto.get.getBloomFilterMightContain.getNullShortCircuit == !enabled)
+          }
+        }
+      }
+    }
+  }
+
+  test("padding permits only whole eager argument roots and retains NO_CODEGEN masks") {
+    val id = AttributeReference("id", LongType)()
+    val text = AttributeReference("text", StringType)()
+    val condition = AttributeReference("p", BooleanType)()
+    val field = GetStructField(subquery(struct(StringType)), 0)
+    val string = If(condition, field, text)
+    val inner = Add(id, Literal(3L))
+    val length = Cast(inner, IntegerType)
+    val left = StringLPad(string, length, Literal("x"))
+    val right = StringRPad(string, length, Literal("x"))
+    val inputs = Seq(id, text, condition)
+    for (mode <- Seq("CODEGEN_ONLY", "NO_CODEGEN"); enabled <- Seq(false, true)) {
+      withSQLConf(
+        "spark.sql.codegen.factoryMode" -> mode,
+        "spark.sql.subexpressionElimination.enabled" -> enabled.toString) {
+        QueryPlanSerde.withSharedSubexpressions(Seq(left, right), eagerSharing = true) {
+          Seq(left, right).foreach { padding =>
+            val proto = QueryPlanSerde.exprToProtoInternal(padding, inputs, binding = false)
+            if (enabled && mode == "NO_CODEGEN") {
+              assert(proto.isEmpty)
+            } else {
+              assert(proto.isDefined)
+              assert(proto.get.getScalarFunc.getNullShortCircuit == !enabled)
+            }
+          }
+        }
+        QueryPlanSerde.withSharedSubexpressions(Seq(left, inner), eagerSharing = true) {
+          val proto = QueryPlanSerde.exprToProtoInternal(left, inputs, binding = false)
+          assert(proto.isEmpty == enabled)
+          if (!enabled) assert(proto.get.getScalarFunc.getNullShortCircuit)
+        }
+      }
+    }
+  }
+
 }

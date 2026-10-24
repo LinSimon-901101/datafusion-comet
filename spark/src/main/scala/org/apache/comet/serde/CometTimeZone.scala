@@ -23,7 +23,9 @@ import java.time.ZoneOffset
 
 import scala.util.Try
 
+import org.apache.spark.sql.catalyst.expressions.{Attribute, BoundReference, Cast, Expression, FromUTCTimestamp, PreciseTimestampConversion, SecondsToTimestamp, ToUTCTimestamp, TruncTimestamp}
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
+import org.apache.spark.sql.types.{TimestampNTZType, TimestampType}
 
 /**
  * Converts the timezone Spark stamps on an expression into an ID that native code can parse.
@@ -59,6 +61,32 @@ object CometTimeZone {
     nativeId(timeZoneId).exists { id =>
       Try(DateTimeUtils.getZoneId(id).getRules.isFixedOffset).getOrElse(false)
     }
+
+  private[serde] val clockInputUnsupportedReason: String =
+    "Clock expressions with inputs that may be scalar require Spark for non-fixed timezones"
+
+  /** A conditional can return a scalar branch even when its predicate reads a column. */
+  private[serde] def clockSupportLevel(
+      child: Expression,
+      timeZoneId: Option[String]): SupportLevel = {
+    def arrayInput(input: Expression): Boolean = input match {
+      case _: Attribute | _: BoundReference => true
+      // Other casts can be replaced with a scalar NULL by their serde.
+      case cast: Cast if cast.dataType == TimestampType || cast.dataType == TimestampNTZType =>
+        arrayInput(cast.child)
+      case seconds: SecondsToTimestamp => arrayInput(seconds.child)
+      case precise: PreciseTimestampConversion => arrayInput(precise.child)
+      case trunc: TruncTimestamp => arrayInput(trunc.timestamp) || arrayInput(trunc.format)
+      case from: FromUTCTimestamp => arrayInput(from.left) || arrayInput(from.right)
+      case to: ToUTCTimestamp => arrayInput(to.left) || arrayInput(to.right)
+      case _ => false
+    }
+    if (child.dataType == TimestampNTZType || isFixedOffset(timeZoneId) || arrayInput(child)) {
+      supportLevel(timeZoneId)
+    } else {
+      Unsupported(Some(clockInputUnsupportedReason))
+    }
+  }
 
   /** `Unsupported` when native code cannot represent `timeZoneId`, `Compatible` otherwise. */
   def supportLevel(timeZoneId: Option[String]): SupportLevel = nativeId(timeZoneId) match {

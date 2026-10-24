@@ -623,8 +623,9 @@ impl PhysicalPlanner {
         spark_expr: &Expr,
         input_schema: SchemaRef,
     ) -> Result<Arc<dyn PhysicalExpr>, ExecutionError> {
-        Ok(ScalarSubqueryConsumer::wrap(
-            self.create_expr_inner(spark_expr, input_schema)?,
+        Ok(ScalarSubqueryConsumer::wrap_with_schema(
+            self.create_expr_inner(spark_expr, Arc::clone(&input_schema))?,
+            input_schema,
         ))
     }
 
@@ -959,7 +960,7 @@ impl PhysicalPlanner {
                     // plan is created in executePlan. Keep an owned constant in the plan rather
                     // than initializing mutable state while evaluating input batches.
                     let value = Subquery::resolve_struct(self.exec_context_id, id, &data_type)?;
-                    Ok(Arc::new(DataFusionLiteral::new(value)))
+                    Ok(Arc::new(Subquery::resolved_struct_literal(value)))
                 } else {
                     Ok(Arc::new(Subquery::new(self.exec_context_id, id, data_type)))
                 }
