@@ -155,6 +155,43 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     assert(CometScalarSubquery.consumerFallbackReason(deterministic).isEmpty)
   }
 
+  test("synthetic NULL guards do not repeat stateful scalar consumers") {
+    val condition = GreaterThan(Rand(Literal(42L)), Literal(0.5))
+    val numeric = GetStructField(subquery(struct(LongType)), 0)
+    val nullable = If(condition, numeric, Literal.create(null, LongType))
+    val repeated = Coalesce(Seq(nullable, Literal(-1L)))
+    assert(CometScalarSubquery.consumerFallbackReason(repeated).isDefined)
+    assert(QueryPlanSerde.exprToProtoInternal(repeated, Seq.empty, binding = false).isEmpty)
+    val ordinary =
+      Coalesce(Seq(If(condition, Literal(1L), Literal.create(null, LongType)), Literal(-1L)))
+    assert(CometScalarSubquery.consumerFallbackReason(ordinary).isEmpty)
+    val plan = ProjectExec(Seq(Alias(numeric, "numeric")()), emptyInput)
+    CometScalarSubquery.tagPlanInputs(plan)
+    CometScalarSubquery.withPlanInputs(plan) {
+      assert(CometScalarSubquery.consumerFallbackReason(ordinary).isDefined)
+    }
+    val wide = Alias(GetStructField(subquery(struct(StringType)), 0), "wide")()
+    val producer = ProjectExec(Seq(wide), emptyInput)
+    val consumer = ProjectExec(
+      Seq(Alias(OctetLength(wide.toAttribute), "length")(), Alias(ordinary, "stateful")()),
+      producer)
+    CometScalarSubquery.tagPlanInputs(consumer)
+    assert(CometScalarSubquery.rowPathFallbackReason(producer).isDefined)
+    assert(CometScalarSubquery.rowPathFallbackReason(consumer).isDefined)
+    CometScalarSubquery.tagPlanInputs(producer)
+    assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty)
+    assert(
+      QueryPlanSerde
+        .exprToProtoInternal(Alias(repeated, "result")(), Seq.empty, binding = false)
+        .isEmpty)
+    Seq(
+      Coalesce(Seq(numeric, Literal(-1L))),
+      Coalesce(Seq(numeric, If(condition, Literal(1L), Literal(2L))))).foreach { safe =>
+      assert(CometScalarSubquery.consumerFallbackReason(safe).isEmpty, safe)
+      assert(QueryPlanSerde.exprToProtoInternal(safe, Seq.empty, binding = false).isDefined, safe)
+    }
+  }
+
   test("row-dependent nested membership retains Spark short-circuit evaluation") {
     val dt = StructType(Seq(StructField("s", StringType), StructField("f", DoubleType)))
     val scalar = subquery(dt)
@@ -607,6 +644,26 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     // Recompute on the same node: a standalone scalar projection retains its native contract.
     CometScalarSubquery.tagPlanInputs(producer)
     assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty)
+  }
+
+  test("opaque siblings protect both consumers and producers of retained wide values") {
+    val text = Alias(GetStructField(subquery(struct(StringType)), 0), "text")()
+    val binary = AttributeReference("binary", BinaryType)()
+    Seq[Expression](Rand(Literal(42L)), OctetLength(binary)).foreach { sibling =>
+      val producer = ProjectExec(Seq(text), emptyInput)
+      val consumer = ProjectExec(
+        Seq(Alias(OctetLength(text.toAttribute), "length")(), Alias(sibling, "sibling")()),
+        producer)
+      CometScalarSubquery.tagPlanInputs(consumer)
+      assert(CometScalarSubquery.rowPathFallbackReason(producer).isDefined, sibling)
+      assert(CometScalarSubquery.rowPathFallbackReason(consumer).isDefined, sibling)
+      val inner = ProjectExec(Seq(text, Alias(sibling, "sibling")()), emptyInput)
+      val outer =
+        ProjectExec(Seq(Alias(OctetLength(text.toAttribute), "length")(), inner.output(1)), inner)
+      CometScalarSubquery.tagPlanInputs(outer)
+      assert(CometScalarSubquery.rowPathFallbackReason(inner).isDefined, sibling)
+      assert(CometScalarSubquery.rowPathFallbackReason(outer).isDefined, sibling)
+    }
   }
 
   test("pure projections preserve bounded native producer batches") {

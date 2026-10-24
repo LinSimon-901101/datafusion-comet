@@ -3650,6 +3650,78 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar review synthetic NULL guards preserve stateful evaluation") {
+    withSQLConf(
+      SQLConf.ANSI_ENABLED.key -> "false",
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      SQLConf.SUBQUERY_REUSE_ENABLED.key -> "true",
+      SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
+      withTempPath { dir =>
+        withTempView("stateful_items") {
+          withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+            spark.range(256).coalesce(1).write.parquet(dir.getCanonicalPath)
+          }
+          spark.read.parquet(dir.getCanonicalPath).createOrReplaceTempView("stateful_items")
+          val maximum = "(SELECT max(id) FROM stateful_items)"
+          val minimum = "(SELECT min(id) FROM stateful_items)"
+          val expressions = Seq(
+            s"coalesce(IF(rand(42L) > 0.5, $maximum, CAST(NULL AS BIGINT)), id)",
+            "size(IF(rand(42L) > 0.5, array(id), CAST(NULL AS ARRAY<BIGINT>)))",
+            "arrays_zip(IF(rand(42L) > 0.5, array(id), CAST(NULL AS ARRAY<BIGINT>)))",
+            "map_from_arrays(array(id), " +
+              "IF(rand(42L) > 0.5, array(id), CAST(NULL AS ARRAY<BIGINT>)))",
+            "ln(rand(42L) - 0.5D)",
+            "log2(rand(42L) - 0.5D)",
+            "log10(rand(42L) - 0.5D)",
+            "size(array(rand(42L)))",
+            "arrays_zip(array(rand(42L)))",
+            "map_from_arrays(array(id), array(rand(42L)))",
+            "10D / CAST(rand(42L) * 2 AS INT)",
+            "10L DIV CAST(rand(42L) * 2 AS BIGINT)")
+          for (mode <- Seq("CODEGEN_ONLY", "NO_CODEGEN"); expression <- expressions) {
+            withSQLConf(SQLConf.CODEGEN_FACTORY_MODE.key -> mode) {
+              val df = sql(
+                s"SELECT id, $expression AS v, $maximum AS hi, $minimum AS lo " +
+                  "FROM stateful_items")
+              assert(
+                df.queryExecution.optimizedPlan.exists(_.expressions.exists(_.exists {
+                  case GetStructField(_: LogicalScalarSubquery, _, _) => true
+                  case _ => false
+                })),
+                df.queryExecution.optimizedPlan.toString)
+              checkSparkAnswer(df)
+              val reason =
+                new ExtendedExplainInfo().generateVerboseInfo(df.queryExecution.executedPlan)
+              assert(reason.contains("Repeated stateful evaluation"), reason)
+            }
+          }
+          val safe = Seq(
+            s"coalesce(IF(id % 2 = 0, $maximum, CAST(NULL AS BIGINT)), " +
+              "CAST(rand(42L) * 10 AS BIGINT))",
+            "size(array(id))",
+            "arrays_zip(array(id))",
+            "map_from_arrays(array(id), array(id))",
+            "ln(CAST(id / id AS DOUBLE))")
+          safe.foreach { expression =>
+            checkSparkAnswerAndOperator(
+              sql(s"SELECT id, $expression AS v, $maximum AS hi, $minimum AS lo " +
+                "FROM stateful_items"),
+              Seq(classOf[CometProjectExec]))
+          }
+          withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+            Seq("10D / (rand(42L) + 1D)", "10L DIV CAST(rand(42L) * 2 + 1 AS BIGINT)")
+              .foreach { expression =>
+                checkSparkAnswerAndOperator(
+                  sql(s"SELECT id, $expression AS v, $maximum AS hi, $minimum AS lo " +
+                    "FROM stateful_items"),
+                  Seq(classOf[CometProjectExec]))
+              }
+          }
+        }
+      }
+    }
+  }
+
   test("scalar review primitive and fixed-width IN preserve row evaluation") {
     withScalarReviewTables {
       Seq(
@@ -3810,19 +3882,46 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
-  test("scalar review row aggregates avoid materializing retained wide aliases") {
+  test("scalar review row consumers avoid materializing retained wide aliases") {
     withScalarReviewTables {
-      val query = "SELECT count(s), sum(octet_length(s)), sum(octet_length(m)) FROM " +
-        "(SELECT (SELECT max(s) FROM review_wide) s, " +
+      val source = "(SELECT id, (SELECT max(s) FROM review_wide) s, " +
         "(SELECT min(s) FROM review_wide) m FROM review_outer) q"
-      val df = sql(query)
-      checkSparkAnswer(df)
-      assert(
-        df.queryExecution.executedPlan.exists {
+      Seq(
+        "SELECT count(s), sum(octet_length(s)), sum(octet_length(m)) FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), " +
+          "coalesce(IF(rand(42L) > 0.5, 1L, CAST(NULL AS BIGINT)), id) FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), rand(42L) FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), " +
+          "round(CAST(id AS DOUBLE) / 3D, 1) FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), " +
+          "CAST(id + 1 AS DOUBLE) / 3D FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), " +
+          "regexp_extract(CAST(id AS STRING), '(.)', 1) FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), " +
+          "size(filter(array(id, id + 1), x -> x >= 0)) FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), " +
+          "octet_length(unhex(hex(id))) FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), r FROM " +
+          "(SELECT id, (SELECT max(s) FROM review_wide) s, " +
+          "(SELECT min(s) FROM review_wide) m, rand(42L) r FROM review_outer) q")
+        .foreach { query =>
+          val df = sql(query)
+          checkSparkAnswer(df)
+          assert(
+            df.queryExecution.executedPlan.exists {
+              case p: ProjectExec => p.projectList.exists(_.name == "s")
+              case _ => false
+            },
+            df.queryExecution.executedPlan)
+        }
+      withSQLConf("spark.comet.expression.Ascii.enabled" -> "false") {
+        val df = sql("SELECT id, octet_length(s), ascii(s), octet_length(m) FROM " + source)
+        checkSparkAnswer(df)
+        assert(df.queryExecution.executedPlan.exists {
           case p: ProjectExec => p.projectList.exists(_.name == "s")
           case _ => false
-        },
-        df.queryExecution.executedPlan)
+        })
+      }
     }
   }
 

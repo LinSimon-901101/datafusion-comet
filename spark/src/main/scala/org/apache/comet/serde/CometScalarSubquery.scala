@@ -22,7 +22,8 @@ package org.apache.comet.serde
 import scala.jdk.CollectionConverters._
 import scala.util.DynamicVariable
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, And, ArrayContains, ArrayPosition, ArrayRemove, ArraysOverlap, ArrayUnion, Attribute, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, Concat, CreateArray, CreateMap, CreateNamedStruct, DateFromUnixDate, DayOfWeek, DivModLike, ElementAt, EqualNullSafe, EqualTo, Expression, ExprId, GetArrayItem, GetArrayStructFields, GetMapValue, GetStructField, GreaterThan, GreaterThanOrEqual, Greatest, Hour, If, In, InSet, IsNotNull, IsNull, KnownNotNull, KnownNullable, Least, LessThan, LessThanOrEqual, Literal, Minute, Murmur3Hash, NamedExpression, Not, Or, Pmod, PreciseTimestampConversion, Remainder, Second, Slice, SortOrder, SpecifiedWindowFrame, StringLPad, StringRPad, ToUnixTimestamp, TryEval, UnixDate, UnixTimestamp, WeekDay, WindowSpecDefinition, XxHash64}
+import org.apache.spark.sql.catalyst.expressions.{Alias, And, ArrayContains, ArrayPosition, ArrayRemove, ArraysOverlap, ArraysZip, ArrayUnion, Attribute, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, Concat, CreateArray, CreateMap, CreateNamedStruct, DateFormatClass, DateFromUnixDate, DayOfWeek, Divide, DivModLike, ElementAt, EqualNullSafe, EqualTo, EvalMode, Expression, ExprId, GetArrayItem, GetArrayStructFields, GetMapValue, GetStructField, GreaterThan, GreaterThanOrEqual, Greatest, Hour, If, In, InSet, IntegralDivide, IsNotNull, IsNull, KnownNotNull, KnownNullable, LambdaFunction, Least, LessThan, LessThanOrEqual, Literal, Log, Log10, Log2, MapFromArrays, Minute, Murmur3Hash, NamedExpression, Not, Or, Pmod, PreciseTimestampConversion, RegExpExtract, RegExpExtractAll, Remainder, ScalaUDF, Second, Size, Slice, SortOrder, SpecifiedWindowFrame, StringLPad, StringRPad, ToUnixTimestamp, TryEval, UnixDate, UnixTimestamp, WeekDay, WindowSpecDefinition, XxHash64}
+import org.apache.spark.sql.catalyst.expressions.objects.StaticInvoke
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.catalyst.trees.TreePattern.PLAN_EXPRESSION
 import org.apache.spark.sql.comet.CometExec
@@ -68,7 +69,23 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
         reason
       }
     }
-    reason.orElse(Some(structSubqueryRowPathReason))
+    reason
+      .orElse {
+        projected.iterator
+          .flatMap(_.collect { case e: Expression => e })
+          .flatMap { expr =>
+            QueryPlanSerde.exprSerdeMap.get(expr.getClass).flatMap { handler =>
+              handler.asInstanceOf[CometExpressionSerde[Expression]].getSupportLevel(expr) match {
+                case Unsupported(notes) => notes
+                case _ => None
+              }
+            }
+          }
+          .take(1)
+          .toSeq
+          .headOption
+      }
+      .orElse(Some(structSubqueryRowPathReason))
   }
 
   private def provenanceChildren(plan: SparkPlan): Seq[SparkPlan] = plan match {
@@ -236,7 +253,14 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
         }
       }
       val wideChildren = children.filter(wideOutput)
-      if (expandsMaterializedInput || (wideChildren.nonEmpty &&
+      val opaqueWideProjection = original.isInstanceOf[ProjectExec] &&
+        (wideOutput(plan) || wideChildren.nonEmpty) && withPlanInputs(plan) {
+          QueryPlanSerde.withSharedSubexpressions(valueRoots, eagerSharing = true) {
+            valueRoots.exists(e =>
+              requiresRowProjection(e) || consumerFallbackReason(e).isDefined)
+          }
+        }
+      if (expandsMaterializedInput || opaqueWideProjection || (wideChildren.nonEmpty &&
           (!original.isInstanceOf[ProjectExec] ||
             wideChildren.exists(_.getTagValue(structSubqueryRowPath).contains(true))))) {
         plan.setTagValue(structSubqueryRowPath, true)
@@ -562,8 +586,46 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
       (QueryPlanSerde.canShortCircuitNulls(expr) ||
         skippedObservableArguments(expr).forall(QueryPlanSerde.isEagerSharedSubexpression))
 
+  // Opaque/stateful siblings prevent native projection fusion. Keep their wide producer on rows
+  // too; conservatively include native-opt-in handlers without duplicating dispatch decisions.
+  private def requiresRowProjection(expr: Expression): Boolean =
+    !expr.deterministic || expr.exists {
+      case _: ScalaUDF | _: LambdaFunction | _: StaticInvoke | _: RegExpExtract |
+          _: RegExpExtractAll | _: DateFormatClass =>
+        true
+      case node =>
+        QueryPlanSerde.exprSerdeMap.get(node.getClass).forall { handler =>
+          val serde = handler.asInstanceOf[CometExpressionSerde[Expression]]
+          !CometConf.isExprEnabled(serde.getExprConfigName(node)) || (handler match {
+            case _: CometCodegenDispatch[_] => true
+            case _: NativeOptInAvailable if !handler.isInstanceOf[CodegenDispatchFallback] => true
+            case _ =>
+              serde.getSupportLevel(node) match {
+                case Compatible(_, None) => false
+                case _ => true
+              }
+          })
+        }
+    }
+
+  // These serdes repeat operands in synthetic NULL/domain guards, even when non-nullable.
+  private def repeatsStatefulOperand(expr: Expression): Boolean = expr match {
+    case coalesce: Coalesce => coalesce.children.dropRight(1).exists(!_.deterministic)
+    case _: Size | _: ArraysZip | _: MapFromArrays | _: Log | _: Log10 | _: Log2 =>
+      !expr.deterministic
+    case division: Divide if division.evalMode != EvalMode.ANSI =>
+      !division.right.deterministic
+    case division: IntegralDivide if division.evalMode != EvalMode.ANSI =>
+      !division.right.deterministic
+    case _ => false
+  }
+
   private def evaluationFallbackReason(expr: Expression): Option[String] = {
     if (!hasStructSubqueryContext(expr)) return None
+    if (repeatsStatefulOperand(expr)) {
+      return Some(
+        "Repeated stateful evaluation of struct scalar subquery consumers requires Spark")
+    }
     expr match {
       // IN skips candidates after a NULL value or a matching candidate. Native dynamic IN only
       // stops after a batch-wide match, and Spark may evaluate shared candidates eagerly.
