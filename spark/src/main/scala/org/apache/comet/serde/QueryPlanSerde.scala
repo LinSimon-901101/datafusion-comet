@@ -1391,9 +1391,6 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
       } else {
         Nil
       }
-
-    lazy val initializesBloom: Boolean =
-      common.exists(_.exists(_.isInstanceOf[BloomFilterMightContain]))
   }
 
   /**
@@ -1445,9 +1442,6 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
     !SQLConf.get
       .getConfString("spark.sql.codegen.factoryMode", "FALLBACK")
       .equalsIgnoreCase("NO_CODEGEN")
-
-  private[serde] def hasSharedBloomInitialization: Boolean =
-    SQLConf.get.wholeStageEnabled && sharedSubexpressions.value.exists(_.initializesBloom)
 
   /** A common child or operator-wide discovery alone does not prove eager evaluation. */
   private[serde] def isEagerSharedSubexpression(expr: Expression): Boolean =

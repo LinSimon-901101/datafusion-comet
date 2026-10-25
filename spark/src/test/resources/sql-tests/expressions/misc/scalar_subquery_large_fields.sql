@@ -68,7 +68,7 @@ SELECT id, octet_length(IF(id >= 0, (SELECT max(s) FROM large_field_source), '')
 FROM large_field_outer
 
 -- ANSI arithmetic is fallible independently of the width of its selected branch.
-query expect_fallback(Fallible struct scalar subquery consumers require Spark row evaluation)
+query expect_fallback(Fallible struct scalar subquery consumers require Spark evaluation)
 SELECT id, octet_length(IF(id + 1 > 0, (SELECT max(s) FROM large_field_source), '')),
        octet_length(IF(id % 2 = 0, (SELECT min(s) FROM large_field_source), NULL))
 FROM large_field_outer
@@ -107,7 +107,7 @@ FROM large_field_outer
 
 -- A fallible arm must retain Spark row evaluation even when this input never selects it.
 -- Other inputs or a partial reader can expose a different first error.
-query expect_fallback(Fallible struct scalar subquery consumers require Spark row evaluation)
+query expect_fallback(Fallible struct scalar subquery consumers require Spark evaluation)
 SELECT id, IF(id < 0, octet_length(CAST(CAST((SELECT max(s) FROM large_field_source)
                                          AS INT) AS STRING)), 0),
        octet_length((SELECT min(s) FROM large_field_source))

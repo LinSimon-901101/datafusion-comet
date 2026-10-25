@@ -115,6 +115,14 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
       assert(CometScalarSubquery.consumerFallbackReason(total).isEmpty)
       assert(CometScalarSubquery.consumerFallbackReason(cast).isDefined)
       assert(CometScalarSubquery.consumerFallbackReason(fallible).isDefined)
+      val constantCast = cast.copy(child = Literal("invalid"))
+      val constantAdd = Add(value, Literal(Long.MaxValue), EvalMode.ANSI)
+      val constantLike = org.apache.spark.sql.catalyst.expressions
+        .Like(Literal("a"), Literal("a" + 92.toChar), 92.toChar)
+      Seq(constantCast, constantAdd, constantLike).foreach { constant =>
+        assert(constant.references.isEmpty, constant)
+        assert(CometScalarSubquery.consumerFallbackReason(constant).isDefined, constant)
+      }
       assert(CometScalarSubquery.broadcastBuildKeysFallbackReason(Seq(total)).isEmpty)
       assert(CometScalarSubquery.broadcastBuildKeysFallbackReason(Seq(cast)).isDefined)
       val scalarText = GetStructField(subquery(struct(StringType)), 0)
@@ -175,7 +183,9 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
       CaseWhen(Seq(Literal(true) -> Literal(true)), Some(bloom)),
       Coalesce(Seq(Literal(true), bloom)))
     Seq("CODEGEN_ONLY", "NO_CODEGEN", "FALLBACK").foreach { mode =>
-      withSQLConf("spark.sql.codegen.factoryMode" -> mode) {
+      withSQLConf(
+        "spark.sql.codegen.factoryMode" -> mode,
+        "spark.sql.codegen.wholeStage" -> "false") {
         conditionals.foreach { conditional =>
           assert(
             CometScalarSubquery.consumerFallbackReason(conditional).isDefined ==
@@ -191,11 +201,11 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
         assert(CometScalarSubquery.consumerFallbackReason(concat).isDefined)
         val round = Round(Cast(bloom, LongType), Literal.create(null, IntegerType))
         assert(CometScalarSubquery.consumerFallbackReason(round).isDefined)
+        // Generated evaluation alone does not prove a constant wrapper's evaluation schedule.
         assert(
-          CometScalarSubquery.consumerFallbackReason(round.copy(scale = Literal(0))).isDefined ==
-            (mode != "CODEGEN_ONLY"))
+          CometScalarSubquery.consumerFallbackReason(round.copy(scale = Literal(0))).isDefined)
         val parsed = Cast(GetStructField(subquery(struct(StringType)), 0), LongType)
-        assert(CometScalarSubquery.consumerFallbackReason(round.copy(child = parsed)).isEmpty)
+        assert(CometScalarSubquery.consumerFallbackReason(round.copy(child = parsed)).isDefined)
       }
     }
   }
@@ -210,7 +220,9 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
       GreaterThan(nullable, bloom),
       GreaterThanOrEqual(nullable, bloom))
     for (mode <- Seq("NO_CODEGEN", "FALLBACK", "CODEGEN_ONLY")) {
-      withSQLConf("spark.sql.codegen.factoryMode" -> mode) {
+      withSQLConf(
+        "spark.sql.codegen.factoryMode" -> mode,
+        "spark.sql.codegen.wholeStage" -> "false") {
         consumers.foreach { consumer =>
           QueryPlanSerde.withSharedSubexpressions(Seq(consumer)) {
             assert(
@@ -230,7 +242,7 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     }
   }
 
-  test("shared Bloom initialization protects the owning expression group") {
+  test("Bloom initialization preserves the driver phase with or without shared expressions") {
     val value = subquery(struct(BinaryType))
     val first = BloomFilterMightContain(GetStructField(value, 0), Literal(1L))
     val repeated = first.copy(valueExpression = Literal(2L))
@@ -244,15 +256,19 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
         "spark.sql.codegen.wholeStage" -> whole.toString,
         "spark.sql.subexpressionElimination.enabled" -> shared.toString) {
         QueryPlanSerde.withSharedSubexpressions(Seq(first, second, second)) {
-          assert(CometScalarSubquery.consumerFallbackReason(first).isDefined == (whole && shared))
+          assert(CometScalarSubquery.consumerFallbackReason(first).isDefined == whole)
         }
         QueryPlanSerde.withSharedSubexpressions(Seq(first, second)) {
-          assert(CometScalarSubquery.consumerFallbackReason(first).isEmpty)
+          assert(CometScalarSubquery.consumerFallbackReason(first).isDefined == whole)
         }
+        assert(CometScalarSubquery.topKInitializationFallbackReason(Seq(first)).isDefined)
         val safe = GetStructField(subquery(struct(BooleanType)), 0)
         QueryPlanSerde.withSharedSubexpressions(Seq(safe, safe)) {
           assert(CometScalarSubquery.consumerFallbackReason(safe).isEmpty)
         }
+        val plain = BloomFilterMightContain(subquery(BinaryType), Literal(1L))
+        assert(CometScalarSubquery.consumerFallbackReason(plain).isEmpty)
+        assert(CometScalarSubquery.topKInitializationFallbackReason(Seq(plain)).isEmpty)
       }
     }
   }

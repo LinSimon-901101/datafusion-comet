@@ -51,6 +51,9 @@ object CometTakeOrderedAndProjectExec extends CometSink[TakeOrderedAndProjectExe
     if (!isCometShuffleEnabled(op.conf)) {
       return Unsupported(Some("TakeOrderedAndProject requires shuffle to be enabled"))
     }
+    CometScalarSubquerySerde.topKInitializationFallbackReason(op.expressions).foreach { reason =>
+      return Unsupported(Some(reason))
+    }
     val projectProtos = op.projectList.map { p =>
       val o = exprToProto(p, op.child.output)
       if (o.isEmpty) {

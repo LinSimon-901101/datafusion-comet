@@ -342,6 +342,9 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
     "Calendar operations on struct scalar subqueries require Spark because their runtime values " +
       "may exceed the native calendar range"
 
+  private val bloomInitializationFallbackReason =
+    "Bloom initialization of struct scalar subqueries requires Spark evaluation"
+
   private val timezoneConsumerFallbackReason =
     "Timezone-dependent scalar subquery operations require Spark for non-fixed timezones"
 
@@ -751,6 +754,15 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
       None
     }
 
+  def topKInitializationFallbackReason(expressions: Seq[Expression]): Option[String] =
+    if (expressions.exists(hasStructSubqueryContext) &&
+      expressions.exists(_.exists(_.isInstanceOf[BloomFilterMightContain]))) {
+      // TopK builds its ordering and collect projection on the driver, even with no tasks.
+      Some(bloomInitializationFallbackReason)
+    } else {
+      None
+    }
+
   def groupedAggregateFallbackReason(plan: BaseAggregateExec): Option[String] =
     if (plan.groupingExpressions.nonEmpty &&
       plan.aggregateExpressions.exists(hasStructSubqueryContext) &&
@@ -831,23 +843,17 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
 
   private def evaluationFallbackReason(expr: Expression): Option[String] = {
     if (!hasStructSubqueryContext(expr)) return None
-    val readsRows = expr.references.nonEmpty || !expr.deterministic ||
-      expr.exists(_.isInstanceOf[BoundReference])
-    if (readsRows && !canEvaluateInAnyRowOrder(expr) &&
-      !(deferredTopKSort.value && deferredTopKKey(expr))) {
-      return Some("Fallible struct scalar subquery consumers require Spark row evaluation")
-    }
     expr match {
       // Runtime masks cannot defer native Bloom setup. FALLBACK can also recover from a
       // code-generation error and interpret the expression, including its first-error order.
-      // Whole-stage codegen initializes shared subtrees before the other operator expressions.
+      // Whole-stage codegen initializes on the driver, even when there are no input tasks.
       case _
           if expr.exists(_.isInstanceOf[BloomFilterMightContain]) &&
             (!SQLConf.get
               .getConfString("spark.sql.codegen.factoryMode", "FALLBACK")
               .equalsIgnoreCase("CODEGEN_ONLY") ||
-              QueryPlanSerde.hasSharedBloomInitialization) =>
-        Some("Bloom initialization of struct scalar subqueries requires Spark evaluation")
+              SQLConf.get.wholeStageEnabled) =>
+        Some(bloomInitializationFallbackReason)
       // IN skips candidates after a NULL value or a matching candidate. Native dynamic IN only
       // stops after a batch-wide match, and Spark may evaluate shared candidates eagerly.
       case in: In
@@ -979,13 +985,20 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
           Some("Unbounded struct scalar subquery constructors require Spark row evaluation")
         } else None
       }
+      .orElse(evaluationFallbackReason(expr))
       .orElse {
         expr.children.iterator.map(consumerFallbackReason).collectFirst {
           case Some(childReason) =>
             childReason
         }
       }
-      .orElse(evaluationFallbackReason(expr))
+      .orElse {
+        // A constant can still fail during code generation or before the first input row.
+        if (hasStructSubqueryContext(expr) && !canEvaluateInAnyRowOrder(expr) &&
+          !(deferredTopKSort.value && deferredTopKKey(expr))) {
+          Some("Fallible struct scalar subquery consumers require Spark evaluation")
+        } else None
+      }
   }
 
   override def getUnsupportedReasons(): Seq[String] = Seq(

@@ -3571,31 +3571,57 @@ class CometExecSuite extends CometTestBase {
           spark.range(1000).coalesce(1).write.parquet(fact)
           spark.read.parquet(dim).createOrReplaceTempView("dim")
           spark.read.parquet(fact).createOrReplaceTempView("fact")
-          val df = sql("""
+          for (whole <- Seq(false, true))
+            withSQLConf(
+              SQLConf.CODEGEN_FACTORY_MODE.key -> "CODEGEN_ONLY",
+              SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> whole.toString) {
+              val df = sql("""
             |SELECT fact.id,
             |       (SELECT percentile(id, 0.5) FROM dim
             |        WHERE v = 'keep' AND id IS NOT NULL) AS p
             |FROM fact JOIN dim ON fact.id = dim.id WHERE dim.v = 'keep'
             |""".stripMargin)
-          val mergedFilters = df.queryExecution.optimizedPlan.collect { case p =>
-            p.expressions.flatMap(_.collect {
-              case b: org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain
-                  if b.left.isInstanceOf[GetStructField] =>
-                b
-            })
-          }.flatten
-          assert(mergedFilters.nonEmpty, df.queryExecution.optimizedPlan.toString)
-          val (_, plan) = checkSparkAnswerAndOperator(df, Seq(classOf[CometFilterExec]))
-          assert(
-            stripAQEPlan(plan)
-              .collect { case p: CometFilterExec => p }
-              .exists(_.condition.exists {
-                case b: org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain =>
-                  b.left.isInstanceOf[GetStructField]
-                case _ => false
-              }),
-            plan.toString)
-          checkAnswer(df, Seq(Row(0L, 0.5), Row(1L, 0.5)))
+              val mergedFilters = df.queryExecution.optimizedPlan.collect { case p =>
+                p.expressions.flatMap(_.collect {
+                  case b: org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain
+                      if b.left.isInstanceOf[GetStructField] =>
+                    b
+                })
+              }.flatten
+              assert(mergedFilters.nonEmpty, df.queryExecution.optimizedPlan.toString)
+              if (!whole) {
+                val (_, plan) = checkSparkAnswerAndOperator(df, Seq(classOf[CometFilterExec]))
+                assert(
+                  stripAQEPlan(plan)
+                    .collect { case p: CometFilterExec => p }
+                    .exists(_.condition.exists {
+                      case b: org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain =>
+                        b.left.isInstanceOf[GetStructField]
+                      case _ => false
+                    }),
+                  plan.toString)
+              } else {
+                checkSparkAnswer(df)
+                val plan = stripAQEPlan(df.queryExecution.executedPlan)
+                assert(
+                  plan.exists {
+                    case filter: FilterExec =>
+                      filter.condition.exists {
+                        case b: org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain =>
+                          b.left.isInstanceOf[GetStructField]
+                        case _ => false
+                      }
+                    case _ => false
+                  },
+                  plan)
+                assert(
+                  new ExtendedExplainInfo()
+                    .getFallbackReasons(plan)
+                    .exists(_.contains("Bloom initialization")),
+                  plan)
+              }
+              checkAnswer(df, Seq(Row(0L, 0.5), Row(1L, 0.5)))
+            }
         }
       }
     }
@@ -3894,14 +3920,19 @@ class CometExecSuite extends CometTestBase {
             }
             if (comet) {
               val plan = stripAQEPlan(df.queryExecution.executedPlan)
-              if (mode != "CODEGEN_ONLY") {
+              if (mode != "CODEGEN_ONLY" || expected.isEmpty) {
                 assert(plan.exists {
                   case project: ProjectExec =>
                     project.projectList.exists(_.exists(_.prettyName == name))
                   case _ => false
                 })
                 val reasons = new ExtendedExplainInfo().getFallbackReasons(plan)
-                assert(reasons.exists(_.contains("Bloom initialization")), reasons)
+                val reason = if (mode == "CODEGEN_ONLY") {
+                  "Fallible struct scalar subquery consumers"
+                } else {
+                  "Bloom initialization"
+                }
+                assert(reasons.exists(_.contains(reason)), reasons)
               } else {
                 val projects = plan.collect {
                   case p: CometProjectExec
@@ -3987,7 +4018,7 @@ class CometExecSuite extends CometTestBase {
               }
               if (comet) {
                 val plan = stripAQEPlan(df.queryExecution.executedPlan)
-                if (reordered) {
+                if (whole) {
                   assert(
                     plan.exists {
                       case p: ProjectExec =>
@@ -4031,6 +4062,185 @@ class CometExecSuite extends CometTestBase {
             }
           }
         } finally sql("DROP TEMPORARY FUNCTION IF EXISTS review_might")
+      }
+    }
+  }
+
+  test("scalar review Bloom initialization preserves zero-task codegen errors") {
+    withTempPath { path =>
+      withTempView("review_bloom_source", "review_bloom_outer") {
+        withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+          spark.range(0, 4, 1, 1).write.parquet(path.toString)
+        }
+        spark.read.parquet(path.toString).createOrReplaceTempView("review_bloom_source")
+        spark.sessionState.functionRegistry.createOrReplaceTempFunction(
+          "review_might",
+          (children: Seq[Expression]) =>
+            org.apache.spark.sql.catalyst.expressions
+              .BloomFilterMightContain(children.head, children(1)),
+          "built-in")
+        val inputs = Seq(
+          spark.sparkContext.emptyRDD[Row],
+          spark.sparkContext.parallelize(Seq.empty[Row], 1),
+          spark.sparkContext.parallelize((0L until 4L).map(Row(_)), 1))
+        try {
+          for ((input, index) <- inputs.zipWithIndex) {
+            spark
+              .createDataFrame(input, StructType(Seq(StructField("id", LongType, false))))
+              .createOrReplaceTempView("review_bloom_outer")
+            for {
+              shape <- Seq("project", "topk-order", "topk-project")
+              whole <- Seq(false, true)
+              comet <- Seq(false, true)
+              asRDD <- Seq(false, true)
+            } {
+              withSQLConf(
+                SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+                SQLConf.CODEGEN_FACTORY_MODE.key -> "CODEGEN_ONLY",
+                SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> whole.toString,
+                SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "false",
+                CometConf.COMET_ENABLED.key -> comet.toString) {
+                val bloom = "review_might((SELECT max(named_struct('b', unhex('00000000'))) " +
+                  "FROM review_bloom_source).b, id)"
+                val df = sql(shape match {
+                  case "topk-order" =>
+                    s"SELECT id FROM review_bloom_outer ORDER BY $bloom LIMIT 1"
+                  case "topk-project" =>
+                    s"SELECT $bloom answer FROM " +
+                      "(SELECT id FROM review_bloom_outer ORDER BY id) q LIMIT 1"
+                  case _ => s"SELECT $bloom answer FROM review_bloom_outer"
+                })
+                def result: Array[Row] = if (asRDD) df.rdd.collect() else df.collect()
+                // TopK's row-RDD empty-input shortcut skips its collect-only projection setup.
+                if (index == 0 && ((!whole && shape == "project") ||
+                    (asRDD && shape == "topk-project"))) {
+                  assert(result.isEmpty)
+                } else {
+                  val error = withClue(
+                    s"input=$index shape=$shape whole=$whole comet=$comet asRDD=$asRDD: ") {
+                    intercept[Exception](result)
+                  }
+                  assert(
+                    causeChain(error).exists(e =>
+                      Option(e.getMessage).exists(message =>
+                        message.contains("BloomFilter version: 0") ||
+                          message.contains("Bloom filter version number (0)"))),
+                    error)
+                }
+                if (comet) {
+                  val plan = stripAQEPlan(df.queryExecution.executedPlan)
+                  if (whole || shape != "project") {
+                    assert(
+                      plan.exists {
+                        case p: ProjectExec if shape == "project" =>
+                          p.projectList.exists(_.name == "answer")
+                        case t: TakeOrderedAndProjectExec =>
+                          t.expressions.exists(_.exists(_.isInstanceOf[
+                            org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain]))
+                        case _ => false
+                      },
+                      plan)
+                    assert(
+                      new ExtendedExplainInfo()
+                        .getFallbackReasons(plan)
+                        .exists(_.contains("Bloom initialization")),
+                      plan)
+                  } else {
+                    val projects = plan.collect {
+                      case p: CometProjectExec if p.projectList.exists(_.name == "answer") => p
+                    }
+                    assert(projects.nonEmpty, plan)
+                    projects.foreach { project =>
+                      val names = project.projectList.flatMap(_.collect {
+                        case bloom: org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain =>
+                          bloom.prettyName
+                      })
+                      assert(names.nonEmpty, project)
+                      names.foreach { name =>
+                        assert(
+                          project
+                            .getTagValue(CometExplainInfo.NATIVE_EXPRS)
+                            .exists(_.contains(name)),
+                          project)
+                        assert(
+                          !project
+                            .getTagValue(CometExplainInfo.CODEGEN_DISPATCH_EXPRS)
+                            .exists(_.contains(name)),
+                          project)
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } finally sql("DROP TEMPORARY FUNCTION IF EXISTS review_might")
+      }
+    }
+  }
+
+  test("scalar review constant initialization preserves codegen errors without row references") {
+    withTempPath { path =>
+      withTempView("review_constant_source", "review_constant_outer") {
+        withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+          spark.range(0, 4, 1, 1).write.parquet(path.toString)
+        }
+        spark.read.parquet(path.toString).createOrReplaceTempView("review_constant_source")
+        spark.sessionState.functionRegistry.createOrReplaceTempFunction(
+          "review_invalid_like",
+          (_: Seq[Expression]) =>
+            org.apache.spark.sql.catalyst.expressions
+              .Like(Literal("a"), Literal("a" + 92.toChar), 92.toChar),
+          "built-in")
+        val inputs = Seq(
+          spark.sparkContext.emptyRDD[Row],
+          spark.sparkContext.parallelize(Seq.empty[Row], 1),
+          spark.sparkContext.parallelize(Seq(Row(1L)), 1))
+        try {
+          for ((input, index) <- inputs.zipWithIndex) {
+            spark
+              .createDataFrame(input, StructType(Seq(StructField("id", LongType, false))))
+              .createOrReplaceTempView("review_constant_outer")
+            for (whole <- Seq(true, false); comet <- Seq(false, true)) {
+              withSQLConf(
+                SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+                SQLConf.CODEGEN_FACTORY_MODE.key -> "CODEGEN_ONLY",
+                SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> whole.toString,
+                SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "false",
+                SQLConf.OPTIMIZER_EXCLUDED_RULES.key ->
+                  "org.apache.spark.sql.catalyst.optimizer.ConstantFolding",
+                CometConf.COMET_ENABLED.key -> comet.toString) {
+                val df = sql(
+                  "SELECT (SELECT max(named_struct('n', id)) FROM review_constant_source).n n, " +
+                    "review_invalid_like(id) answer FROM review_constant_outer")
+                if (index == 0 && !whole) {
+                  assert(df.collect().isEmpty)
+                } else {
+                  val error = intercept[Exception](df.collect())
+                  assert(
+                    causeChain(error).exists(e =>
+                      Option(e.getMessage)
+                        .exists(_.contains("INVALID_FORMAT.ESC_AT_THE_END"))),
+                    error)
+                }
+                if (comet) {
+                  val plan = stripAQEPlan(df.queryExecution.executedPlan)
+                  assert(
+                    plan.exists {
+                      case p: ProjectExec => p.projectList.exists(_.name == "answer")
+                      case _ => false
+                    },
+                    plan)
+                  assert(
+                    new ExtendedExplainInfo()
+                      .getFallbackReasons(plan)
+                      .exists(_.contains("Fallible struct scalar subquery consumers")),
+                    plan)
+                }
+              }
+            }
+          }
+        } finally sql("DROP TEMPORARY FUNCTION IF EXISTS review_invalid_like")
       }
     }
   }

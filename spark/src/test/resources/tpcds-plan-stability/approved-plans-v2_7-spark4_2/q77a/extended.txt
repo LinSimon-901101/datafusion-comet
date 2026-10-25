@@ -50,7 +50,7 @@ CometColumnarToRow
                :           :                          +- CometBroadcastExchange
                :           :                             +- CometFilter
                :           :                                +- CometNativeScan parquet spark_catalog.default.store
-               :           :-  Project [COMET: Fallible struct scalar subquery consumers require Spark row evaluation]
+               :           :-  Project [COMET: Fallible struct scalar subquery consumers require Spark evaluation]
                :           :  +- CometColumnarToRow
                :           :     +- CometBroadcastNestedLoopJoin
                :           :        :- CometBroadcastExchange
@@ -170,7 +170,7 @@ CometColumnarToRow
                :                    :                          +- CometBroadcastExchange
                :                    :                             +- CometFilter
                :                    :                                +- CometNativeScan parquet spark_catalog.default.store
-               :                    :-  Project [COMET: Fallible struct scalar subquery consumers require Spark row evaluation]
+               :                    :-  Project [COMET: Fallible struct scalar subquery consumers require Spark evaluation]
                :                    :  +- CometColumnarToRow
                :                    :     +- CometBroadcastNestedLoopJoin
                :                    :        :- CometBroadcastExchange
@@ -290,7 +290,7 @@ CometColumnarToRow
                                     :                          +- CometBroadcastExchange
                                     :                             +- CometFilter
                                     :                                +- CometNativeScan parquet spark_catalog.default.store
-                                    :-  Project [COMET: Fallible struct scalar subquery consumers require Spark row evaluation]
+                                    :-  Project [COMET: Fallible struct scalar subquery consumers require Spark evaluation]
                                     :  +- CometColumnarToRow
                                     :     +- CometBroadcastNestedLoopJoin
                                     :        :- CometBroadcastExchange
