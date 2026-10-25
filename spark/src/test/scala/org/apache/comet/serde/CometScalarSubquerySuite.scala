@@ -170,12 +170,21 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
   test("conditional and broadcast Bloom initialization retain their own stage gates") {
     val bloom =
       BloomFilterMightContain(GetStructField(subquery(struct(BinaryType)), 0), Literal(1L))
-    val conditional = If(Literal(true), Literal(true), bloom)
+    val conditionals = Seq(
+      If(Literal(true), Literal(true), bloom),
+      CaseWhen(Seq(Literal(true) -> Literal(true)), Some(bloom)),
+      Coalesce(Seq(Literal(true), bloom)))
     Seq("CODEGEN_ONLY", "NO_CODEGEN").foreach { mode =>
       withSQLConf("spark.sql.codegen.factoryMode" -> mode) {
-        assert(
-          CometScalarSubquery.consumerFallbackReason(conditional).isDefined ==
-            (mode == "NO_CODEGEN"))
+        conditionals.foreach { conditional =>
+          assert(
+            CometScalarSubquery.consumerFallbackReason(conditional).isDefined ==
+              (mode == "NO_CODEGEN"),
+            conditional)
+        }
+        val safe = Coalesce(Seq(GetStructField(subquery(struct(BooleanType)), 0), Literal(true)))
+        assert(CometScalarSubquery.consumerFallbackReason(safe).isEmpty)
+        assert(QueryPlanSerde.exprToProtoInternal(safe, Seq.empty, binding = false).isDefined)
         assert(CometScalarSubquery.broadcastBuildKeysFallbackReason(Seq(bloom)).isDefined)
         val text = If(bloom, Literal("x"), Literal("y"))
         val concat = ConcatWs(Seq(Literal.create(null, StringType), text))

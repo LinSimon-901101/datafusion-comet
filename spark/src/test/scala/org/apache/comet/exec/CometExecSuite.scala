@@ -3837,6 +3837,75 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar review Coalesce Bloom initialization follows evaluation mode") {
+    withScalarReviewTables {
+      val registry = spark.sessionState.functionRegistry
+      registry.createOrReplaceTempFunction(
+        "review_might",
+        (children: Seq[Expression]) =>
+          org.apache.spark.sql.catalyst.expressions
+            .BloomFilterMightContain(children.head, children(1)),
+        "internal")
+      def query: DataFrame = sql(
+        "SELECT coalesce((SELECT max(k) >= 0 FROM review_nums), " +
+          "review_might((SELECT max(named_struct('b', unhex('00000000'))) " +
+          "FROM review_nums).b, 1L)) answer FROM review_nums WHERE k = 0")
+      try
+        for {
+          mode <- Seq("NO_CODEGEN", "CODEGEN_ONLY")
+          shared <- Seq(false, true)
+          comet <- Seq(false, true)
+        } {
+          withSQLConf(
+            SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
+            SQLConf.CODEGEN_FACTORY_MODE.key -> mode,
+            SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> shared.toString,
+            CometConf.COMET_ENABLED.key -> comet.toString) {
+            val df = query
+            assert(
+              df.queryExecution.optimizedPlan.exists(_.expressions.exists(_.exists {
+                case GetStructField(_: LogicalScalarSubquery, _, _) => true
+                case _ => false
+              })),
+              df.queryExecution.optimizedPlan.toString)
+            if (mode == "NO_CODEGEN") {
+              assert(df.collect().toSeq == Seq(Row(true)))
+            } else {
+              val error = intercept[Exception](df.collect())
+              assert(
+                causeChain(error).exists(e =>
+                  Option(e.getMessage).exists(_.contains("BloomFilter version: 0"))),
+                error)
+            }
+            if (comet) {
+              val plan = stripAQEPlan(df.queryExecution.executedPlan)
+              if (mode == "NO_CODEGEN") {
+                assert(plan.exists {
+                  case project: ProjectExec =>
+                    project.projectList.exists(_.exists(
+                      _.isInstanceOf[org.apache.spark.sql.catalyst.expressions.Coalesce]))
+                  case _ => false
+                })
+                val reasons = new ExtendedExplainInfo().getFallbackReasons(plan)
+                assert(reasons.exists(_.contains("Conditional Bloom initialization")), reasons)
+              } else {
+                assertExpressionImpl(plan, native = Seq("coalesce"), dispatched = Seq.empty)
+              }
+              val safe = sql(
+                "SELECT coalesce((SELECT max(named_struct('flag', k >= 0)) " +
+                  "FROM review_nums).flag, false) answer FROM review_nums WHERE k = 0")
+              assert(safe.collect().toSeq == Seq(Row(true)))
+              assertExpressionImpl(
+                safe.queryExecution.executedPlan,
+                native = Seq("coalesce"),
+                dispatched = Seq.empty)
+            }
+          }
+        }
+      finally sql("DROP TEMPORARY FUNCTION IF EXISTS review_might")
+    }
+  }
+
   test("scalar review whole-stage filters do not eagerly evaluate shared Slice arguments") {
     withScalarReviewTables {
       for (filterSharing <- Seq(false, true))

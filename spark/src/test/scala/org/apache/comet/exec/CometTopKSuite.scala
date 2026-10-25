@@ -215,56 +215,56 @@ class CometTopKSuite extends CometTestBase {
     }
   }
 
-  for (adaptive <- Seq(false, true) if isSpark40Plus) {
-    test(s"native deferred TopK preserves skipped overflow keys: AQE=$adaptive") {
-      withSQLConf(
-        SQLConf.ANSI_ENABLED.key -> "true",
-        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> adaptive.toString,
-        SQLConf.LEAF_NODE_DEFAULT_PARALLELISM.key -> "1") {
-        withParquetTable(Seq(Tuple1(1)), "topk_one") {
-          val scalar = "(SELECT named_struct('v', max(_1)) FROM topk_one).v"
-          for (rows <- Seq(Seq((0, Int.MaxValue)), (0 until 40).map(i => (i, Int.MaxValue)))) {
-            withParquetTable(rows, "topk_lazy") {
-              val key = if (rows.size == 1) s"_2 + $scalar" else s"_1, _2 + $scalar"
-              val (_, plan) = checkSparkAnswerAndOperator(
-                sql(s"SELECT _1 FROM topk_lazy ORDER BY $key LIMIT 7"),
-                classOf[CometTakeOrderedAndProjectExec])
-              val topK = collect(plan) { case t: CometTakeOrderedAndProjectExec => t }.head
-              assert(operators(topK.finalNativePlan(1).get).exists { op =>
-                op.hasSort && op.getSort.getDeferSortErrors
-              })
+  if (isSpark40Plus) {
+    for (adaptive <- Seq(false, true)) {
+      test(s"native deferred TopK preserves skipped overflow keys: AQE=$adaptive") {
+        withSQLConf(
+          SQLConf.ANSI_ENABLED.key -> "true",
+          SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> adaptive.toString,
+          SQLConf.LEAF_NODE_DEFAULT_PARALLELISM.key -> "1") {
+          withParquetTable(Seq(Tuple1(1)), "topk_one") {
+            val scalar = "(SELECT named_struct('v', max(_1)) FROM topk_one).v"
+            for (rows <- Seq(Seq((0, Int.MaxValue)), (0 until 40).map(i => (i, Int.MaxValue)))) {
+              withParquetTable(rows, "topk_lazy") {
+                val key = if (rows.size == 1) s"_2 + $scalar" else s"_1, _2 + $scalar"
+                val (_, plan) = checkSparkAnswerAndOperator(
+                  sql(s"SELECT _1 FROM topk_lazy ORDER BY $key LIMIT 7"),
+                  classOf[CometTakeOrderedAndProjectExec])
+                val topK = collect(plan) { case t: CometTakeOrderedAndProjectExec => t }.head
+                assert(operators(topK.finalNativePlan(1).get).exists { op =>
+                  op.hasSort && op.getSort.getDeferSortErrors
+                })
+              }
             }
-          }
-          withParquetTable(Seq((0, Int.MaxValue), (0, 0)), "topk_lazy") {
-            def query = sql(s"SELECT _1 FROM topk_lazy ORDER BY _1, _2 + $scalar LIMIT 7")
-            var expected = Option.empty[(String, String, java.util.Map[String, String])]
-            for (comet <- Seq(false, true)) {
-              withSQLConf(CometConf.COMET_ENABLED.key -> comet.toString) {
-                val df = query
-                val error = intercept[Exception](df.collect())
-                val actual = Iterator
-                  .iterate[Throwable](error)(_.getCause)
-                  .takeWhile(_ != null)
-                  .collectFirst {
-                    case e: SparkThrowable if e.getErrorClass != null =>
-                      (e.getErrorClass, e.getSqlState, e.getMessageParameters)
-                  }
-                assert(actual.exists(v => v._1 == "ARITHMETIC_OVERFLOW" && v._2 == "22003"))
-                if (comet) {
-                  assert(actual == expected)
-                  assert(collect(df.queryExecution.executedPlan) {
-                    case t: CometTakeOrderedAndProjectExec => t
-                  }.nonEmpty)
-                } else expected = actual
+            withParquetTable(Seq((0, Int.MaxValue), (0, 0)), "topk_lazy") {
+              def query = sql(s"SELECT _1 FROM topk_lazy ORDER BY _1, _2 + $scalar LIMIT 7")
+              var expected = Option.empty[(String, String, java.util.Map[String, String])]
+              for (comet <- Seq(false, true)) {
+                withSQLConf(CometConf.COMET_ENABLED.key -> comet.toString) {
+                  val df = query
+                  val error = intercept[Exception](df.collect())
+                  val actual = Iterator
+                    .iterate[Throwable](error)(_.getCause)
+                    .takeWhile(_ != null)
+                    .collectFirst {
+                      case e: SparkThrowable if e.getErrorClass != null =>
+                        (e.getErrorClass, e.getSqlState, e.getMessageParameters)
+                    }
+                  assert(actual.exists(v => v._1 == "ARITHMETIC_OVERFLOW" && v._2 == "22003"))
+                  if (comet) {
+                    assert(actual == expected)
+                    assert(collect(df.queryExecution.executedPlan) {
+                      case t: CometTakeOrderedAndProjectExec => t
+                    }.nonEmpty)
+                  } else expected = actual
+                }
               }
             }
           }
         }
       }
     }
-  }
 
-  if (isSpark40Plus) {
     test("native deferred TopK collect merges only the required sorted prefixes") {
       withSQLConf(
         SQLConf.ANSI_ENABLED.key -> "true",

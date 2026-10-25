@@ -837,7 +837,7 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
       return Some("Fallible struct scalar subquery consumers require Spark row evaluation")
     }
     expr match {
-      case _: If | _: CaseWhen
+      case _: If | _: CaseWhen | _: Coalesce
           if !QueryPlanSerde.usesGeneratedExpressionEvaluation &&
             expr.exists(_.isInstanceOf[BloomFilterMightContain]) =>
         Some("Conditional Bloom initialization of struct scalar subqueries requires Spark")

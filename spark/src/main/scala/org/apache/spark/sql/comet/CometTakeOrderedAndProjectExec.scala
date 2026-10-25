@@ -135,7 +135,7 @@ case class CometTakeOrderedAndProjectExec(
   lazy val orderingSatisfies: Boolean =
     SortOrder.orderingSatisfies(child.outputOrdering, sortOrder)
 
-  lazy val deferSortErrors =
+  lazy val deferSortErrors: Boolean =
     CometScalarSubquerySerde.usesDeferredTopK(sortOrder, limit, projectList)
 
   // Also exposed to tests so they can inspect the plan actually used for final execution.
