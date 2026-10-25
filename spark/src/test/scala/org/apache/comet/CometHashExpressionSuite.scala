@@ -173,7 +173,7 @@ class CometHashExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelpe
         (1, 2, 3, 4), (null, null, null, null),
         (-128, -32768, -2147483648, -9223372036854775808),
         (127, 32767, 2147483647, 9223372036854775807)""")
-      checkSparkAnswerAndOperator("""SELECT hash(array(a,b,c,d)),
+      checkNativeHashes("""SELECT hash(array(a,b,c,d)),
         hash(c,array(a,b),d), hash(array(a,null),b),
         hash(CASE WHEN c IS NULL THEN CAST(NULL AS ARRAY<BIGINT>) ELSE array(d,1L) END),
         hash(array(CAST(a AS BIGINT),(SELECT max(d) FROM t),(SELECT min(d) FROM t))),
