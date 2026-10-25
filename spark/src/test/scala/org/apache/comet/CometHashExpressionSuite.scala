@@ -226,8 +226,8 @@ class CometHashExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelpe
         hash(array(s,s)), hash(array(x,x)), hash(array(st,st)), hash(array(a,a)),
         hash(b,array(st,null),s), xxhash64(array(b,b)), xxhash64(array(d,d)),
         xxhash64(array(w,w)), xxhash64(array(s,s)), xxhash64(array(x,x)),
-        xxhash64(array(st,st)), xxhash64(array(a,a)), xxhash64(b,array(st,null),s),
-        hash(array(d,(SELECT max(d) FROM t),(SELECT min(d) FROM t))),
+        xxhash64(array(st,st)), xxhash64(array(a,a)), xxhash64(b,array(st,null),s) FROM t""")
+      checkNativeHashes("""SELECT hash(array(d,(SELECT max(d) FROM t),(SELECT min(d) FROM t))),
         xxhash64(array(d,(SELECT max(d) FROM t),(SELECT min(d) FROM t))) FROM t""")
     }
   }
