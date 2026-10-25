@@ -903,7 +903,18 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
    * whole-struct casts. A physical subquery may be reused, but it is still an
    * [[ExecSubqueryExpression]]; its result must never be evaluated while planning this check.
    */
-  private[serde] def consumerFallbackReason(expr: Expression): Option[String] = {
+  private[serde] def consumerFallbackReason(expr: Expression): Option[String] =
+    specificConsumerFallbackReason(expr).orElse {
+      // Constants can fail during setup. Check every subtree, including Bloom's filter input.
+      if (hasStructSubqueryContext(expr) && expr.exists { node =>
+          hasStructSubqueryContext(node) && !canEvaluateInAnyRowOrder(node) &&
+          !(deferredTopKSort.value && deferredTopKKey(node))
+        }) {
+        Some("Fallible struct scalar subquery consumers require Spark evaluation")
+      } else None
+    }
+
+  private def specificConsumerFallbackReason(expr: Expression): Option[String] = {
     // Skip paths without struct subqueries. A newly admitted calendar consumer can be a
     // sibling or ancestor of a struct-producing operator without using its result directly.
     // Aliases still carry value provenance through the owning plan's ExprIds.
@@ -985,20 +996,13 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
           Some("Unbounded struct scalar subquery constructors require Spark row evaluation")
         } else None
       }
-      .orElse(evaluationFallbackReason(expr))
       .orElse {
-        expr.children.iterator.map(consumerFallbackReason).collectFirst {
+        expr.children.iterator.map(specificConsumerFallbackReason).collectFirst {
           case Some(childReason) =>
             childReason
         }
       }
-      .orElse {
-        // A constant can still fail during code generation or before the first input row.
-        if (hasStructSubqueryContext(expr) && !canEvaluateInAnyRowOrder(expr) &&
-          !(deferredTopKSort.value && deferredTopKKey(expr))) {
-          Some("Fallible struct scalar subquery consumers require Spark evaluation")
-        } else None
-      }
+      .orElse(evaluationFallbackReason(expr))
   }
 
   override def getUnsupportedReasons(): Seq[String] = Seq(
