@@ -32,7 +32,8 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, PrimitiveArray, PrimitiveBuilder, RecordBatch, RecordBatchOptions,
+    make_array, Array, ArrayData, ArrayRef, AsArray, PrimitiveArray, PrimitiveBuilder, RecordBatch,
+    RecordBatchOptions,
 };
 use arrow::compute::interleave_record_batch;
 use arrow::datatypes::{ArrowPrimitiveType, DataType, Int32Type, Int64Type, SchemaRef};
@@ -359,6 +360,101 @@ fn key_scratch_bytes(rows: usize, keys: usize) -> Result<usize> {
         })
 }
 
+fn reserve_key_rows(
+    reservation: &MemoryReservation,
+    base: usize,
+    mut count: usize,
+    keys: usize,
+) -> Result<usize> {
+    loop {
+        let bytes = checked_bytes(base, key_scratch_bytes(count, keys)?)?;
+        match reservation.try_resize(bytes) {
+            Ok(()) => return Ok(count),
+            Err(error)
+                if count > 1
+                    && matches!(error.find_root(), DataFusionError::ResourcesExhausted(_)) =>
+            {
+                count = count.div_ceil(2);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+// Bound selected-value copies and interleave's child-index workspace. Arrow's
+// generic slice size includes an entire list/map child, which needs slicing too.
+fn copied_value_bytes(data: &ArrayData) -> Result<usize> {
+    let nested = match data.data_type() {
+        DataType::Struct(_) => Some((0, data.len(), 0)),
+        DataType::List(_) | DataType::Map(_, _) => {
+            let offsets = data.buffer::<i32>(0);
+            Some((
+                offsets[0] as usize,
+                (offsets[data.len()] - offsets[0]) as usize,
+                4,
+            ))
+        }
+        DataType::LargeList(_) => {
+            let offsets = data.buffer::<i64>(0);
+            Some((
+                offsets[0] as usize,
+                (offsets[data.len()] - offsets[0]) as usize,
+                8,
+            ))
+        }
+        DataType::FixedSizeList(_, width) => Some((
+            data.offset() * *width as usize,
+            data.len() * *width as usize,
+            0,
+        )),
+        _ => None,
+    };
+    let bytes = if let Some((start, len, offset_width)) = nested {
+        let mut size = checked_bytes(data.len().div_ceil(8), (data.len() + 1) * offset_width)?;
+        for child in data.child_data() {
+            let child = if matches!(data.data_type(), DataType::Struct(_)) {
+                child.clone()
+            } else {
+                child.slice(start, len)
+            };
+            size = checked_bytes(size, copied_value_bytes(&child)?)?;
+        }
+        checked_bytes(size, len.saturating_mul(2 * size_of::<usize>()))?
+    } else if matches!(data.data_type(), DataType::Utf8View | DataType::BinaryView) {
+        let array = make_array(data.clone());
+        let values = if matches!(data.data_type(), DataType::Utf8View) {
+            array.as_string_view().total_buffer_bytes_used()
+        } else {
+            array.as_binary_view().total_buffer_bytes_used()
+        };
+        checked_bytes(data.len().saturating_mul(16), values)?
+    } else if matches!(data.data_type(), DataType::Dictionary(_, _)) {
+        // Dictionary interleave retains its dictionary values.
+        data.get_buffer_memory_size()
+    } else {
+        data.get_slice_memory_size()?
+    };
+    checked_bytes(bytes.saturating_mul(2), 256 + size_of::<ArrayData>())
+}
+
+fn compact_view_buffers(data: ArrayData) -> Result<ArrayData> {
+    match data.data_type() {
+        DataType::Utf8View => Ok(make_array(data).as_string_view().gc().to_data()),
+        DataType::BinaryView => Ok(make_array(data).as_binary_view().gc().to_data()),
+        DataType::Dictionary(_, _) => Ok(data),
+        _ if data.child_data().is_empty() => Ok(data),
+        _ => {
+            let children = data
+                .child_data()
+                .iter()
+                .cloned()
+                .map(compact_view_buffers)
+                .collect::<Result<Vec<_>>>()?;
+            Ok(data.into_builder().child_data(children).build()?)
+        }
+    }
+}
+
 fn retained_batches(selector: &Selector<Candidate>) -> Vec<Arc<CachedBatch>> {
     let mut batches = Vec::<Arc<CachedBatch>>::new();
     for candidate in &selector.buffer {
@@ -403,13 +499,21 @@ fn compact(
             DataFusionError::Internal("SparkTopKExec threshold left its buffer".into())
         })?;
     let sources = retained_batches(selector);
-    let source_bytes = sources.iter().try_fold(0, |size, source| {
-        checked_bytes(size, source.batch.get_array_memory_size())
+    let copy_bytes = selector.buffer.iter().try_fold(0, |size, row| {
+        row.batch
+            .batch
+            .columns()
+            .iter()
+            .try_fold(size, |size, column| {
+                checked_bytes(
+                    size,
+                    copied_value_bytes(&column.to_data().slice(row.row, 1))?,
+                )
+            })
     })?;
-    // Interleave does not duplicate source rows. Charge a full source payload copy and
-    // fresh key buffers while both old and compacted storage are alive.
+    // Charge selected values while both old and compacted storage are alive.
     let temporary = checked_bytes(
-        source_bytes,
+        copy_bytes,
         key_scratch_bytes(selector.buffer.len(), encoder.expressions.len())?,
     )?;
     reservation.try_resize(checked_bytes(
@@ -440,7 +544,13 @@ fn compact(
             &RecordBatchOptions::new().with_row_count(Some(indices.len())),
         )?
     } else {
-        interleave_record_batch(&batches, &indices)?
+        let batch = interleave_record_batch(&batches, &indices)?;
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|column| compact_view_buffers(column.to_data()).map(make_array))
+            .collect::<Result<Vec<_>>>()?;
+        RecordBatch::try_new(Arc::clone(schema), columns)?
     };
     let mut keys = Vec::with_capacity(encoder.expressions.len());
     for (key, converter) in encoder.converters.iter().enumerate() {
@@ -498,18 +608,14 @@ async fn select(
         let mut offset = 0;
         while offset < batch.num_rows() {
             let base = checked_bytes(held_input, retained_size(&selector)?)?;
-            let mut count = batch.num_rows() - offset;
             // Key caches are optional workspace, not a minimum input-batch-sized
             // allocation. Retrying smaller slices preserves every comparator call.
-            loop {
-                let bytes =
-                    checked_bytes(base, key_scratch_bytes(count, encoder.expressions.len())?)?;
-                match reservation.try_resize(bytes) {
-                    Ok(()) => break,
-                    Err(_) if count > 1 => count = count.div_ceil(2),
-                    Err(error) => return Err(error),
-                }
-            }
+            let count = reserve_key_rows(
+                &reservation,
+                base,
+                batch.num_rows() - offset,
+                encoder.expressions.len(),
+            )?;
             let mut cached = encoder.encode(batch.slice(offset, count))?;
             cached.payload_bytes = 0;
             let cached = Arc::new(cached);
@@ -775,7 +881,7 @@ fn java_small_sort<T: Clone, F: FnMut(&T, &T) -> Result<Ordering>>(
 mod tests {
     use super::*;
 
-    use arrow::array::{Int32Array, Int64Array};
+    use arrow::array::{Int32Array, Int64Array, ListArray, StringArray, StringViewArray};
     use arrow::datatypes::{Field, Schema};
     use datafusion::common::{config::ConfigOptions, ScalarValue};
     use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
@@ -993,6 +1099,99 @@ mod tests {
             assert_eq!(values.values().as_ref(), &[0, 1, 2, 3, 4, 5, 6]);
             assert_eq!(pool.reserved(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn compaction_copies_selected_wide_and_nested_values_only() {
+        for payload in [
+            Arc::new(StringArray::from_iter_values(
+                (0..8192).map(|i| format!("{i:0256}")),
+            )) as ArrayRef,
+            Arc::new(StringViewArray::from_iter_values((0..8192).map(|i| format!("{i:0256}"))).gc())
+                as ArrayRef,
+            Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+                (0..8192).map(|i| Some((0..64).map(move |j| Some(i + j)))),
+            )) as ArrayRef,
+        ] {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int32, false),
+                Field::new("payload", payload.data_type().clone(), true),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from_iter_values(0..8192)), payload],
+            )
+            .unwrap();
+            let input = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(vec![Ok(batch.clone()), Ok(batch.clone())]),
+            ));
+            let encoder = KeyEncoder::try_new(&[add_key(0, DataType::Int32)], &schema).unwrap();
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(3 * 1024 * 1024));
+            let reservation = MemoryConsumer::new("wide topk test").register(&pool);
+            let metrics = BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+            let output = select(input, schema, encoder, 7, reservation, metrics)
+                .await
+                .unwrap();
+            assert_eq!(
+                output
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap()
+                    .values()
+                    .as_ref(),
+                &[0, 0, 1, 1, 2, 2, 3]
+            );
+            assert!(output.get_array_memory_size() < 64 * 1024);
+            assert_eq!(pool.reserved(), 0);
+        }
+    }
+
+    #[test]
+    fn key_workspace_does_not_retry_an_acquisition_exception() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        #[derive(Debug)]
+        struct FailedAcquisition {
+            calls: AtomicUsize,
+            inner: GreedyMemoryPool,
+        }
+        impl std::fmt::Display for FailedAcquisition {
+            fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+                write!(f, "failed acquisition")
+            }
+        }
+        impl MemoryPool for FailedAcquisition {
+            fn name(&self) -> &str {
+                "failed acquisition"
+            }
+            fn grow(&self, r: &MemoryReservation, n: usize) {
+                self.inner.grow(r, n)
+            }
+            fn shrink(&self, r: &MemoryReservation, n: usize) {
+                self.inner.shrink(r, n)
+            }
+            fn reserved(&self) -> usize {
+                self.inner.reserved()
+            }
+            fn try_grow(&self, r: &MemoryReservation, n: usize) -> Result<()> {
+                if self.calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                    return Err(DataFusionError::Execution("acquisition exception".into()));
+                }
+                self.inner.try_grow(r, n)
+            }
+        }
+        let pool = Arc::new(FailedAcquisition {
+            calls: AtomicUsize::new(0),
+            inner: GreedyMemoryPool::new(1024 * 1024),
+        });
+        let memory: Arc<dyn MemoryPool> = pool.clone();
+        let reservation = MemoryConsumer::new("exception topk test").register(&memory);
+        let error = reserve_key_rows(&reservation, 0, 8192, 1).unwrap_err();
+        assert!(error.to_string().contains("acquisition exception"));
+        assert_eq!(pool.calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(pool.reserved(), 0);
     }
 
     fn failure(name: &str) -> DataFusionError {
