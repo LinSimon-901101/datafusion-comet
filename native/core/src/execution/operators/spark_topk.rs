@@ -1186,7 +1186,7 @@ mod tests {
             calls: AtomicUsize::new(0),
             inner: GreedyMemoryPool::new(1024 * 1024),
         });
-        let memory: Arc<dyn MemoryPool> = pool.clone();
+        let memory: Arc<dyn MemoryPool> = Arc::clone(&pool) as Arc<dyn MemoryPool>;
         let reservation = MemoryConsumer::new("exception topk test").register(&memory);
         let error = reserve_key_rows(&reservation, 0, 8192, 1).unwrap_err();
         assert!(error.to_string().contains("acquisition exception"));
