@@ -23,6 +23,7 @@ import scala.jdk.CollectionConverters._
 
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.{CometTestBase, Row}
+import org.apache.spark.sql.catalyst.CatalystTypeConverters
 import org.apache.spark.sql.comet.CometTakeOrderedAndProjectExec
 import org.apache.spark.sql.internal.SQLConf
 
@@ -42,12 +43,12 @@ class CometTopKMemorySuite extends CometTestBase {
     Seq(op) ++ op.getChildrenList.asScala.toSeq.flatMap(operators)
 
   if (isSpark40Plus) {
-    for (wide <- Seq(false, true)) {
-      test(s"deferred native TopK bounds key and payload workspace: wide=$wide") {
+    for (payload <- Seq("int", "string", "nested")) {
+      test(s"deferred native TopK bounds key and payload workspace: payload=$payload") {
         withSQLConf(
           // The effective native budgets reproduce the 512KiB and 3MiB failures.
           CometConf.COMET_OFFHEAP_MEMORY_POOL_FRACTION.key ->
-            (if (wide) "0.5" else (1.0 / 12).toString),
+            (if (payload == "string") "0.5" else (1.0 / 12).toString),
           SQLConf.ANSI_ENABLED.key -> "true",
           SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
           SQLConf.LEAF_NODE_DEFAULT_PARALLELISM.key -> "1") {
@@ -58,8 +59,14 @@ class CometTopKMemorySuite extends CometTestBase {
                 .coalesce(1)
                 .selectExpr(
                   "CAST(id AS INT) AS k",
-                  if (wide) "rpad(CAST(id AS STRING), 256, '0') AS payload"
-                  else "CAST(16383 - id AS INT) AS payload")
+                  payload match {
+                    case "string" => "rpad(CAST(id AS STRING), 256, '0') AS payload"
+                    case "nested" =>
+                      (0 until 8).foldLeft("CAST(id AS INT)") { (child, _) =>
+                        s"named_struct('v', $child)"
+                      } + " AS payload"
+                    case _ => "CAST(16383 - id AS INT) AS payload"
+                  })
                 .write
                 .parquet(path.getCanonicalPath)
             }
@@ -71,7 +78,11 @@ class CometTopKMemorySuite extends CometTestBase {
                   "k + (SELECT max(_1) FROM topk_one), " +
                     "k + (SELECT min(_1) FROM topk_one)")
                 val expected = (0 until 7).map { i =>
-                  if (wide) Row(i.toString.padTo(256, '0')) else Row(16383 - i)
+                  payload match {
+                    case "string" => Row(i.toString.padTo(256, '0'))
+                    case "nested" => Row((0 until 8).foldLeft[Any](i)((child, _) => Row(child)))
+                    case _ => Row(16383 - i)
+                  }
                 }
                 queries.foreach { keys =>
                   val query = s"SELECT payload FROM topk_memory ORDER BY $keys LIMIT 7"
@@ -84,10 +95,12 @@ class CometTopKMemorySuite extends CometTestBase {
                     op.hasSort && op.getSort.getDeferSortErrors
                   })
                   val df = sql(query)
+                  val convert = CatalystTypeConverters.createToScalaConverter(df.schema)
                   val actual = df.queryExecution.toRdd
+                    .map(_.copy())
                     .collect()
                     .map { row =>
-                      if (wide) Row(row.getUTF8String(0).toString) else Row(row.getInt(0))
+                      convert(row).asInstanceOf[Row]
                     }
                     .toSeq
                   assert(actual == expected)

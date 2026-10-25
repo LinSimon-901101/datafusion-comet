@@ -409,7 +409,7 @@ fn copied_value_bytes(data: &ArrayData) -> Result<usize> {
         )),
         _ => None,
     };
-    let bytes = if let Some((start, len, offset_width)) = nested {
+    if let Some((start, len, offset_width)) = nested {
         let mut size = checked_bytes(data.len().div_ceil(8), (data.len() + 1) * offset_width)?;
         for child in data.child_data() {
             let child = if matches!(data.data_type(), DataType::Struct(_)) {
@@ -419,8 +419,9 @@ fn copied_value_bytes(data: &ArrayData) -> Result<usize> {
             };
             size = checked_bytes(size, copied_value_bytes(&child)?)?;
         }
-        checked_bytes(size, len.saturating_mul(2 * size_of::<usize>()))?
-    } else if matches!(data.data_type(), DataType::Utf8View | DataType::BinaryView) {
+        return checked_bytes(size, len.saturating_mul(2 * size_of::<usize>()));
+    }
+    let bytes = if matches!(data.data_type(), DataType::Utf8View | DataType::BinaryView) {
         let array = make_array(data.clone());
         let values = if matches!(data.data_type(), DataType::Utf8View) {
             array.as_string_view().total_buffer_bytes_used()
@@ -434,7 +435,13 @@ fn copied_value_bytes(data: &ArrayData) -> Result<usize> {
     } else {
         data.get_slice_memory_size()?
     };
-    checked_bytes(bytes.saturating_mul(2), 256 + size_of::<ArrayData>())
+    checked_bytes(bytes, bytes)
+}
+
+fn copied_array_overhead(data: &ArrayData) -> Result<usize> {
+    data.child_data().iter().try_fold(512, |size, child| {
+        checked_bytes(size, copied_array_overhead(child)?)
+    })
 }
 
 fn compact_view_buffers(data: ArrayData) -> Result<ArrayData> {
@@ -499,7 +506,14 @@ fn compact(
             DataFusionError::Internal("SparkTopKExec threshold left its buffer".into())
         })?;
     let sources = retained_batches(selector);
-    let copy_bytes = selector.buffer.iter().try_fold(0, |size, row| {
+    let overhead = sources[0]
+        .batch
+        .columns()
+        .iter()
+        .try_fold(0, |size, column| {
+            checked_bytes(size, copied_array_overhead(&column.to_data())?)
+        })?;
+    let copy_bytes = selector.buffer.iter().try_fold(overhead, |size, row| {
         row.batch
             .batch
             .columns()
@@ -881,7 +895,9 @@ fn java_small_sort<T: Clone, F: FnMut(&T, &T) -> Result<Ordering>>(
 mod tests {
     use super::*;
 
-    use arrow::array::{Int32Array, Int64Array, ListArray, StringArray, StringViewArray};
+    use arrow::array::{
+        Int32Array, Int64Array, ListArray, StringArray, StringViewArray, StructArray,
+    };
     use arrow::datatypes::{Field, Schema};
     use datafusion::common::{config::ConfigOptions, ScalarValue};
     use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
@@ -1144,6 +1160,45 @@ mod tests {
                 &[0, 0, 1, 1, 2, 2, 3]
             );
             assert!(output.get_array_memory_size() < 64 * 1024);
+            assert_eq!(pool.reserved(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_copy_bound_grows_linearly_and_fits_a_small_pool() {
+        for depth in [8, 64] {
+            let mut payload: ArrayRef = Arc::new(Int32Array::from_iter_values(0..8192));
+            for _ in 0..depth {
+                payload = Arc::new(StructArray::from(vec![(
+                    Arc::new(Field::new("v", payload.data_type().clone(), true)),
+                    payload,
+                )]));
+            }
+            let data = payload.to_data().slice(0, 1);
+            let bound = copied_value_bytes(&data).unwrap() + copied_array_overhead(&data).unwrap();
+            assert!(bound < 1024 * (depth + 1));
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Int32, false),
+                Field::new("payload", payload.data_type().clone(), true),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from_iter_values(0..8192)), payload],
+            )
+            .unwrap();
+            let input = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(vec![Ok(batch)]),
+            ));
+            let encoder = KeyEncoder::try_new(&[add_key(0, DataType::Int32)], &schema).unwrap();
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(512 * 1024));
+            let reservation = MemoryConsumer::new("nested topk test").register(&pool);
+            let metrics = BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+            let output = select(input, schema, encoder, 7, reservation, metrics)
+                .await
+                .unwrap();
+            assert_eq!(output.num_rows(), 7);
+            assert!(output.column(1).get_array_memory_size() < bound * 7);
             assert_eq!(pool.reserved(), 0);
         }
     }
