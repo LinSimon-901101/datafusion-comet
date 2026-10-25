@@ -20,7 +20,7 @@
 package org.apache.comet.serde
 
 import org.apache.spark.sql.{CometTestBase, Row}
-import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Ascending, AttributeReference, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, ConcatWs, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, FromUTCTimestamp, GetStructField, GreaterThan, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Minute, Murmur3Hash, NamedExpression, Not, OctetLength, PreciseTimestampConversion, Rand, Round, Second, SecondsToTimestamp, SortOrder, StringLPad, StringRepeat, StringRPad, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, UnixTimestamp, WeekDay}
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Ascending, AttributeReference, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, ConcatWs, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, FromUTCTimestamp, GetStructField, GreaterThan, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Minute, Murmur3Hash, NamedExpression, Not, OctetLength, PreciseTimestampConversion, Rand, Round, Second, SecondsToTimestamp, SortOrder, StringLPad, StringRepeat, StringRPad, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, UnixTimestamp, WeekDay, XxHash64}
 import org.apache.spark.sql.execution.{FilterExec, ProjectExec, ScalarSubquery, SubqueryExec}
 import org.apache.spark.sql.types._
 
@@ -49,19 +49,22 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     val children = Seq(value, Literal(1L), Literal.create(null, LongType))
     val array = CreateArray(children)
     assert(
-      CometMurmur3Hash.hashChildren(Seq(Literal(7L), array, value)) ==
+      HashUtils.hashChildren(Seq(Literal(7L), array, value)) ==
         Seq(Literal(7L)) ++ children ++ Seq(value))
     val proto =
       CometMurmur3Hash.convert(Murmur3Hash(Seq(array), 17), Seq(value), binding = false).get
     assert(proto.getScalarFunc.getArgsCount == 4)
     assert(proto.getScalarFunc.getArgs(3).getLiteral.getIntVal == 17)
+    val xx = CometXxHash64.convert(XxHash64(Seq(array), 17L), Seq(value), binding = false).get
+    assert(xx.getScalarFunc.getArgsCount == 4)
+    assert(xx.getScalarFunc.getArgs(3).getLiteral.getLongVal == 17L)
     val fallible = array.copy(children = Seq(Add(value, Literal(1L), EvalMode.ANSI)))
     val stateful = array.copy(children = Seq(Cast(Rand(42L), LongType)))
     val nullable = Literal.create(null, ArrayType(LongType))
     val conditional = If(Literal(true), array, nullable)
     val empty = CreateArray(Seq.empty)
     for (child <- Seq(fallible, stateful, nullable, conditional, empty)) {
-      assert(CometMurmur3Hash.hashChildren(Seq(child)) == Seq(child))
+      assert(HashUtils.hashChildren(Seq(child)) == Seq(child))
     }
   }
 

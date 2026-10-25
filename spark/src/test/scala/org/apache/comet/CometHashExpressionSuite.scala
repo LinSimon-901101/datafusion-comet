@@ -176,7 +176,10 @@ class CometHashExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelpe
       checkSparkAnswerAndOperator("""SELECT hash(array(a,b,c,d)),
         hash(c,array(a,b),d), hash(array(a,null),b),
         hash(CASE WHEN c IS NULL THEN CAST(NULL AS ARRAY<BIGINT>) ELSE array(d,1L) END),
-        hash(array(CAST(a AS BIGINT),(SELECT max(d) FROM t),(SELECT min(d) FROM t)))
+        hash(array(CAST(a AS BIGINT),(SELECT max(d) FROM t),(SELECT min(d) FROM t))),
+        xxhash64(array(a,b,c,d)), xxhash64(c,array(a,b),d), xxhash64(array(a,null),b),
+        xxhash64(CASE WHEN c IS NULL THEN CAST(NULL AS ARRAY<BIGINT>) ELSE array(d,1L) END),
+        xxhash64(array(CAST(a AS BIGINT),(SELECT max(d) FROM t),(SELECT min(d) FROM t)))
         FROM t""")
     }
   }
