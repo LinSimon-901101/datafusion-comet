@@ -43,8 +43,12 @@ object CometLiteral extends CometExpressionSerde[Literal] with CometTypeShim wit
 
   override def getSupportLevel(expr: Literal): SupportLevel = {
     val serializable = expr.dataType match {
-      // A null literal carries only its type on the wire, so any type serializeDataType handles.
-      case _ if expr.value == null => supportedDataType(expr.dataType, allowComplex = true)
+      // A null literal still needs an Arrow schema with distinct struct child names.
+      case _ if expr.value == null =>
+        supportedDataType(
+          expr.dataType,
+          allowComplex = true,
+          allowDuplicateStructFieldNames = false)
       case ArrayType(elementType, _) => listLiteralElementSupported(elementType)
       case dt => supportedDataType(dt)
     }

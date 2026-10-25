@@ -4587,6 +4587,57 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar struct typed NULL siblings retain supported field names") {
+    Seq("CODEGEN_ONLY", "FALLBACK").foreach { factoryMode =>
+      withSQLConf(
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+        SQLConf.CODEGEN_FACTORY_MODE.key -> factoryMode) {
+        withTempPath { path =>
+          withTempView("scalar_null_fields") {
+            withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+              spark.range(0, 4, 1, 1).write.parquet(path.toString)
+            }
+            spark.read.parquet(path.toString).createOrReplaceTempView("scalar_null_fields")
+            val scalar = "(SELECT max(named_struct('n', id)) FROM scalar_null_fields).n"
+            val containers =
+              Seq("%s", "STRUCT<s:%s>", "ARRAY<%s>", "MAP<STRING,%s>", "MAP<%s,STRING>")
+            for {
+              container <- containers
+              duplicate <- Seq(true, false)
+            } {
+              val fields = if (duplicate) "STRUCT<x:INT,x:INT>" else "STRUCT<x:INT,y:INT>"
+              val df = sql(
+                s"SELECT $scalar n, CAST(NULL AS ${container.format(fields)}) d " +
+                  "FROM scalar_null_fields")
+              if (duplicate) {
+                checkSparkAnswer(df)
+                assert(stripAQEPlan(df.queryExecution.executedPlan).exists {
+                  case p: ProjectExec => p.projectList.exists(_.name == "d")
+                  case _ => false
+                })
+              } else {
+                checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+                assert(stripAQEPlan(df.queryExecution.executedPlan).exists {
+                  case p: CometProjectExec => p.projectList.exists(_.name == "d")
+                  case _ => false
+                })
+              }
+            }
+            val cast = sql(
+              s"SELECT $scalar n, " +
+                "CAST((SELECT max(named_struct('p', id, 'q', id)) FROM scalar_null_fields) " +
+                "AS STRUCT<x:BIGINT,x:BIGINT>) d FROM scalar_null_fields")
+            checkSparkAnswer(cast)
+            assert(stripAQEPlan(cast.queryExecution.executedPlan).exists {
+              case p: ProjectExec => p.projectList.exists(_.name == "d")
+              case _ => false
+            })
+          }
+        }
+      }
+    }
+  }
+
   test("scalar review bounded integer casts remain native") {
     withScalarReviewTables {
       val fallible = sql(

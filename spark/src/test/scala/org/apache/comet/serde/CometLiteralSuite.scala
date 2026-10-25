@@ -42,6 +42,28 @@ import org.apache.comet.shims.CometTypeShim
  */
 class CometLiteralSuite extends CometTestBase with CometTypeShim {
 
+  test("a null literal rejects duplicate struct field names at every nesting level") {
+    val duplicateType =
+      StructType(Seq(StructField("x", IntegerType), StructField("x", IntegerType)))
+    val distinctType =
+      StructType(Seq(StructField("x", IntegerType), StructField("y", IntegerType)))
+    def containers(dt: DataType): Seq[DataType] =
+      Seq(
+        dt,
+        StructType(Seq(StructField("s", dt))),
+        ArrayType(dt),
+        MapType(StringType, dt),
+        MapType(dt, StringType))
+
+    containers(duplicateType).zip(containers(distinctType)).foreach {
+      case (duplicate, distinct) =>
+        assert(
+          CometLiteral.getSupportLevel(Literal.create(null, duplicate)).isInstanceOf[Unsupported])
+        assert(
+          CometLiteral.getSupportLevel(Literal.create(null, distinct)).isInstanceOf[Compatible])
+    }
+  }
+
   /**
    * Element types the two sides are compared over. Both halves of the list matter. A type the
    * encoder handles today that drops out of the gate silently costs a native projection; a type
