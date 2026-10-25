@@ -4639,6 +4639,51 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar struct array overlap consumers compare every row") {
+    withTempPath { path =>
+      withTempView("scalar_overlap_rows") {
+        withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+          spark
+            .range(0, 4, 1, 1)
+            .selectExpr("CAST(id AS INT) id", "array(CAST(id + 1 AS INT)) a")
+            .write
+            .parquet(path.toString)
+        }
+        spark.read.parquet(path.toString).createOrReplaceTempView("scalar_overlap_rows")
+        val scalar = "(SELECT max(named_struct('n', id)) FROM scalar_overlap_rows).n"
+        for {
+          excluded <- Seq("org.apache.spark.sql.catalyst.optimizer.ConstantFolding", "")
+          factoryMode <- Seq("CODEGEN_ONLY", "FALLBACK")
+          arguments <- Seq("array(1), a", "a, array(1)")
+          conditional <- Seq(false, true)
+        } {
+          withSQLConf(
+            SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+            SQLConf.CODEGEN_FACTORY_MODE.key -> factoryMode,
+            SQLConf.OPTIMIZER_EXCLUDED_RULES.key -> excluded,
+            CometConf.COMET_BATCH_SIZE.key -> "8192") {
+            val overlap = s"arrays_overlap($arguments)"
+            val result = if (conditional) s"IF($scalar > 0, $overlap, false)" else overlap
+            val df = sql(s"SELECT id, $scalar n, $result overlap FROM scalar_overlap_rows")
+            val nativeExpected = conditional || excluded.nonEmpty
+            val (_, cometPlan) = if (nativeExpected) {
+              checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+            } else {
+              checkSparkAnswer(df)
+            }
+            assert(stripAQEPlan(cometPlan).exists {
+              case p: CometProjectExec if nativeExpected =>
+                p.projectList.exists(_.name == "overlap")
+              case p: ProjectExec if !nativeExpected =>
+                p.projectList.exists(_.name == "overlap")
+              case _ => false
+            })
+          }
+        }
+      }
+    }
+  }
+
   test("scalar review bounded integer casts remain native") {
     withScalarReviewTables {
       val fallible = sql(
