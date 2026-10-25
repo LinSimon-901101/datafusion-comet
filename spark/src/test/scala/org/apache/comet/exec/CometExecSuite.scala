@@ -52,7 +52,7 @@ import org.apache.spark.sql.internal.SQLConf.SESSION_LOCAL_TIMEZONE
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
-import org.apache.comet.{CometConf, CometExecIterator, CometNativeException, ExtendedExplainInfo}
+import org.apache.comet.{CometConf, CometExecIterator, CometExplainInfo, CometNativeException, ExtendedExplainInfo}
 import org.apache.comet.CometSparkSessionExtensions.{isSpark35Plus, isSpark40Plus, isSpark41Plus, isSpark42Plus}
 import org.apache.comet.rules.CometCoalesceShufflePartitions
 import org.apache.comet.serde.Config.ConfigMap
@@ -3897,7 +3897,21 @@ class CometExecSuite extends CometTestBase {
                   else "Nullable ordered consumers"
                 assert(reasons.exists(_.contains(reason)), reasons)
               } else {
-                assertExpressionImpl(plan, native = Seq(name), dispatched = Seq.empty)
+                val projects = plan.collect {
+                  case p: CometProjectExec
+                      if p.projectList.exists(e =>
+                        e.name == "answer" && e.exists(_.prettyName == name)) =>
+                    p
+                }
+                assert(projects.nonEmpty, plan)
+                projects.foreach { project =>
+                  assert(
+                    project.getTagValue(CometExplainInfo.NATIVE_EXPRS).exists(_.contains(name)))
+                  assert(
+                    !project
+                      .getTagValue(CometExplainInfo.CODEGEN_DISPATCH_EXPRS)
+                      .exists(_.contains(name)))
+                }
               }
               val safe = sql(
                 "SELECT coalesce((SELECT max(named_struct('flag', k >= 0)) " +
