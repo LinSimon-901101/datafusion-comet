@@ -21,7 +21,7 @@ package org.apache.comet
 
 import scala.util.Random
 
-import org.apache.spark.sql.CometTestBase
+import org.apache.spark.sql.{CometTestBase, Row}
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 
 import org.apache.comet.testing.{DataGenOptions, FuzzDataGenerator, ParquetGenerator, SchemaGenOptions}
@@ -181,6 +181,54 @@ class CometHashExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelpe
         xxhash64(CASE WHEN c IS NULL THEN CAST(NULL AS ARRAY<BIGINT>) ELSE array(d,1L) END),
         xxhash64(array(CAST(a AS BIGINT),(SELECT max(d) FROM t),(SELECT min(d) FROM t)))
         FROM t""")
+    }
+  }
+
+  test("hash - floating array constructors retain native special values and merged scalars") {
+    withTable("t") {
+      sql("CREATE TABLE t(f FLOAT, d DOUBLE) USING parquet")
+      sql("""INSERT INTO t VALUES
+        (0.0, -0.0), (-0.0, 0.0), (null, null), (1.25, -1.25),
+        (CAST('NaN' AS FLOAT), CAST('NaN' AS DOUBLE)),
+        (CAST('Infinity' AS FLOAT), CAST('-Infinity' AS DOUBLE)),
+        (CAST('-Infinity' AS FLOAT), CAST('Infinity' AS DOUBLE))""")
+      val nonCanonicalNaN = Row(
+        java.lang.Float.intBitsToFloat(0xffa00001),
+        java.lang.Double.longBitsToDouble(0xfff0000000000001L))
+      withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+        spark
+          .createDataFrame(
+            spark.sparkContext.parallelize(Seq(nonCanonicalNaN), 1),
+            spark.table("t").schema)
+          .write
+          .mode("append")
+          .insertInto("t")
+      }
+      checkNativeHashes("""SELECT hash(array(f,f)), hash(array(d,d)), hash(array(f,d)),
+        hash(f,array(d,null),d), xxhash64(array(f,f)), xxhash64(array(d,d)),
+        xxhash64(array(f,d)), xxhash64(f,array(d,null),d),
+        hash(array(f,(SELECT max(f) FROM t),(SELECT min(f) FROM t))),
+        hash(array(d,(SELECT max(d) FROM t),(SELECT min(d) FROM t))),
+        xxhash64(array(f,(SELECT max(f) FROM t),(SELECT min(f) FROM t))),
+        xxhash64(array(d,(SELECT max(d) FROM t),(SELECT min(d) FROM t))) FROM t""")
+    }
+  }
+
+  test("hash - constructed arrays preserve native leaf and nested NULL semantics") {
+    withTable("t") {
+      sql("""CREATE TABLE t(b BOOLEAN, d DECIMAL(18,2), w DECIMAL(38,10), s STRING,
+        x BINARY, st STRUCT<v:BIGINT>, a ARRAY<BIGINT>) USING parquet""")
+      sql("""INSERT INTO t VALUES
+        (true, 1.25, 1.25, 'ab', X'00FF', named_struct('v',1L), array(1L,null)),
+        (false, -1.25, -1.25, '', X'', named_struct('v',CAST(NULL AS BIGINT)), array()),
+        (null, null, null, null, null, null, null)""")
+      checkNativeHashes("""SELECT hash(array(b,b)), hash(array(d,d)), hash(array(w,w)),
+        hash(array(s,s)), hash(array(x,x)), hash(array(st,st)), hash(array(a,a)),
+        hash(b,array(st,null),s), xxhash64(array(b,b)), xxhash64(array(d,d)),
+        xxhash64(array(w,w)), xxhash64(array(s,s)), xxhash64(array(x,x)),
+        xxhash64(array(st,st)), xxhash64(array(a,a)), xxhash64(b,array(st,null),s),
+        hash(array(d,(SELECT max(d) FROM t),(SELECT min(d) FROM t))),
+        xxhash64(array(d,(SELECT max(d) FROM t),(SELECT min(d) FROM t))) FROM t""")
     }
   }
 

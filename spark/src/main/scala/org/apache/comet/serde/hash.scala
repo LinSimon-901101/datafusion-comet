@@ -21,7 +21,7 @@ package org.apache.comet.serde
 
 import org.apache.spark.sql.catalyst.expressions.{Attribute, BoundReference, Cast, CreateArray, Expression, GetStructField, Literal, Murmur3Hash, Sha1, Sha2, XxHash64}
 import org.apache.spark.sql.execution.ExecSubqueryExpression
-import org.apache.spark.sql.types.{ArrayType, ByteType, DataType, IntegerType, LongType, MapType, ShortType, StringType, StructType}
+import org.apache.spark.sql.types.{ArrayType, DataType, IntegerType, LongType, MapType, StringType, StructType}
 
 import org.apache.comet.serde.QueryPlanSerde.{exprToProtoInternal, isTimeType, scalarFunctionExprToProtoWithReturnType, serializeDataType, supportedDataType}
 
@@ -127,12 +127,9 @@ private[serde] object HashUtils {
 
   def hashChildren(children: Seq[Expression]): Seq[Expression] =
     children.flatMap {
-      // A constructed array is non-null and hashes its elements in order. Total integral
+      // A constructed array is non-null and hashes its elements in order. Total
       // children can be hashed directly without materializing and gathering a ListArray.
-      case array: CreateArray if array.children.nonEmpty && array.children.forall { child =>
-            Set[DataType](ByteType, ShortType, IntegerType, LongType).contains(child.dataType) &&
-            isValueRead(child)
-          } =>
+      case array: CreateArray if array.children.nonEmpty && array.children.forall(isValueRead) =>
         array.children
       case child => Seq(child)
     }

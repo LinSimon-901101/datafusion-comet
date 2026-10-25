@@ -44,7 +44,7 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
   private def supported(dt: DataType): Boolean =
     CometScalarSubquery.getSupportLevel(subquery(dt)) == Compatible()
 
-  test("integral array hash fusion preserves argument order and evaluation boundaries") {
+  test("array hash fusion preserves argument order and evaluation boundaries") {
     val value = AttributeReference("value", LongType, nullable = true)()
     val children = Seq(value, Literal(1L), Literal.create(null, LongType))
     val array = CreateArray(children)
@@ -58,6 +58,20 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     val xx = CometXxHash64.convert(XxHash64(Seq(array), 17L), Seq(value), binding = false).get
     assert(xx.getScalarFunc.getArgsCount == 4)
     assert(xx.getScalarFunc.getArgs(3).getLiteral.getLongVal == 17L)
+    for (dataType <- Seq(
+        BooleanType,
+        FloatType,
+        DoubleType,
+        DecimalType(18, 2),
+        StringType,
+        BinaryType,
+        struct(LongType),
+        ArrayType(LongType),
+        MapType(StringType, LongType))) {
+      val value = AttributeReference("value", dataType, nullable = true)()
+      val values = Seq(value, Literal.create(null, dataType))
+      assert(HashUtils.hashChildren(Seq(CreateArray(values))) == values)
+    }
     val fallible = array.copy(children = Seq(Add(value, Literal(1L), EvalMode.ANSI)))
     val stateful = array.copy(children = Seq(Cast(Rand(42L), LongType)))
     val nullable = Literal.create(null, ArrayType(LongType))
