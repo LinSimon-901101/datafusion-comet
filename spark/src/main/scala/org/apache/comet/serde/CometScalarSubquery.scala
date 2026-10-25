@@ -33,6 +33,7 @@ import org.apache.spark.sql.execution.{ExecSubqueryExpression, ExpandExec, Gener
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
 import com.google.protobuf.Message
@@ -789,11 +790,6 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
 
   private def hasNativeNullShortCircuit(expr: Expression): Boolean =
     isNativeNullShortCircuitFamily(expr) &&
-      // Native masks skip runtime work, but cannot defer planning-time Bloom initialization.
-      (QueryPlanSerde.usesGeneratedExpressionEvaluation ||
-        !skippedObservableArguments(expr).exists { child =>
-          child.exists(_.isInstanceOf[BloomFilterMightContain])
-        }) &&
       (QueryPlanSerde.canShortCircuitNulls(expr) ||
         skippedObservableArguments(expr).forall(QueryPlanSerde.isEagerSharedSubexpression))
 
@@ -842,10 +838,14 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
       return Some("Fallible struct scalar subquery consumers require Spark row evaluation")
     }
     expr match {
-      case _: If | _: CaseWhen | _: Coalesce
-          if !QueryPlanSerde.usesGeneratedExpressionEvaluation &&
+      // Runtime masks cannot defer native Bloom setup. FALLBACK can also recover from a
+      // code-generation error and interpret the expression, including its first-error order.
+      case _
+          if !SQLConf.get
+            .getConfString("spark.sql.codegen.factoryMode", "FALLBACK")
+            .equalsIgnoreCase("CODEGEN_ONLY") &&
             expr.exists(_.isInstanceOf[BloomFilterMightContain]) =>
-        Some("Conditional Bloom initialization of struct scalar subqueries requires Spark")
+        Some("Bloom initialization of struct scalar subqueries requires CODEGEN_ONLY")
       // IN skips candidates after a NULL value or a matching candidate. Native dynamic IN only
       // stops after a batch-wide match, and Spark may evaluate shared candidates eagerly.
       case in: In

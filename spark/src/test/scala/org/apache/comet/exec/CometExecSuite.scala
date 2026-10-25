@@ -3849,14 +3849,17 @@ class CometExecSuite extends CometTestBase {
       val bloom = "review_might((SELECT max(named_struct('b', unhex('00000000'))) " +
         "FROM review_nums).b, 1L)"
       val nullable = "(SELECT max(k) >= 0 FROM review_nums WHERE k IS NULL)"
+      val invalid = "coalesce(CAST((SELECT max(named_struct('s', txt)) " +
+        "FROM review_items).s AS BOOLEAN), false)"
       val expressions = Seq(
-        ("coalesce", s"coalesce((SELECT max(k) >= 0 FROM review_nums), $bloom)", Row(true)),
-        ("equalto", s"$nullable = $bloom", Row(null)),
-        ("lessthan", s"$nullable < $bloom", Row(null)))
+        ("coalesce", s"coalesce((SELECT max(k) >= 0 FROM review_nums), $bloom)", Some(Row(true))),
+        ("equalto", s"$nullable = $bloom", Some(Row(null))),
+        ("lessthan", s"$nullable < $bloom", Some(Row(null))),
+        ("equalto", s"$invalid = $bloom", None))
       try
         for {
           (name, expression, expected) <- expressions
-          mode <- Seq("NO_CODEGEN", "CODEGEN_ONLY")
+          mode <- Seq("NO_CODEGEN", "FALLBACK", "CODEGEN_ONLY")
           shared <- Seq(false, true)
           comet <- Seq(false, true)
         } {
@@ -3872,30 +3875,33 @@ class CometExecSuite extends CometTestBase {
                 case _ => false
               })),
               df.queryExecution.optimizedPlan.toString)
-            if (mode == "NO_CODEGEN") {
-              assert(df.collect().toSeq == Seq(expected))
+            if (mode != "CODEGEN_ONLY" && expected.isDefined) {
+              assert(df.collect().toSeq == Seq(expected.get))
             } else {
               val error = intercept[Exception](df.collect())
-              assert(
-                causeChain(error).exists(e =>
-                  Option(e.getMessage).exists(message =>
-                    message.contains("BloomFilter version: 0") ||
-                      message.contains("Unexpected Bloom filter version number (0)"))),
-                error)
+              if (mode == "CODEGEN_ONLY") {
+                assert(
+                  causeChain(error).exists(e =>
+                    Option(e.getMessage).exists(message =>
+                      message.contains("BloomFilter version: 0") ||
+                        message.contains("Unexpected Bloom filter version number (0)"))),
+                  error)
+              } else {
+                assert(
+                  causeChain(error).exists(_.getMessage.contains("CAST_INVALID_INPUT")),
+                  error)
+              }
             }
             if (comet) {
               val plan = stripAQEPlan(df.queryExecution.executedPlan)
-              if (mode == "NO_CODEGEN") {
+              if (mode != "CODEGEN_ONLY") {
                 assert(plan.exists {
                   case project: ProjectExec =>
                     project.projectList.exists(_.exists(_.prettyName == name))
                   case _ => false
                 })
                 val reasons = new ExtendedExplainInfo().getFallbackReasons(plan)
-                val reason =
-                  if (name == "coalesce") "Conditional Bloom initialization"
-                  else "Nullable ordered consumers"
-                assert(reasons.exists(_.contains(reason)), reasons)
+                assert(reasons.exists(_.contains("Bloom initialization")), reasons)
               } else {
                 val projects = plan.collect {
                   case p: CometProjectExec

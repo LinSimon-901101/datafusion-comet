@@ -174,12 +174,12 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
       If(Literal(true), Literal(true), bloom),
       CaseWhen(Seq(Literal(true) -> Literal(true)), Some(bloom)),
       Coalesce(Seq(Literal(true), bloom)))
-    Seq("CODEGEN_ONLY", "NO_CODEGEN").foreach { mode =>
+    Seq("CODEGEN_ONLY", "NO_CODEGEN", "FALLBACK").foreach { mode =>
       withSQLConf("spark.sql.codegen.factoryMode" -> mode) {
         conditionals.foreach { conditional =>
           assert(
             CometScalarSubquery.consumerFallbackReason(conditional).isDefined ==
-              (mode == "NO_CODEGEN"),
+              (mode != "CODEGEN_ONLY"),
             conditional)
         }
         val safe = Coalesce(Seq(GetStructField(subquery(struct(BooleanType)), 0), Literal(true)))
@@ -190,9 +190,10 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
         val concat = ConcatWs(Seq(Literal.create(null, StringType), text))
         assert(CometScalarSubquery.consumerFallbackReason(concat).isDefined)
         val round = Round(Cast(bloom, LongType), Literal.create(null, IntegerType))
+        assert(CometScalarSubquery.consumerFallbackReason(round).isDefined)
         assert(
-          CometScalarSubquery.consumerFallbackReason(round).isDefined == (mode != "NO_CODEGEN"))
-        assert(CometScalarSubquery.consumerFallbackReason(round.copy(scale = Literal(0))).isEmpty)
+          CometScalarSubquery.consumerFallbackReason(round.copy(scale = Literal(0))).isDefined ==
+            (mode != "CODEGEN_ONLY"))
         val parsed = Cast(GetStructField(subquery(struct(StringType)), 0), LongType)
         assert(CometScalarSubquery.consumerFallbackReason(round.copy(child = parsed)).isEmpty)
       }
@@ -208,19 +209,20 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
       LessThan(nullable, bloom),
       GreaterThan(nullable, bloom),
       GreaterThanOrEqual(nullable, bloom))
-    for (mode <- Seq("NO_CODEGEN", "CODEGEN_ONLY")) {
+    for (mode <- Seq("NO_CODEGEN", "FALLBACK", "CODEGEN_ONLY")) {
       withSQLConf("spark.sql.codegen.factoryMode" -> mode) {
         consumers.foreach { consumer =>
           QueryPlanSerde.withSharedSubexpressions(Seq(consumer)) {
             assert(
               CometScalarSubquery.consumerFallbackReason(consumer).isDefined ==
-                (mode == "NO_CODEGEN"),
+                (mode != "CODEGEN_ONLY"),
               consumer)
           }
         }
         QueryPlanSerde.withSharedSubexpressions(Seq.empty) {
           assert(
-            CometScalarSubquery.consumerFallbackReason(EqualTo(Literal(true), bloom)).isEmpty)
+            CometScalarSubquery.consumerFallbackReason(EqualTo(Literal(true), bloom)).isDefined ==
+              (mode != "CODEGEN_ONLY"))
           val safe = GetStructField(subquery(struct(BooleanType)), 0)
           assert(CometScalarSubquery.consumerFallbackReason(EqualTo(nullable, safe)).isEmpty)
         }
