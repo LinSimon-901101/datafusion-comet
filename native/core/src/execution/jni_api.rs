@@ -93,7 +93,7 @@ use datafusion_spark::function::url::url_encode::UrlEncode as SparkUrlEncode;
 use futures::stream::{Stream, StreamExt};
 use futures::FutureExt;
 use jni::objects::JByteBuffer;
-use jni::sys::{jlongArray, JNI_FALSE};
+use jni::sys::{jintArray, jlongArray, JNI_FALSE};
 use jni::{
     errors::Result as JNIResult,
     objects::{
@@ -150,6 +150,96 @@ use std::sync::OnceLock;
 use tikv_jemalloc_ctl::{epoch, stats};
 
 static TOKIO_RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
+
+/// Bounded driver merge. This has no task context, execution registry, or retained Arrow pointers.
+#[no_mangle]
+pub extern "system" fn Java_org_apache_comet_Native_mergeTopK(
+    e: EnvUnowned,
+    _class: JClass,
+    ipc: JByteArray,
+    sort: JByteArray,
+    left_rows: jint,
+    fetch: jint,
+) -> jintArray {
+    try_unwrap_or_throw(&e, |env| {
+        let ipc = env.convert_byte_array(ipc)?;
+        let sort = env.convert_byte_array(sort)?;
+        let indices = merge_topk(&ipc, &sort, left_rows, fetch)?;
+        let output = env.new_int_array(indices.len())?;
+        output.set_region(env, 0, &indices)?;
+        Ok(output.into_raw())
+    })
+}
+
+fn merge_topk(ipc: &[u8], sort: &[u8], left_rows: i32, fetch: i32) -> CometResult<Vec<i32>> {
+    use crate::execution::operators::spark_topk::{merge_indices, MAX_SPARK_TOPK_FETCH};
+    use arrow::ipc::reader::StreamReader;
+    use datafusion_comet_proto::spark_expression::{expr::ExprStruct, Expr};
+    use datafusion_comet_proto::spark_operator::Sort;
+    use std::io::Cursor;
+
+    // No subquery callbacks or arbitrary UDFs are valid on the driver bridge. The Scala
+    // caller resolves only scalar fields after query preparation, never the fallible Add.
+    fn leaf(expr: &Expr) -> bool {
+        match &expr.expr_struct {
+            Some(ExprStruct::Bound(_) | ExprStruct::Literal(_)) => true,
+            Some(ExprStruct::Cast(cast)) => cast.child.as_deref().is_some_and(leaf),
+            _ => false,
+        }
+    }
+    fn key(expr: &Expr) -> bool {
+        match &expr.expr_struct {
+            Some(ExprStruct::SortOrder(order)) => order.child.as_deref().is_some_and(|e| match &e
+                .expr_struct
+            {
+                Some(ExprStruct::Add(add)) => {
+                    add.left.as_deref().is_some_and(leaf) && add.right.as_deref().is_some_and(leaf)
+                }
+                _ => leaf(e),
+            }),
+            _ => false,
+        }
+    }
+    if fetch <= 0 || fetch as usize > MAX_SPARK_TOPK_FETCH || left_rows < 0 {
+        return Err(CometError::Internal(
+            "Invalid bounded TopK merge size".into(),
+        ));
+    }
+    let sort = Sort::decode(sort)
+        .map_err(|error| CometError::Internal(format!("Invalid TopK merge keys: {error}")))?;
+    if sort.sort_orders.is_empty() || !sort.sort_orders.iter().all(key) {
+        return Err(CometError::Internal(
+            "Unsupported driver TopK merge key".into(),
+        ));
+    }
+    let mut reader = StreamReader::try_new(Cursor::new(ipc), None)?;
+    let batch = reader
+        .next()
+        .transpose()?
+        .ok_or_else(|| CometError::Internal("TopK merge requires one Arrow batch".into()))?;
+    if reader.next().is_some()
+        || batch.num_rows() > 2 * fetch as usize
+        || batch
+            .schema()
+            .fields()
+            .iter()
+            .any(|f| !matches!(f.data_type(), ArrowDataType::Int32 | ArrowDataType::Int64))
+    {
+        return Err(CometError::Internal("Invalid TopK merge batch".into()));
+    }
+    let planner = PhysicalPlanner::default();
+    let keys = sort
+        .sort_orders
+        .iter()
+        .map(|expr| planner.create_sort_expr(expr, batch.schema()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(
+        merge_indices(&batch, left_rows as usize, fetch as usize, &keys)?
+            .into_iter()
+            .map(|index| index as i32)
+            .collect(),
+    )
+}
 
 #[cfg(feature = "jemalloc")]
 fn log_jemalloc_usage() {

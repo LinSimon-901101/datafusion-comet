@@ -325,7 +325,7 @@ The type-name conversion functions (`bigint`, `binary`, `boolean`, `date`, `deci
 | `unix_micros` | ✅ | Codegen dispatch |  |
 | `unix_millis` | ✅ | Codegen dispatch |  |
 | `unix_seconds` | ✅ | Codegen dispatch |  |
-| `unix_timestamp` | ✅ | Hybrid | String parsing uses Spark's codegen and honors the time parser policy, ANSI mode, and session time zone. Date inputs use Spark codegen or fallback for checked timezone and overflow semantics. Timestamp inputs ignore the format and use native execution. |
+| `unix_timestamp` | ✅ | Hybrid | String parsing uses Spark's codegen and honors the time parser policy, ANSI mode, and session time zone. Date columns retain native execution; date expressions that may return scalars use Spark codegen or fallback for checked timezone and overflow semantics. Timestamp inputs ignore the format and use native execution. |
 | `weekday` | ✅ | Native |  |
 | `weekofyear` | ✅ | Native |  |
 | `window` | ✅ | — | Batch tumbling and sliding time-window grouping runs natively |
@@ -744,6 +744,10 @@ kernel. In struct-subquery plans, unknown merged lengths and unbounded intermedi
 Spark rows; finite, safe conditional padding remains native. Fallible row-dependent consumers,
 computed broadcast keys and ANSI grouped decimal sums also retain Spark evaluation where native
 batching or initialization would change the first error or evaluate rows skipped by Spark.
+On Spark 4+, small Top-K queries retain native execution for pure `INT`/`BIGINT` scalar-subquery addition
+keys and direct-column projections when the requested limit, including offset, is at most 15.
+Overflow is exposed only when Spark's comparator would request that key. Other fallible sort
+keys retain Spark evaluation, as do installations using Java's legacy merge sort.
 Other expressions can also produce a scalar string for an entire batch, even when they
 reference columns. The native padding adapter broadcasts these runtime scalar strings
 through the existing array kernel for admitted expressions, preserving scalar and per-row lengths.

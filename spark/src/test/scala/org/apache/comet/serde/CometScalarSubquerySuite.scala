@@ -44,6 +44,25 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
   private def supported(dt: DataType): Boolean =
     CometScalarSubquery.getSupportLevel(subquery(dt)) == Compatible()
 
+  test("deferred TopK admits pure integer keys only in its comparator scope") {
+    val id = AttributeReference("id", IntegerType)()
+    val value = GetStructField(subquery(struct(IntegerType)), 0)
+    val add = Add(id, value, EvalMode.ANSI)
+    val order = SortOrder(add, Ascending)
+    assert(CometScalarSubquery.usesDeferredTopK(Seq(order), 7, Seq(id)) == isSpark40Plus)
+    assert(!CometScalarSubquery.usesDeferredTopK(Seq(order), 16, Seq(id)))
+    assert(!CometScalarSubquery.usesDeferredTopK(Seq(order), 7, Seq(Alias(add, "result")())))
+    val nested = SortOrder(Add(add, value, EvalMode.ANSI), Ascending)
+    assert(!CometScalarSubquery.usesDeferredTopK(Seq(nested), 7, Seq(id)))
+    assert(QueryPlanSerde.operatorExprToProto(order, Seq(id)).isEmpty)
+    CometScalarSubquery.withDeferredTopK(enabled = true) {
+      val proto = QueryPlanSerde.operatorExprToProto(order, Seq(id))
+      assert(proto.exists(_.getSortOrder.getChild.hasAdd))
+      assert(QueryPlanSerde.operatorExprToProto(nested, Seq(id)).isEmpty)
+    }
+    assert(QueryPlanSerde.operatorExprToProto(order, Seq(id)).isEmpty)
+  }
+
   test("struct context preserves row errors independently of width and NULL masks") {
     val id = AttributeReference("id", LongType, nullable = false)()
     val text = AttributeReference("text", StringType)()
@@ -673,7 +692,7 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     }
   }
 
-  test("date unix_timestamp dispatches while timestamp epoch extraction remains native") {
+  test("unix_timestamp keeps date columns native and dispatches potentially scalar dates") {
     val id = AttributeReference("id", IntegerType)()
     for {
       enabled <- Seq(false, true)
@@ -695,7 +714,7 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
           assert(CometScalarSubquery.consumerFallbackReason(unix).isEmpty)
           val (proto, reasons) =
             QueryPlanSerde.exprToProtoWithFallbackReasons(Alias(unix, "epoch")(), Seq(id, column))
-          if (dt != DateType) {
+          if (dt != DateType || (child eq column)) {
             assert(proto.exists(_.hasUnixTimestamp), s"$unix: $proto $reasons")
             assert(reasons.isEmpty, reasons)
             if (child eq column) assert(proto.get.getUnixTimestamp.getChild.hasBound)
@@ -705,8 +724,8 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
           } else {
             assert(proto.isEmpty, unix)
             assert(
-              reasons.exists(
-                _.contains("date inputs require Spark for checked timezone conversion")),
+              reasons.exists(_.contains(
+                "date inputs that may be scalar require Spark for checked timezone conversion")),
               reasons)
             assert(
               reasons.exists(_.contains(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key)),

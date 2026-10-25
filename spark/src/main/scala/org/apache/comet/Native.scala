@@ -29,6 +29,13 @@ import org.apache.comet.shuffle.ShufflePartitionPusher
 
 class Native extends NativeBase {
 
+  /** Merge two bounded native TopK runs on the driver, without a task execution context. */
+  @native def mergeTopK(
+      ipc: Array[Byte],
+      sort: Array[Byte],
+      leftRows: Int,
+      fetch: Int): Array[Int]
+
   // scalastyle:off
   /**
    * Create a native query plan from execution SparkPlan serialized in bytes.

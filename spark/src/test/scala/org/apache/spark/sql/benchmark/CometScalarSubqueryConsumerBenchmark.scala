@@ -43,7 +43,7 @@ object CometScalarSubqueryConsumerBenchmark extends CometBenchmarkBase {
         "CAST(NULL AS STRUCT<k:BIGINT>)))) AS BIGINT)) FROM consumer_outer",
       false),
     (
-      "merged subqueries -> integer cast -> length",
+      "legacy merged subqueries -> integer cast -> length",
       "SELECT sum(CAST(octet_length(CAST(payload.k + " +
         "(SELECT max(n) FROM consumer_cast_source) AS STRING)) AS BIGINT)), " +
         "sum((SELECT min(n) FROM consumer_cast_source)) FROM consumer_outer",
@@ -54,7 +54,20 @@ object CometScalarSubqueryConsumerBenchmark extends CometBenchmarkBase {
         "CAST((SELECT max(id) FROM consumer_array_source) AS BIGINT), " +
         "CAST((SELECT min(id) FROM consumer_array_source) AS BIGINT))) AS BIGINT)) " +
         "FROM consumer_outer",
-      true))
+      true),
+    (
+      "merged subqueries -> ANSI integer TopK",
+      "SELECT k FROM consumer_outer ORDER BY " +
+        "k + (SELECT max(n) FROM consumer_cast_source), " +
+        "k + (SELECT min(n) FROM consumer_cast_source) LIMIT 7",
+      true),
+    (
+      "runtime scalar clock and timestamp epoch",
+      "SELECT sum(CAST(hour(IF(coalesce(k, 0) >= 0, " +
+        "TIMESTAMP '2024-07-01 12:34:56', timestamp_micros(k))) AS BIGINT)), " +
+        "sum(unix_timestamp(IF(coalesce(k, 0) >= 0, " +
+        "TIMESTAMP '2024-07-01 12:34:56', timestamp_micros(k)))) FROM consumer_outer",
+      false))
 
   private def configs(comet: Boolean): Seq[(String, String)] = Seq(
     CometConf.COMET_ENABLED.key -> comet.toString,
@@ -84,7 +97,7 @@ object CometScalarSubqueryConsumerBenchmark extends CometBenchmarkBase {
           })
         }
         require(hasMergedStruct == merged, df.queryExecution.optimizedPlan.toString)
-        if (!merged) {
+        if (name.startsWith("ordinary NULL struct")) {
           require(
             df.queryExecution.optimizedPlan.exists(_.expressions.exists(_.exists {
               case Literal(null, _: StructType) => true
@@ -115,13 +128,17 @@ object CometScalarSubqueryConsumerBenchmark extends CometBenchmarkBase {
       SQLConf.SUBQUERY_REUSE_ENABLED.key -> "true",
       SQLConf.SHUFFLE_PARTITIONS.key -> "1",
       SQLConf.ANSI_ENABLED.key -> "true",
+      SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC",
       CometConf.COMET_BATCH_SIZE.key -> "8192") {
       withTempPath { dir =>
         withTempTable("consumer_outer", "consumer_cast_source", "consumer_array_source") {
           withSQLConf(configs(comet = false): _*) {
             spark
               .range(0, rows, 1, 1)
-              .selectExpr("id % 2 = 0 AS p", "named_struct('k', id) AS payload")
+              .selectExpr(
+                "id % 2 = 0 AS p",
+                "named_struct('k', id) AS payload",
+                "CASE WHEN id % 31 = 0 THEN NULL ELSE id END AS k")
               .write
               .parquet(s"${dir.getCanonicalPath}/outer")
             spark
@@ -138,7 +155,12 @@ object CometScalarSubqueryConsumerBenchmark extends CometBenchmarkBase {
             "consumer_array_source" -> "array_source").foreach { case (table, path) =>
             spark.read.parquet(s"${dir.getCanonicalPath}/$path").createOrReplaceTempView(table)
           }
-          cases.foreach { case (name, query, merged) => measure(name, query, merged, rows) }
+          cases.foreach { case (name, query, merged) =>
+            // Legacy arithmetic is total; ANSI overflow/order fallback has separate regressions.
+            withSQLConf(SQLConf.ANSI_ENABLED.key -> (!name.startsWith("legacy ")).toString) {
+              measure(name, query, merged, rows)
+            }
+          }
         }
       }
     }

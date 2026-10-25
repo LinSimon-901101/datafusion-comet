@@ -38,6 +38,7 @@ import org.apache.spark.sql.types._
 import com.google.protobuf.Message
 
 import org.apache.comet.CometConf
+import org.apache.comet.CometSparkSessionExtensions.isSpark40Plus
 import org.apache.comet.CometSparkSessionExtensions.withFallbackReason
 import org.apache.comet.serde.QueryPlanSerde.{serializeDataType, supportedDataType}
 import org.apache.comet.shims.{CometEvalModeUtil, CometExprTraitShim}
@@ -102,6 +103,47 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
     new TreeNodeTag[Boolean]("CometStructScalarSubqueryContext")
   private val currentStructSubqueryInputs = new DynamicVariable[Set[ExprId]](Set.empty)
   private val currentPlanHasStructSubquery = new DynamicVariable[Boolean](false)
+  private val deferredTopKSort = new DynamicVariable[Boolean](false)
+
+  private def topKValue(expr: Expression): Boolean = expr match {
+    case _: Attribute | _: BoundReference | _: Literal | _: ScalarSubquery =>
+      Set[DataType](IntegerType, LongType).contains(expr.dataType)
+    case field: GetStructField =>
+      def scalarField(e: Expression): Boolean = e match {
+        case _: ScalarSubquery => true
+        case f: GetStructField => scalarField(f.child)
+        case _ => false
+      }
+      Set[DataType](IntegerType, LongType).contains(field.dataType) && scalarField(field)
+    case cast: Cast if Cast.canUpCast(cast.child.dataType, cast.dataType) =>
+      Set[DataType](IntegerType, LongType).contains(cast.dataType) && topKValue(cast.child)
+    case _ => false
+  }
+
+  private def deferredTopKKey(expr: Expression): Boolean = expr match {
+    case sort: SortOrder => deferredTopKKey(sort.child)
+    case add: Add if add.evalMode == EvalMode.ANSI =>
+      Set[DataType](IntegerType, LongType).contains(add.dataType) &&
+      add.children.forall(topKValue)
+    case _ => topKValue(expr)
+  }
+
+  // A buffer smaller than Java TimSort's MIN_MERGE uses its fixed insertion-sort path.
+  // The native selector mirrors that path and Guava's comparisons, including skipped keys.
+  def usesDeferredTopK(
+      sortOrder: Seq[SortOrder],
+      limit: Int,
+      projectList: Seq[NamedExpression]): Boolean =
+    isSpark40Plus && !java.lang.Boolean.getBoolean("java.util.Arrays.useLegacyMergeSort") &&
+      limit > 0 && limit < 16 && projectList.forall(_.isInstanceOf[Attribute]) &&
+      sortOrder.forall(deferredTopKKey) &&
+      sortOrder.exists(_.exists {
+        case add: Add => add.evalMode == EvalMode.ANSI
+        case _ => false
+      }) && sortOrder.exists(_.exists(_.isInstanceOf[ScalarSubquery]))
+
+  def withDeferredTopK[T](enabled: Boolean)(f: => T): T =
+    deferredTopKSort.withValue(enabled)(f)
 
   /**
    * Trace struct scalar values before native conversion replaces their producing projections.
@@ -790,7 +832,8 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
     if (!hasStructSubqueryContext(expr)) return None
     val readsRows = expr.references.nonEmpty || !expr.deterministic ||
       expr.exists(_.isInstanceOf[BoundReference])
-    if (readsRows && !canEvaluateInAnyRowOrder(expr)) {
+    if (readsRows && !canEvaluateInAnyRowOrder(expr) &&
+      !(deferredTopKSort.value && deferredTopKKey(expr))) {
       return Some("Fallible struct scalar subquery consumers require Spark row evaluation")
     }
     expr match {

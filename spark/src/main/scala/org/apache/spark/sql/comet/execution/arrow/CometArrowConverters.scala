@@ -61,13 +61,18 @@ object CometArrowConverters extends Logging {
    */
   def serializeScalarSubquery(row: InternalRow, dataType: StructType): Array[Byte] = {
     val schema = StructType(Seq(StructField("value", dataType, nullable = true)))
+    serializeRows(Seq(InternalRow(normalizeScalarSubqueryRow(row, dataType))), schema)
+  }
+
+  /** Encode a bounded driver-side input without transferring live Arrow pointers. */
+  private[comet] def serializeRows(rows: Seq[InternalRow], schema: StructType): Array[Byte] = {
     val output = new ByteArrayOutputStream()
     Using.resource(
       VectorSchemaRoot.create(
         Utils.toArrowSchema(schema, CometArrowStream.NATIVE_TIMEZONE),
         CometArrowAllocator)) { root =>
-      val rowWriter = ArrowWriter.create(root, 1)
-      rowWriter.write(InternalRow(normalizeScalarSubqueryRow(row, dataType)))
+      val rowWriter = ArrowWriter.create(root, rows.length)
+      rows.foreach(rowWriter.write)
       rowWriter.finish()
       Using.resource(new ArrowStreamWriter(root, null, Channels.newChannel(output))) { writer =>
         writer.start()

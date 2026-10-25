@@ -21,7 +21,7 @@ package org.apache.comet.serde
 
 import java.util.Locale
 
-import org.apache.spark.sql.catalyst.expressions.{AddMonths, Attribute, Cast, ConvertTimezone, DateAdd, DateDiff, DateFormatClass, DateFromUnixDate, DateSub, DayOfMonth, DayOfWeek, DayOfYear, Days, DivideDTInterval, Expression, FromUTCTimestamp, GetDateField, GetTimestamp, Hour, Hours, LastDay, Literal, MakeDate, MakeDTInterval, MakeInterval, MakeTimestamp, MakeYMInterval, MicrosToTimestamp, MillisToTimestamp, Minute, Month, MonthsBetween, MultiplyDTInterval, MultiplyYMInterval, NextDay, PreciseTimestampConversion, Quarter, Second, SecondsToTimestamp, TimestampAdd, TimestampDiff, ToUnixTimestamp, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, UnixMicros, UnixMillis, UnixSeconds, UnixTimestamp, WeekDay, WeekOfYear, Year}
+import org.apache.spark.sql.catalyst.expressions.{AddMonths, Attribute, BoundReference, Cast, ConvertTimezone, DateAdd, DateDiff, DateFormatClass, DateFromUnixDate, DateSub, DayOfMonth, DayOfWeek, DayOfYear, Days, DivideDTInterval, Expression, FromUTCTimestamp, GetDateField, GetTimestamp, Hour, Hours, LastDay, Literal, MakeDate, MakeDTInterval, MakeInterval, MakeTimestamp, MakeYMInterval, MicrosToTimestamp, MillisToTimestamp, Minute, Month, MonthsBetween, MultiplyDTInterval, MultiplyYMInterval, NextDay, PreciseTimestampConversion, Quarter, Second, SecondsToTimestamp, TimestampAdd, TimestampDiff, ToUnixTimestamp, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, UnixMicros, UnixMillis, UnixSeconds, UnixTimestamp, WeekDay, WeekOfYear, Year}
 import org.apache.spark.sql.types.{CalendarIntervalType, DataType, DateType, DoubleType, FloatType, IntegerType, LongType, StringType, TimestampNTZType, TimestampType}
 import org.apache.spark.unsafe.types.UTF8String
 
@@ -276,7 +276,7 @@ object CometUnixTimestamp
     with CodegenDispatchFallback {
 
   private val dateInputUnsupportedReason =
-    "unix_timestamp date inputs require Spark for checked timezone conversion"
+    "unix_timestamp date inputs that may be scalar require Spark for checked timezone conversion"
 
   override def getUnsupportedReasons(): Seq[String] = Seq(
     "String inputs, including collated strings, have no native implementation.",
@@ -284,14 +284,16 @@ object CometUnixTimestamp
 
   private def isSupportedInputType(expr: UnixTimestamp): Boolean = {
     expr.children.head.dataType match {
-      case TimestampType | TimestampNTZType => true
+      case TimestampType | TimestampNTZType | DateType => true
       case _ => false
     }
   }
 
   override def getSupportLevel(expr: UnixTimestamp): SupportLevel = {
-    // Date conversion must preserve Spark's checked, zoned start-of-day calculation.
-    if (expr.timeExp.dataType == DateType) {
+    // Keep the existing column kernel; a conditional can return a scalar even with references.
+    val arrayDate = expr.timeExp.isInstanceOf[Attribute] ||
+      expr.timeExp.isInstanceOf[BoundReference]
+    if (expr.timeExp.dataType == DateType && !arrayDate) {
       Unsupported(Some(dateInputUnsupportedReason))
     } else if (!isSupportedInputType(expr)) {
       val inputType = expr.children.head.dataType

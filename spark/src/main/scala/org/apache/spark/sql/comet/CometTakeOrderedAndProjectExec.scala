@@ -19,21 +19,26 @@
 
 package org.apache.spark.sql.comet
 
+import scala.jdk.CollectionConverters._
+
 import org.apache.spark.TaskContext
 import org.apache.spark.rdd.{ParallelCollectionRDD, RDD}
 import org.apache.spark.serializer.Serializer
-import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, NamedExpression, SortOrder}
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.{Attribute, AttributeSet, BoundReference, GetStructField, Literal, NamedExpression, SortOrder, UnsafeProjection}
 import org.apache.spark.sql.catalyst.util.truncatedString
-import org.apache.spark.sql.comet.execution.arrow.CometArrowStream
+import org.apache.spark.sql.comet.execution.arrow.{CometArrowConverters, CometArrowStream}
 import org.apache.spark.sql.comet.execution.shuffle.{CometShuffledBatchRDD, CometShuffleExchangeExec}
 import org.apache.spark.sql.comet.util.{Utils => CometUtils}
-import org.apache.spark.sql.execution.{SparkPlan, TakeOrderedAndProjectExec, UnaryExecNode, UnsafeRowSerializer}
+import org.apache.spark.sql.execution.{ScalarSubquery, SparkPlan, TakeOrderedAndProjectExec, UnaryExecNode, UnsafeRowSerializer}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics, SQLShuffleReadMetricsReporter, SQLShuffleWriteMetricsReporter}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
-import org.apache.comet.{CometConf, ConfigEntry}
+import org.apache.comet.{CometConf, ConfigEntry, Native, SparkErrorConverter}
 import org.apache.comet.CometSparkSessionExtensions.isCometShuffleEnabled
-import org.apache.comet.serde.{Compatible, OperatorOuterClass, SupportLevel, Unsupported}
+import org.apache.comet.exceptions.CometQueryExecutionException
+import org.apache.comet.serde.{CometScalarSubquery, Compatible, OperatorOuterClass, SupportLevel, Unsupported}
 import org.apache.comet.serde.QueryPlanSerde.{exprToProto, operatorExprToProto, supportedSortType, withSharedSubexpressions}
 import org.apache.comet.serde.operator.CometSink
 
@@ -58,12 +63,14 @@ object CometTakeOrderedAndProjectExec extends CometSink[TakeOrderedAndProjectExe
       .foreach { reason =>
         return Unsupported(Some(reason))
       }
-    op.sortOrder.foreach { s =>
-      val o = operatorExprToProto(s, op.child.output)
-      if (o.isEmpty) {
-        return Unsupported(Some(s"unsupported sort order: $s"))
+    CometScalarSubquery.withDeferredTopK(
+      CometScalarSubquery.usesDeferredTopK(op.sortOrder, op.limit, op.projectList)) {
+      op.sortOrder.foreach { s =>
+        val o = operatorExprToProto(s, op.child.output)
+        if (o.isEmpty) {
+          return Unsupported(Some(s"unsupported sort order: $s"))
+        }
       }
-      o
     }
     if (!supportedSortType(op, op.sortOrder)) {
       return Unsupported(Some("unsupported data type in sort order"))
@@ -128,6 +135,9 @@ case class CometTakeOrderedAndProjectExec(
   lazy val orderingSatisfies: Boolean =
     SortOrder.orderingSatisfies(child.outputOrdering, sortOrder)
 
+  lazy val deferSortErrors =
+    CometScalarSubquery.usesDeferredTopK(sortOrder, limit, projectList)
+
   // Also exposed to tests so they can inspect the plan actually used for final execution.
   def finalNativePlan(inputPartitions: Int): Option[OperatorOuterClass.Operator] = {
     val selectedLocally = child match {
@@ -152,8 +162,138 @@ case class CometTakeOrderedAndProjectExec(
   // Spark's ordering evaluates each sort key on its own, without subexpression elimination
   private def topKNativePlan(offset: Int): Option[OperatorOuterClass.Operator] =
     withSharedSubexpressions(Seq.empty) {
-      CometExecUtils.getTopKNativePlan(child.output, sortOrder, child, limit, offset)
+      CometExecUtils.getTopKNativePlan(
+        child.output,
+        sortOrder,
+        child,
+        limit,
+        offset,
+        deferSortErrors)
     }
+
+  override def executeCollect(): Array[InternalRow] = {
+    if (!deferSortErrors) {
+      super.executeCollect()
+    } else {
+      // Spark's executeQuery prepares and awaits scalar subqueries before entering this body.
+      executeQuery {
+        val childRDD = child.executeColumnar()
+        if (childRDD.getNumPartitions == 0 || limit == 0) {
+          Array.empty[InternalRow]
+        } else {
+          val inputAttributes = child.output
+          val fetch = limit
+
+          // Resolve cached subquery values solely for the standalone driver merge. Keep the
+          // original expressions for task execution and its normal subquery registration.
+          // Fold only struct-field extraction: evaluating Add here could expose a skipped error.
+          val mergeOrders = sortOrder.map { order =>
+            order
+              .transformUp {
+                case bound: BoundReference => inputAttributes(bound.ordinal)
+                case subquery: ScalarSubquery =>
+                  Literal.create(subquery.eval(InternalRow.empty), subquery.dataType)
+                case field: GetStructField if field.child.isInstanceOf[Literal] =>
+                  Literal.create(field.eval(InternalRow.empty), field.dataType)
+              }
+              .asInstanceOf[SortOrder]
+          }
+          val referenced = AttributeSet(mergeOrders.flatMap(_.child.references))
+          val mergeAttributes = inputAttributes.filter(referenced.contains)
+          val mergeSchema = CometUtils.fromAttributes(mergeAttributes)
+          val mergeSort = OperatorOuterClass.Sort
+            .newBuilder()
+            .setFetch(fetch)
+            .setSkip(0)
+            .setDeferSortErrors(true)
+          withSharedSubexpressions(Seq.empty) {
+            CometScalarSubquery.withDeferredTopK(true) {
+              mergeOrders.foreach { order =>
+                mergeSort.addSortOrders(operatorExprToProto(order, mergeAttributes).get)
+              }
+            }
+          }
+          // Fresh expression serialization keeps query contexts inline; do not intern a detached
+          // Sort, since it has no Operator.sql_text_pool for the standalone planner to resolve.
+          val mergeSortBytes = mergeSort.build().toByteArray
+
+          // Match RDD.takeOrdered: partition zero contributes an empty array when empty; other
+          // empty partitions contribute nothing. RDD.reduce merges results in completion order.
+          val localArrays = deferredCollectLocalTopK(childRDD)
+          val mergeConf = conf.clone()
+          val limited = localArrays.reduce { (left, right) =>
+            SQLConf.withExistingConf(mergeConf) {
+              if (left.isEmpty) {
+                right
+              } else if (right.isEmpty) {
+                left
+              } else {
+                val combined = left ++ right
+                val selectInputs = UnsafeProjection.create(mergeAttributes, inputAttributes)
+                selectInputs.initialize(0)
+                val inputs = combined.iterator.map(row => selectInputs(row).copy()).toSeq
+                val ipc = CometArrowConverters.serializeRows(inputs, mergeSchema)
+                val selected =
+                  try {
+                    new Native().mergeTopK(ipc, mergeSortBytes, left.length, fetch)
+                  } catch {
+                    case error: CometQueryExecutionException =>
+                      throw SparkErrorConverter.convertToSparkException(error)
+                  }
+                selected.map(combined(_))
+              }
+            }
+          }
+          val data = if (offset > 0) limited.drop(offset) else limited
+          if (projectList != inputAttributes) {
+            // Admission restricts this path to direct attributes, so this only selects/reorders
+            // already-owned payload values and cannot evaluate a fallible scalar expression.
+            val project = UnsafeProjection.create(projectList, inputAttributes)
+            project.initialize(0)
+            data.map(row => project(row).copy(): InternalRow)
+          } else {
+            data
+          }
+        }
+      }
+    }
+  }
+
+  private def deferredCollectLocalTopK(childRDD: RDD[ColumnarBatch]): RDD[Array[InternalRow]] = {
+    // Spark collect applies takeOrdered even after its ordering-satisfies limit shortcut.
+    // Unlike doExecuteColumnar, this path must still run the native selector on that prefix.
+    val input = if (orderingSatisfies) {
+      CometExecUtils.getNativeLimitRDD(childRDD, child.output, limit)
+    } else {
+      childRDD
+    }
+    val numParts = input.getNumPartitions
+    val inputAttributes = child.output
+    val inputSchema = CometUtils.fromAttributes(inputAttributes)
+    val inputTypes = inputAttributes.map(_.dataType)
+    val serializedTopK = CometExec.serializeNativePlan(topKNativePlan(offset = 0).get)
+    input.mapPartitionsWithIndexInternal { case (idx, iter) =>
+      val native = CometExec.getCometIterator(
+        CometArrowStream.inputObjects(iter, inputSchema, "CometTakeOrderedAndProject-collect"),
+        inputAttributes.length,
+        serializedTopK,
+        numParts,
+        idx,
+        inputTypes)
+      setSubqueries(native.id, this)
+      Option(TaskContext.get()).foreach { context =>
+        context.addTaskCompletionListener[Unit] { _ =>
+          cleanSubqueries(native.id, this)
+        }
+      }
+      val copyProjection = UnsafeProjection.create(inputAttributes, inputAttributes)
+      copyProjection.initialize(idx)
+      val rows: Array[InternalRow] = native.flatMap { batch =>
+        batch.rowIterator().asScala.map[InternalRow](row => copyProjection(row).copy())
+      }.toArray
+      if (rows.nonEmpty || idx == 0) Iterator.single(rows) else Iterator.empty
+    }
+  }
 
   protected override def doExecuteColumnar(): RDD[ColumnarBatch] = {
     val childRDD = child.executeColumnar()

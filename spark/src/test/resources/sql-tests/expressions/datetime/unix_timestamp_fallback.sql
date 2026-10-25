@@ -41,9 +41,9 @@ SELECT unix_timestamp(ts), unix_timestamp(ntz) FROM test_unix_ts_fallback
 query expect_native(unix_timestamp)
 SELECT unix_timestamp(ts, fmt), unix_timestamp(ntz, fmt) FROM test_unix_ts_fallback
 
--- Date conversion uses Spark's checked start-of-day calculation, including with a format.
-query expect_fallback(unix_timestamp date inputs require Spark for checked timezone conversion)
+-- Existing date columns retain the native route, including an ignored format.
+query expect_native(unix_timestamp)
 SELECT unix_timestamp(d) FROM test_unix_ts_fallback
 
-query expect_fallback(unix_timestamp date inputs require Spark for checked timezone conversion)
+query expect_native(unix_timestamp)
 SELECT unix_timestamp(d, fmt) FROM test_unix_ts_fallback
