@@ -166,6 +166,21 @@ class CometHashExpressionSuite extends CometTestBase with AdaptiveSparkPlanHelpe
     }
   }
 
+  test("hash - integral array constructors retain native results with NULLs and merged scalars") {
+    withTable("t") {
+      sql("CREATE TABLE t(a TINYINT, b SMALLINT, c INT, d BIGINT) USING parquet")
+      sql("""INSERT INTO t VALUES
+        (1, 2, 3, 4), (null, null, null, null),
+        (-128, -32768, -2147483648, -9223372036854775808),
+        (127, 32767, 2147483647, 9223372036854775807)""")
+      checkSparkAnswerAndOperator("""SELECT hash(array(a,b,c,d)),
+        hash(c,array(a,b),d), hash(array(a,null),b),
+        hash(CASE WHEN c IS NULL THEN CAST(NULL AS ARRAY<BIGINT>) ELSE array(d,1L) END),
+        hash(array(CAST(a AS BIGINT),(SELECT max(d) FROM t),(SELECT min(d) FROM t)))
+        FROM t""")
+    }
+  }
+
   test("hash - struct") {
     withTable("t") {
       sql("CREATE TABLE t(c STRUCT<a: INT, b: STRING>) USING parquet")

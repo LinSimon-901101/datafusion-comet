@@ -19,8 +19,9 @@
 
 package org.apache.comet.serde
 
-import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, Murmur3Hash, Sha1, Sha2, XxHash64}
-import org.apache.spark.sql.types.{ArrayType, DataType, IntegerType, LongType, MapType, StringType, StructType}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, BoundReference, Cast, CreateArray, Expression, GetStructField, Literal, Murmur3Hash, Sha1, Sha2, XxHash64}
+import org.apache.spark.sql.execution.ExecSubqueryExpression
+import org.apache.spark.sql.types.{ArrayType, ByteType, DataType, IntegerType, LongType, MapType, ShortType, StringType, StructType}
 
 import org.apache.comet.serde.QueryPlanSerde.{exprToProtoInternal, isTimeType, scalarFunctionExprToProtoWithReturnType, serializeDataType, supportedDataType}
 
@@ -48,6 +49,26 @@ object CometXxHash64 extends CometExpressionSerde[XxHash64] {
 
 object CometMurmur3Hash extends CometExpressionSerde[Murmur3Hash] {
 
+  private def isValueRead(expr: Expression): Boolean = expr match {
+    case _: Attribute | _: BoundReference | _: Literal | _: ExecSubqueryExpression => true
+    case field: GetStructField => isValueRead(field.child)
+    case cast: Cast if Cast.canUpCast(cast.child.dataType, cast.dataType) =>
+      isValueRead(cast.child)
+    case _ => false
+  }
+
+  private[serde] def hashChildren(children: Seq[Expression]): Seq[Expression] =
+    children.flatMap {
+      // A constructed array is non-null and hashes its elements in order. Total integral
+      // children can be hashed directly without materializing and gathering a ListArray.
+      case array: CreateArray if array.children.nonEmpty && array.children.forall { child =>
+            Set[DataType](ByteType, ShortType, IntegerType, LongType).contains(child.dataType) &&
+            isValueRead(child)
+          } =>
+        array.children
+      case child => Seq(child)
+    }
+
   override def getUnsupportedReasons(): Seq[String] = HashUtils.unsupportedReasons
 
   override def getSupportLevel(expr: Murmur3Hash): SupportLevel =
@@ -57,7 +78,7 @@ object CometMurmur3Hash extends CometExpressionSerde[Murmur3Hash] {
       expr: Murmur3Hash,
       inputs: Seq[Attribute],
       binding: Boolean): Option[ExprOuterClass.Expr] = {
-    val exprs = expr.children.map(exprToProtoInternal(_, inputs, binding))
+    val exprs = hashChildren(expr.children).map(exprToProtoInternal(_, inputs, binding))
     val seedBuilder = LiteralOuterClass.Literal
       .newBuilder()
       .setDatatype(serializeDataType(IntegerType).get)
