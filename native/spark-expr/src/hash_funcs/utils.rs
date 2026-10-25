@@ -976,6 +976,8 @@ macro_rules! create_hashes_internal {
                         $hash_method
                     );
                 }
+                // Every value of a NullType column is null, and a null leaves the hash unchanged.
+                DataType::Null => {}
                 DataType::Utf8 => {
                     $crate::hash_array!(StringArray, col, $hashes_buffer, $hash_method);
                 }

@@ -32,7 +32,7 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
 import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogStatistics, CatalogTable}
-import org.apache.spark.sql.catalyst.expressions.{DynamicPruningExpression, Expression, ExpressionInfo, GetStructField, Hex, Literal, ScalarSubquery => LogicalScalarSubquery}
+import org.apache.spark.sql.catalyst.expressions.{DynamicPruningExpression, Expression, ExpressionInfo, GetStructField, Hex, Literal, Murmur3Hash, ScalarSubquery => LogicalScalarSubquery, XxHash64}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateMode, BloomFilterAggregate, Final}
 import org.apache.spark.sql.catalyst.plans.logical.Expand
 import org.apache.spark.sql.comet._
@@ -4676,6 +4676,76 @@ class CometExecSuite extends CometTestBase {
                 p.projectList.exists(_.name == "overlap")
               case p: ProjectExec if !nativeExpected =>
                 p.projectList.exists(_.name == "overlap")
+              case _ => false
+            })
+          }
+        }
+      }
+    }
+  }
+
+  test("scalar struct NullType fields retain native hashes") {
+    withTempPath { path =>
+      withTempView("scalar_null_hash_rows") {
+        withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+          spark.range(0, 4, 1, 1).write.parquet(path.toString)
+        }
+        spark.read.parquet(path.toString).createOrReplaceTempView("scalar_null_hash_rows")
+        for {
+          factoryMode <- Seq("CODEGEN_ONLY", "FALLBACK")
+          empty <- Seq(false, true)
+          fields <- Seq("'n', id", "'n', id, 'v', NULL")
+          function <- Seq("hash", "xxhash64")
+        } {
+          withSQLConf(
+            SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+            SQLConf.CODEGEN_FACTORY_MODE.key -> factoryMode) {
+            val condition = if (empty) " WHERE id < 0" else ""
+            val scalar = s"(SELECT max(named_struct($fields)) " +
+              s"FROM scalar_null_hash_rows$condition)"
+            val df = sql(s"SELECT id, $function($scalar) answer FROM scalar_null_hash_rows")
+            val (_, cometPlan) =
+              checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+            assert(stripAQEPlan(cometPlan).exists {
+              case p: CometProjectExec =>
+                p.projectList.exists { expression =>
+                  expression.name == "answer" && expression.exists {
+                    case _: Murmur3Hash if function == "hash" => true
+                    case _: XxHash64 if function == "xxhash64" => true
+                    case _ => false
+                  }
+                }
+              case _ => false
+            })
+          }
+        }
+      }
+    }
+  }
+
+  test("scalar struct NullType fields preserve null parents") {
+    withTempPath { path =>
+      withTempView("scalar_null_field_rows") {
+        withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+          spark.range(0, 4, 1, 1).write.parquet(path.toString)
+        }
+        spark.read.parquet(path.toString).createOrReplaceTempView("scalar_null_field_rows")
+        for {
+          factoryMode <- Seq("CODEGEN_ONLY", "FALLBACK")
+          empty <- Seq(false, true)
+          value <- Seq("NULL", "id", "CAST(id AS STRING)")
+        } {
+          withSQLConf(
+            SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+            SQLConf.CODEGEN_FACTORY_MODE.key -> factoryMode) {
+            val condition = if (empty) " WHERE id < 0" else ""
+            val scalar = s"(SELECT max(named_struct('v', $value, 'n', id)) " +
+              s"FROM scalar_null_field_rows$condition)"
+            val df = sql(s"SELECT id, $scalar.v answer FROM scalar_null_field_rows")
+            val (_, cometPlan) =
+              checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+            assert(stripAQEPlan(cometPlan).exists {
+              case p: CometProjectExec => p.projectList.exists(_.name == "answer")
               case _ => false
             })
           }
