@@ -230,6 +230,33 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     }
   }
 
+  test("shared Bloom initialization protects the owning expression group") {
+    val value = subquery(struct(BinaryType))
+    val first = BloomFilterMightContain(GetStructField(value, 0), Literal(1L))
+    val repeated = first.copy(valueExpression = Literal(2L))
+    for {
+      whole <- Seq(false, true)
+      shared <- Seq(false, true)
+      second <- Seq(repeated, Not(repeated))
+    } {
+      withSQLConf(
+        "spark.sql.codegen.factoryMode" -> "CODEGEN_ONLY",
+        "spark.sql.codegen.wholeStage" -> whole.toString,
+        "spark.sql.subexpressionElimination.enabled" -> shared.toString) {
+        QueryPlanSerde.withSharedSubexpressions(Seq(first, second, second)) {
+          assert(CometScalarSubquery.consumerFallbackReason(first).isDefined == (whole && shared))
+        }
+        QueryPlanSerde.withSharedSubexpressions(Seq(first, second)) {
+          assert(CometScalarSubquery.consumerFallbackReason(first).isEmpty)
+        }
+        val safe = GetStructField(subquery(struct(BooleanType)), 0)
+        QueryPlanSerde.withSharedSubexpressions(Seq(safe, safe)) {
+          assert(CometScalarSubquery.consumerFallbackReason(safe).isEmpty)
+        }
+      }
+    }
+  }
+
   private def versionSpecificTypes: Seq[DataType] = {
     val strings =
       if (isSpark40Plus) Seq(DataType.fromDDL("STRING COLLATE UTF8_LCASE")) else Seq.empty

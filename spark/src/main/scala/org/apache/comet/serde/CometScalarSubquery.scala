@@ -840,12 +840,14 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
     expr match {
       // Runtime masks cannot defer native Bloom setup. FALLBACK can also recover from a
       // code-generation error and interpret the expression, including its first-error order.
+      // Whole-stage codegen initializes shared subtrees before the other operator expressions.
       case _
-          if !SQLConf.get
-            .getConfString("spark.sql.codegen.factoryMode", "FALLBACK")
-            .equalsIgnoreCase("CODEGEN_ONLY") &&
-            expr.exists(_.isInstanceOf[BloomFilterMightContain]) =>
-        Some("Bloom initialization of struct scalar subqueries requires CODEGEN_ONLY")
+          if expr.exists(_.isInstanceOf[BloomFilterMightContain]) &&
+            (!SQLConf.get
+              .getConfString("spark.sql.codegen.factoryMode", "FALLBACK")
+              .equalsIgnoreCase("CODEGEN_ONLY") ||
+              QueryPlanSerde.hasSharedBloomInitialization) =>
+        Some("Bloom initialization of struct scalar subqueries requires Spark evaluation")
       // IN skips candidates after a NULL value or a matching candidate. Native dynamic IN only
       // stops after a batch-wide match, and Spark may evaluate shared candidates eagerly.
       case in: In

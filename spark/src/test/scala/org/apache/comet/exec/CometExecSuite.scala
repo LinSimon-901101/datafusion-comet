@@ -3934,6 +3934,107 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar review shared Bloom initialization preserves the first input error") {
+    withTempPath { path =>
+      withTempView("review_bloom_numbers") {
+        withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+          spark.range(0, 4, 1, 1).write.parquet(path.toString)
+        }
+        spark.read.parquet(path.toString).createOrReplaceTempView("review_bloom_numbers")
+        spark.sessionState.functionRegistry.createOrReplaceTempFunction(
+          "review_might",
+          (children: Seq[Expression]) =>
+            org.apache.spark.sql.catalyst.expressions
+              .BloomFilterMightContain(children.head, children(1)),
+          "built-in")
+        try {
+          for {
+            payload <- Seq("ffffffff", "00")
+            whole <- Seq(false, true)
+            shared <- Seq(false, true)
+            wrapped <- Seq(false, true)
+            comet <- Seq(false, true)
+          } {
+            withSQLConf(
+              SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+              SQLConf.CODEGEN_FACTORY_MODE.key -> "CODEGEN_ONLY",
+              SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> whole.toString,
+              SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> shared.toString,
+              CometConf.COMET_ENABLED.key -> comet.toString) {
+              val subquery = "(SELECT max(named_struct('a', unhex('00000000'), " +
+                s"'b', unhex('$payload'))) FROM review_bloom_numbers)"
+              val first = s"review_might($subquery.a, 1L)"
+              val repeated = s"review_might($subquery.b, 2L)"
+              val second = if (wrapped) s"NOT ($repeated)" else repeated
+              val df = sql(s"SELECT $first a, $second b, $second c FROM review_bloom_numbers")
+              val error = intercept[Exception](df.collect())
+              val causes = causeChain(error)
+              val reordered = whole && shared
+              if (reordered && payload == "00") {
+                assert(
+                  causes.exists(e =>
+                    e.isInstanceOf[java.nio.BufferUnderflowException] ||
+                      e.isInstanceOf[java.io.EOFException]),
+                  error)
+              } else {
+                val version = if (reordered) "-1" else "0"
+                assert(
+                  causes.exists(e =>
+                    Option(e.getMessage).exists(message =>
+                      message.contains(s"BloomFilter version: $version") ||
+                        message.contains(s"Bloom filter version number ($version)"))),
+                  error)
+              }
+              if (comet) {
+                val plan = stripAQEPlan(df.queryExecution.executedPlan)
+                if (reordered) {
+                  assert(
+                    plan.exists {
+                      case p: ProjectExec =>
+                        p.projectList.exists(e =>
+                          e.name == "a" && e.exists(_.isInstanceOf[
+                            org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain]))
+                      case _ => false
+                    },
+                    plan)
+                  assert(
+                    new ExtendedExplainInfo()
+                      .getFallbackReasons(plan)
+                      .exists(_.contains("Bloom initialization")),
+                    plan)
+                } else {
+                  val projects = plan.collect {
+                    case p: CometProjectExec if p.projectList.exists(_.name == "a") => p
+                  }
+                  assert(projects.nonEmpty, plan)
+                  projects.foreach { project =>
+                    val names = project.projectList.flatMap(_.collect {
+                      case bloom: org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain =>
+                        bloom.prettyName
+                    })
+                    assert(names.nonEmpty, project)
+                    names.foreach { name =>
+                      assert(
+                        project
+                          .getTagValue(CometExplainInfo.NATIVE_EXPRS)
+                          .exists(_.contains(name)),
+                        project)
+                      assert(
+                        !project
+                          .getTagValue(CometExplainInfo.CODEGEN_DISPATCH_EXPRS)
+                          .exists(_.contains(name)),
+                        project)
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } finally sql("DROP TEMPORARY FUNCTION IF EXISTS review_might")
+      }
+    }
+  }
+
   test("scalar review whole-stage filters do not eagerly evaluate shared Slice arguments") {
     withScalarReviewTables {
       for (filterSharing <- Seq(false, true))
