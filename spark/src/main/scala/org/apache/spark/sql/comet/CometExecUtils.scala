@@ -31,7 +31,7 @@ import org.apache.spark.sql.comet.util.Utils
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
-import org.apache.comet.serde.{CometScalarSubquery, OperatorOuterClass}
+import org.apache.comet.serde.{CometScalarSubquery => CometScalarSubquerySerde, OperatorOuterClass}
 import org.apache.comet.serde.OperatorOuterClass.Operator
 import org.apache.comet.serde.QueryPlanSerde.{exprToProto, operatorExprToProto, serializeDataType}
 
@@ -155,7 +155,7 @@ object CometExecUtils {
     if (scanTypes.length == outputAttributes.length) {
       scanBuilder.addAllFields(scanTypes.asJava)
 
-      val sortOrders = CometScalarSubquery.withDeferredTopK(deferSortErrors) {
+      val sortOrders = CometScalarSubquerySerde.withDeferredTopK(deferSortErrors) {
         sortOrder.map(operatorExprToProto(_, child.output))
       }
 

@@ -95,7 +95,8 @@ attachment counters belong to the local TopK.
 
 On Spark 4+, pure scalar-subquery integer addition keys use `Sort.defer_sort_errors` for limits up to 15,
 including offset. The native `SparkTopKExec` keeps successful key evaluation vectorized and
-defers typed overflow until the corresponding comparator call. Its bounded selector follows
+defers typed overflow until the corresponding comparator call. Key workspace shrinks to fit
+the memory pool, and only retained rows are copied between slices. Its bounded selector follows
 Spark's Guava schedule, including sorting before truncation. This limit keeps each buffer below
 Java TimSort's merge threshold; larger fallible sorts retain Spark execution. Output projections
 on this path are direct attributes. Spark 3 uses an older Guava selection schedule; it retains

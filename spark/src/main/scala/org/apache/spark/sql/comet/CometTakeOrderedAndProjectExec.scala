@@ -38,7 +38,7 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.comet.{CometConf, ConfigEntry, Native, SparkErrorConverter}
 import org.apache.comet.CometSparkSessionExtensions.isCometShuffleEnabled
 import org.apache.comet.exceptions.CometQueryExecutionException
-import org.apache.comet.serde.{CometScalarSubquery, Compatible, OperatorOuterClass, SupportLevel, Unsupported}
+import org.apache.comet.serde.{CometScalarSubquery => CometScalarSubquerySerde, Compatible, OperatorOuterClass, SupportLevel, Unsupported}
 import org.apache.comet.serde.QueryPlanSerde.{exprToProto, operatorExprToProto, supportedSortType, withSharedSubexpressions}
 import org.apache.comet.serde.operator.CometSink
 
@@ -63,8 +63,8 @@ object CometTakeOrderedAndProjectExec extends CometSink[TakeOrderedAndProjectExe
       .foreach { reason =>
         return Unsupported(Some(reason))
       }
-    CometScalarSubquery.withDeferredTopK(
-      CometScalarSubquery.usesDeferredTopK(op.sortOrder, op.limit, op.projectList)) {
+    CometScalarSubquerySerde.withDeferredTopK(
+      CometScalarSubquerySerde.usesDeferredTopK(op.sortOrder, op.limit, op.projectList)) {
       op.sortOrder.foreach { s =>
         val o = operatorExprToProto(s, op.child.output)
         if (o.isEmpty) {
@@ -136,7 +136,7 @@ case class CometTakeOrderedAndProjectExec(
     SortOrder.orderingSatisfies(child.outputOrdering, sortOrder)
 
   lazy val deferSortErrors =
-    CometScalarSubquery.usesDeferredTopK(sortOrder, limit, projectList)
+    CometScalarSubquerySerde.usesDeferredTopK(sortOrder, limit, projectList)
 
   // Also exposed to tests so they can inspect the plan actually used for final execution.
   def finalNativePlan(inputPartitions: Int): Option[OperatorOuterClass.Operator] = {
@@ -207,7 +207,7 @@ case class CometTakeOrderedAndProjectExec(
             .setSkip(0)
             .setDeferSortErrors(true)
           withSharedSubexpressions(Seq.empty) {
-            CometScalarSubquery.withDeferredTopK(true) {
+            CometScalarSubquerySerde.withDeferredTopK(true) {
               mergeOrders.foreach { order =>
                 mergeSort.addSortOrders(operatorExprToProto(order, mergeAttributes).get)
               }

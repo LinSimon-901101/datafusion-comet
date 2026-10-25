@@ -181,6 +181,8 @@ struct KeyCache {
 struct CachedBatch {
     batch: RecordBatch,
     keys: Vec<KeyCache>,
+    // Zero for a slice whose complete input buffers are already reserved by select.
+    payload_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -197,7 +199,7 @@ impl Candidate {
 
 impl CachedBatch {
     fn size(&self) -> usize {
-        self.batch.get_array_memory_size()
+        self.payload_bytes
             + size_of::<Self>()
             + self.keys.capacity() * size_of::<KeyCache>()
             + self
@@ -254,7 +256,12 @@ impl KeyEncoder {
                 failed,
             });
         }
-        Ok(CachedBatch { batch, keys })
+        let payload_bytes = batch.get_array_memory_size();
+        Ok(CachedBatch {
+            batch,
+            keys,
+            payload_bytes,
+        })
     }
 
     fn compare(&self, left: &Candidate, right: &Candidate) -> Result<Ordering> {
@@ -450,7 +457,12 @@ fn compact(
         }
         keys.push(KeyCache { rows, failed });
     }
-    let compacted = Arc::new(CachedBatch { batch, keys });
+    let payload_bytes = batch.get_array_memory_size();
+    let compacted = Arc::new(CachedBatch {
+        batch,
+        keys,
+        payload_bytes,
+    });
     for (index, row) in selector.buffer.iter_mut().enumerate() {
         *row = Candidate {
             batch: Arc::clone(&compacted),
@@ -482,30 +494,41 @@ async fn select(
             continue;
         }
         let _timer = metrics.elapsed_compute().timer();
-        let incoming = checked_bytes(
-            batch.get_array_memory_size(),
-            key_scratch_bytes(batch.num_rows(), encoder.expressions.len())?,
-        )?;
-        reservation.try_resize(checked_bytes(
-            checked_bytes(fixed, retained_size(&selector)?)?,
-            incoming,
-        )?)?;
-        let batch = Arc::new(encoder.encode(batch)?);
-        reservation.try_resize(checked_bytes(
-            checked_bytes(fixed, retained_size(&selector)?)?,
-            batch.size(),
-        )?)?;
-        for row in 0..batch.batch.num_rows() {
-            selector.offer(
-                Candidate {
-                    batch: Arc::clone(&batch),
-                    row,
-                },
-                &mut |a, b| encoder.compare(a, b),
-            )?;
+        let held_input = checked_bytes(fixed, batch.get_array_memory_size())?;
+        let mut offset = 0;
+        while offset < batch.num_rows() {
+            let base = checked_bytes(held_input, retained_size(&selector)?)?;
+            let mut count = batch.num_rows() - offset;
+            // Key caches are optional workspace, not a minimum input-batch-sized
+            // allocation. Retrying smaller slices preserves every comparator call.
+            loop {
+                let bytes =
+                    checked_bytes(base, key_scratch_bytes(count, encoder.expressions.len())?)?;
+                match reservation.try_resize(bytes) {
+                    Ok(()) => break,
+                    Err(_) if count > 1 => count = count.div_ceil(2),
+                    Err(error) => return Err(error),
+                }
+            }
+            let mut cached = encoder.encode(batch.slice(offset, count))?;
+            cached.payload_bytes = 0;
+            let cached = Arc::new(cached);
+            reservation.try_resize(checked_bytes(base, cached.size())?)?;
+            let mut candidate = Candidate {
+                batch: Arc::clone(&cached),
+                row: 0,
+            };
+            for row in 0..count {
+                candidate.row = row;
+                selector.offer_ref(&candidate, &mut |a, b| encoder.compare(a, b))?;
+            }
+            drop(candidate);
+            drop(cached);
+            compact(&mut selector, &encoder, &schema, &reservation, held_input)?;
+            offset += count;
         }
         drop(batch);
-        compact(&mut selector, &encoder, &schema, &reservation, fixed)?;
+        reservation.try_resize(checked_bytes(fixed, retained_size(&selector)?)?)?;
     }
     let _timer = metrics.elapsed_compute().timer();
     selector.finish(&mut |a, b| encoder.compare(a, b))?;
@@ -618,25 +641,34 @@ impl<T: Clone> Selector<T> {
         }
     }
 
+    #[cfg(test)]
     fn offer<F: FnMut(&T, &T) -> Result<Ordering>>(
         &mut self,
         value: T,
         compare: &mut F,
     ) -> Result<()> {
+        self.offer_ref(&value, compare)
+    }
+
+    fn offer_ref<F: FnMut(&T, &T) -> Result<Ordering>>(
+        &mut self,
+        value: &T,
+        compare: &mut F,
+    ) -> Result<()> {
         if self.buffer.is_empty() {
             self.threshold = Some(value.clone());
-            self.buffer.push(value);
+            self.buffer.push(value.clone());
         } else if self.buffer.len() < self.k {
             self.buffer.push(value.clone());
-            if compare(&value, self.threshold.as_ref().expect("nonempty buffer"))?
+            if compare(value, self.threshold.as_ref().expect("nonempty buffer"))?
                 == Ordering::Greater
             {
-                self.threshold = Some(value);
+                self.threshold = Some(value.clone());
             }
-        } else if compare(&value, self.threshold.as_ref().expect("nonempty buffer"))?
+        } else if compare(value, self.threshold.as_ref().expect("nonempty buffer"))?
             == Ordering::Less
         {
-            self.buffer.push(value);
+            self.buffer.push(value.clone());
             if self.buffer.len() == 2 * self.k {
                 self.trim(compare)?;
             }
@@ -918,6 +950,49 @@ mod tests {
         drop(selector);
         drop(reservation);
         assert_eq!(pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn key_workspace_adapts_to_a_small_pool_without_changing_selection() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, false),
+            Field::new("payload", DataType::Int32, false),
+        ]));
+        for count in [1, 2] {
+            let batches = (0..2)
+                .map(|batch| {
+                    RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        vec![
+                            Arc::new(Int32Array::from_iter_values(
+                                (batch * 8192..(batch + 1) * 8192).rev(),
+                            )),
+                            Arc::new(Int32Array::from_iter_values(0..8192)),
+                        ],
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let input = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(batches.into_iter().map(Ok)),
+            ));
+            let keys = vec![add_key(0, DataType::Int32); count];
+            let encoder = KeyEncoder::try_new(&keys, &schema).unwrap();
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(512 * 1024));
+            let reservation = MemoryConsumer::new("small topk test").register(&pool);
+            let metrics = BaselineMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+            let output = select(input, Arc::clone(&schema), encoder, 7, reservation, metrics)
+                .await
+                .unwrap();
+            let values = output
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert_eq!(values.values().as_ref(), &[0, 1, 2, 3, 4, 5, 6]);
+            assert_eq!(pool.reserved(), 0);
+        }
     }
 
     fn failure(name: &str) -> DataFusionError {
