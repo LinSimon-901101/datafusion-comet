@@ -42,26 +42,16 @@ import org.apache.comet.shims.CometTypeShim
  */
 class CometLiteralSuite extends CometTestBase with CometTypeShim {
 
-  test("a null literal rejects duplicate struct field names at every nesting level") {
+  test("a null literal with duplicate struct field names is unsupported") {
     val duplicateType =
       StructType(Seq(StructField("x", IntegerType), StructField("x", IntegerType)))
     val distinctType =
       StructType(Seq(StructField("x", IntegerType), StructField("y", IntegerType)))
-    def containers(dt: DataType): Seq[DataType] =
-      Seq(
-        dt,
-        StructType(Seq(StructField("s", dt))),
-        ArrayType(dt),
-        MapType(StringType, dt),
-        MapType(dt, StringType))
 
-    containers(duplicateType).zip(containers(distinctType)).foreach {
-      case (duplicate, distinct) =>
-        assert(
-          CometLiteral.getSupportLevel(Literal.create(null, duplicate)).isInstanceOf[Unsupported])
-        assert(
-          CometLiteral.getSupportLevel(Literal.create(null, distinct)).isInstanceOf[Compatible])
-    }
+    assert(
+      CometLiteral.getSupportLevel(Literal.create(null, duplicateType)).isInstanceOf[Unsupported])
+    assert(
+      CometLiteral.getSupportLevel(Literal.create(null, distinctType)).isInstanceOf[Compatible])
   }
 
   /**
@@ -181,6 +171,24 @@ class CometLiteralSuite extends CometTestBase with CometTypeShim {
         assert(folded, s"expected a folded literal with non-nullable arrays for leaf $leaf")
         checkSparkAnswerAndOperator(df)
       }
+    }
+  }
+
+  test("a null literal rejects nested duplicate struct field names") {
+    def containers(fieldName: String): Seq[DataType] = {
+      val struct =
+        StructType(Seq(StructField("x", IntegerType), StructField(fieldName, IntegerType)))
+      Seq(
+        StructType(Seq(StructField("s", struct))),
+        ArrayType(struct),
+        MapType(StringType, struct),
+        MapType(struct, StringType))
+    }
+    containers("x").zip(containers("y")).foreach { case (duplicate, distinct) =>
+      assert(
+        CometLiteral.getSupportLevel(Literal.create(null, duplicate)).isInstanceOf[Unsupported])
+      assert(
+        CometLiteral.getSupportLevel(Literal.create(null, distinct)).isInstanceOf[Compatible])
     }
   }
 }

@@ -4610,14 +4610,15 @@ class CometExecSuite extends CometTestBase {
                 s"SELECT $scalar n, CAST(NULL AS ${container.format(fields)}) d " +
                   "FROM scalar_null_fields")
               if (duplicate) {
-                checkSparkAnswer(df)
-                assert(stripAQEPlan(df.queryExecution.executedPlan).exists {
+                val (_, cometPlan) = checkSparkAnswer(df)
+                assert(stripAQEPlan(cometPlan).exists {
                   case p: ProjectExec => p.projectList.exists(_.name == "d")
                   case _ => false
                 })
               } else {
-                checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
-                assert(stripAQEPlan(df.queryExecution.executedPlan).exists {
+                val (_, cometPlan) =
+                  checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+                assert(stripAQEPlan(cometPlan).exists {
                   case p: CometProjectExec => p.projectList.exists(_.name == "d")
                   case _ => false
                 })
@@ -4627,8 +4628,8 @@ class CometExecSuite extends CometTestBase {
               s"SELECT $scalar n, " +
                 "CAST((SELECT max(named_struct('p', id, 'q', id)) FROM scalar_null_fields) " +
                 "AS STRUCT<x:BIGINT,x:BIGINT>) d FROM scalar_null_fields")
-            checkSparkAnswer(cast)
-            assert(stripAQEPlan(cast.queryExecution.executedPlan).exists {
+            val (_, castPlan) = checkSparkAnswer(cast)
+            assert(stripAQEPlan(castPlan).exists {
               case p: ProjectExec => p.projectList.exists(_.name == "d")
               case _ => false
             })
