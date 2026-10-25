@@ -199,6 +199,35 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     }
   }
 
+  test("native NULL masks cannot guard interpreted Bloom initialization") {
+    val bloom =
+      BloomFilterMightContain(GetStructField(subquery(struct(BinaryType)), 0), Literal(1L))
+    val nullable = Literal.create(null, BooleanType)
+    val consumers = Seq(
+      EqualTo(nullable, bloom),
+      LessThan(nullable, bloom),
+      GreaterThan(nullable, bloom),
+      GreaterThanOrEqual(nullable, bloom))
+    for (mode <- Seq("NO_CODEGEN", "CODEGEN_ONLY")) {
+      withSQLConf("spark.sql.codegen.factoryMode" -> mode) {
+        consumers.foreach { consumer =>
+          QueryPlanSerde.withSharedSubexpressions(Seq(consumer)) {
+            assert(
+              CometScalarSubquery.consumerFallbackReason(consumer).isDefined ==
+                (mode == "NO_CODEGEN"),
+              consumer)
+          }
+        }
+        QueryPlanSerde.withSharedSubexpressions(Seq.empty) {
+          assert(
+            CometScalarSubquery.consumerFallbackReason(EqualTo(Literal(true), bloom)).isEmpty)
+          val safe = GetStructField(subquery(struct(BooleanType)), 0)
+          assert(CometScalarSubquery.consumerFallbackReason(EqualTo(nullable, safe)).isEmpty)
+        }
+      }
+    }
+  }
+
   private def versionSpecificTypes: Seq[DataType] = {
     val strings =
       if (isSpark40Plus) Seq(DataType.fromDDL("STRING COLLATE UTF8_LCASE")) else Seq.empty

@@ -3837,7 +3837,7 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
-  test("scalar review Coalesce Bloom initialization follows evaluation mode") {
+  test("scalar review skipped Bloom initialization follows evaluation mode") {
     withScalarReviewTables {
       val registry = spark.sessionState.functionRegistry
       registry.createOrReplaceTempFunction(
@@ -3845,13 +3845,17 @@ class CometExecSuite extends CometTestBase {
         (children: Seq[Expression]) =>
           org.apache.spark.sql.catalyst.expressions
             .BloomFilterMightContain(children.head, children(1)),
-        "internal")
-      def query: DataFrame = sql(
-        "SELECT coalesce((SELECT max(k) >= 0 FROM review_nums), " +
-          "review_might((SELECT max(named_struct('b', unhex('00000000'))) " +
-          "FROM review_nums).b, 1L)) answer FROM review_nums WHERE k = 0")
+        "built-in")
+      val bloom = "review_might((SELECT max(named_struct('b', unhex('00000000'))) " +
+        "FROM review_nums).b, 1L)"
+      val nullable = "(SELECT max(k) >= 0 FROM review_nums WHERE k IS NULL)"
+      val expressions = Seq(
+        ("coalesce", s"coalesce((SELECT max(k) >= 0 FROM review_nums), $bloom)", Row(true)),
+        ("equalto", s"$nullable = $bloom", Row(null)),
+        ("lessthan", s"$nullable < $bloom", Row(null)))
       try
         for {
+          (name, expression, expected) <- expressions
           mode <- Seq("NO_CODEGEN", "CODEGEN_ONLY")
           shared <- Seq(false, true)
           comet <- Seq(false, true)
@@ -3861,7 +3865,7 @@ class CometExecSuite extends CometTestBase {
             SQLConf.CODEGEN_FACTORY_MODE.key -> mode,
             SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> shared.toString,
             CometConf.COMET_ENABLED.key -> comet.toString) {
-            val df = query
+            val df = sql(s"SELECT $expression answer FROM review_nums WHERE k = 0")
             assert(
               df.queryExecution.optimizedPlan.exists(_.expressions.exists(_.exists {
                 case GetStructField(_: LogicalScalarSubquery, _, _) => true
@@ -3869,12 +3873,14 @@ class CometExecSuite extends CometTestBase {
               })),
               df.queryExecution.optimizedPlan.toString)
             if (mode == "NO_CODEGEN") {
-              assert(df.collect().toSeq == Seq(Row(true)))
+              assert(df.collect().toSeq == Seq(expected))
             } else {
               val error = intercept[Exception](df.collect())
               assert(
                 causeChain(error).exists(e =>
-                  Option(e.getMessage).exists(_.contains("BloomFilter version: 0"))),
+                  Option(e.getMessage).exists(message =>
+                    message.contains("BloomFilter version: 0") ||
+                      message.contains("Unexpected Bloom filter version number (0)"))),
                 error)
             }
             if (comet) {
@@ -3882,14 +3888,16 @@ class CometExecSuite extends CometTestBase {
               if (mode == "NO_CODEGEN") {
                 assert(plan.exists {
                   case project: ProjectExec =>
-                    project.projectList.exists(_.exists(
-                      _.isInstanceOf[org.apache.spark.sql.catalyst.expressions.Coalesce]))
+                    project.projectList.exists(_.exists(_.prettyName == name))
                   case _ => false
                 })
                 val reasons = new ExtendedExplainInfo().getFallbackReasons(plan)
-                assert(reasons.exists(_.contains("Conditional Bloom initialization")), reasons)
+                val reason =
+                  if (name == "coalesce") "Conditional Bloom initialization"
+                  else "Nullable ordered consumers"
+                assert(reasons.exists(_.contains(reason)), reasons)
               } else {
-                assertExpressionImpl(plan, native = Seq("coalesce"), dispatched = Seq.empty)
+                assertExpressionImpl(plan, native = Seq(name), dispatched = Seq.empty)
               }
               val safe = sql(
                 "SELECT coalesce((SELECT max(named_struct('flag', k >= 0)) " +

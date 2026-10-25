@@ -789,6 +789,11 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
 
   private def hasNativeNullShortCircuit(expr: Expression): Boolean =
     isNativeNullShortCircuitFamily(expr) &&
+      // Native masks skip runtime work, but cannot defer planning-time Bloom initialization.
+      (QueryPlanSerde.usesGeneratedExpressionEvaluation ||
+        !skippedObservableArguments(expr).exists { child =>
+          child.exists(_.isInstanceOf[BloomFilterMightContain])
+        }) &&
       (QueryPlanSerde.canShortCircuitNulls(expr) ||
         skippedObservableArguments(expr).forall(QueryPlanSerde.isEagerSharedSubexpression))
 
