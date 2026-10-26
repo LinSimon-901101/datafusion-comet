@@ -4116,16 +4116,30 @@ class CometExecSuite extends CometTestBase {
                     (asRDD && shape == "topk-project"))) {
                   assert(result.isEmpty)
                 } else {
-                  val error = withClue(
+                  withClue(
                     s"input=$index shape=$shape whole=$whole comet=$comet asRDD=$asRDD: ") {
-                    intercept[Exception](result)
+                    val error = intercept[Exception](result)
+                    // SPARK-45584: Spark 3.4's collect-only TopK skips subquery preparation,
+                    // so it fails before Bloom setup, including on Comet's Spark fallback.
+                    if (!isSpark35Plus && shape != "project" && !asRDD) {
+                      assert(
+                        causeChain(error).exists {
+                          case e: IllegalArgumentException =>
+                            Option(e.getMessage).exists(message =>
+                              message.contains("Subquery") && message.contains(
+                                "has not finished"))
+                          case _ => false
+                        },
+                        error)
+                    } else {
+                      assert(
+                        causeChain(error).exists(e =>
+                          Option(e.getMessage).exists(message =>
+                            message.contains("BloomFilter version: 0") ||
+                              message.contains("Bloom filter version number (0)"))),
+                        error)
+                    }
                   }
-                  assert(
-                    causeChain(error).exists(e =>
-                      Option(e.getMessage).exists(message =>
-                        message.contains("BloomFilter version: 0") ||
-                          message.contains("Bloom filter version number (0)"))),
-                    error)
                 }
                 if (comet) {
                   val plan = stripAQEPlan(df.queryExecution.executedPlan)

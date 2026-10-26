@@ -2175,9 +2175,12 @@ class CometCodegenSuite
           }
 
           CometScalaUDFCodegen.resetStats()
-          val (_, cometPlan) = checkSparkAnswerAndFallbackReason(
-            df,
-            "codegen dispatch: expression ScalarSubquery not supported")
+          val fallbackReason = if (reuseEnabled) {
+            "Fallible struct scalar subquery consumers require Spark evaluation"
+          } else {
+            "codegen dispatch: expression ScalarSubquery not supported"
+          }
+          val (_, cometPlan) = checkSparkAnswerAndFallbackReason(df, fallbackReason)
           assert(stripAQEPlan(cometPlan).exists {
             case p: ProjectExec => p.projectList.exists(_.exists(_.isInstanceOf[ScalaUDF]))
             case _ => false
