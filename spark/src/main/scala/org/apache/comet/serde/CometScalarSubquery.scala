@@ -625,6 +625,10 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
               !in.deterministic || (in.value.nullable &&
                 in.list.exists(candidate => !canEvaluateForSkippedRows(candidate)))) =>
         Some("Nested membership of struct scalar subqueries requires Spark")
+      case and: And if !canEvaluateForSkippedRows(and.right) =>
+        Some("Boolean short-circuit consumers of struct scalar subqueries require Spark")
+      case or: Or if !canEvaluateForSkippedRows(or.right) =>
+        Some("Boolean short-circuit consumers of struct scalar subqueries require Spark")
       case _ => None
     }
   }

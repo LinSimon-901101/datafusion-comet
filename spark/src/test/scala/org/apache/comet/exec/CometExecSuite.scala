@@ -3638,6 +3638,23 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar review Boolean conditional shared children preserve lazy evaluation") {
+    withScalarReviewTables {
+      val query = "SELECT id >= (SELECT max(k) FROM review_nums) OR CAST(txt AS INT)=2 a, " +
+        "id > (SELECT min(k) FROM review_nums) OR CAST(txt AS INT)=2 b FROM review_items"
+      for (mode <- Seq("CODEGEN_ONLY", "NO_CODEGEN"); shared <- Seq(false, true)) {
+        withSQLConf(
+          SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
+          "spark.sql.codegen.factoryMode" -> mode,
+          SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> shared.toString) {
+          val df = sql(query)
+          checkSparkAnswer(df)
+          checkAnswer(df, Seq(Row(true, true), Row(true, true)))
+        }
+      }
+    }
+  }
+
   test("scalar review primitive and fixed-width IN preserve row evaluation") {
     withScalarReviewTables {
       Seq(
@@ -3664,6 +3681,18 @@ class CometExecSuite extends CometTestBase {
         val (expected, actual) = checkSparkAnswerMaybeThrows(sql(query))
         assert(expected.isDefined && actual.isDefined, s"$expected / $actual")
       }
+    }
+  }
+
+  test("scalar review Boolean consumers preserve row short circuiting") {
+    withScalarReviewTables {
+      Seq(
+        "id = (SELECT max(k) FROM review_nums) OR CAST(txt AS INT) = 2",
+        "id <> (SELECT max(k) FROM review_nums) AND CAST(txt AS INT) = 2")
+        .foreach { predicate =>
+          checkSparkAnswer(
+            s"SELECT id, $predicate, (SELECT min(k) FROM review_nums) FROM review_items")
+        }
     }
   }
 
