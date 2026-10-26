@@ -3710,6 +3710,26 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar review concat preserves generated and interpreted evaluation") {
+    withScalarReviewTables {
+      val z = "(SELECT max(named_struct('f', k)) FROM review_nums WHERE k < 0).f"
+      val query = s"SELECT id, concat(IF(id = 1, CAST($z AS STRING), CAST(id AS STRING)), " +
+        "CAST(CAST(txt AS INT) AS STRING)) FROM review_items"
+      withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "true") {
+        checkSparkAnswer(query)
+      }
+      withSQLConf(
+        SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> "false",
+        "spark.sql.codegen.factoryMode" -> "NO_CODEGEN") {
+        val (expected, actual) = checkSparkAnswerMaybeThrows(sql(query))
+        assert(expected.isDefined && actual.isDefined, s"$expected / $actual")
+        Seq(expected.get, actual.get).foreach { error =>
+          assert(causeChain(error).exists(_.getMessage.contains("CAST_INVALID_INPUT")), error)
+        }
+      }
+    }
+  }
+
   test("scalar review direct wide fields stay bounded at aggregate and shuffle boundaries") {
     withScalarReviewTables {
       checkSparkAnswer(

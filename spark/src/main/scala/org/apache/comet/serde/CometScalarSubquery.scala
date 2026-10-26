@@ -614,6 +614,17 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
     case _ => false
   }
 
+  private def skippedObservableArguments(expr: Expression): Seq[Expression] =
+    expr.children.zipWithIndex.collect {
+      case (child, index)
+          if expr.children.take(index).exists(_.nullable) &&
+            !canEvaluateForSkippedRows(child) =>
+        child
+    }
+
+  private def hasSkippedObservableArgument(expr: Expression): Boolean =
+    skippedObservableArguments(expr).nonEmpty
+
   private def evaluationFallbackReason(expr: Expression): Option[String] = {
     if (!hasStructSubqueryContext(expr)) return None
     expr match {
@@ -629,6 +640,9 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
         Some("Boolean short-circuit consumers of struct scalar subqueries require Spark")
       case or: Or if !canEvaluateForSkippedRows(or.right) =>
         Some("Boolean short-circuit consumers of struct scalar subqueries require Spark")
+      // Generated string concat skips after NULL; interpreted string concat evaluates every arg.
+      case _: Concat if hasSkippedObservableArgument(expr) =>
+        Some("Ordered concat consumers of struct scalar subqueries require Spark")
       case _ => None
     }
   }
