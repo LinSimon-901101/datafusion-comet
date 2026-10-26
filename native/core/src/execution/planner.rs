@@ -127,6 +127,7 @@ use jni::objects::{Global, JObject};
 use log::warn;
 use num::{BigInt, ToPrimitive};
 use object_store::path::Path;
+use parking_lot::Mutex;
 use std::{collections::HashMap, sync::Arc};
 
 pub type PlanCreationResult =
@@ -174,6 +175,8 @@ pub struct BinaryExprOptions {
 
 pub const TEST_EXEC_CONTEXT_ID: i64 = -1;
 
+type StructSubqueryLiterals = HashMap<(i64, i64, DataType), Arc<Literal>>;
+
 /// The query planner for converting Spark query plans to DataFusion query plans.
 #[derive(Clone)]
 pub struct PhysicalPlanner {
@@ -182,6 +185,9 @@ pub struct PhysicalPlanner {
     partition: i32,
     session_ctx: Arc<SessionContext>,
     query_context_registry: Arc<datafusion_comet_spark_expr::QueryContextMap>,
+    /// Field reads of a merged subquery share its immutable result instead of each retaining
+    /// another decoded copy of every sibling. Planner clones share this execution-owned cache.
+    struct_subquery_literals: Arc<Mutex<StructSubqueryLiterals>>,
     /// SQL texts referenced by `QueryContext.sql_text_idx`, taken from the root operator's
     /// `sql_text_pool`. Held as `Arc`s so that every context in the plan shares one allocation
     /// rather than each cloning the full query text out of the proto. Empty when the plan was
@@ -218,6 +224,7 @@ impl PhysicalPlanner {
             session_ctx,
             partition,
             query_context_registry: datafusion_comet_spark_expr::create_query_context_map(),
+            struct_subquery_literals: Arc::default(),
             sql_text_pool: vec![],
             task_context: None,
             class_loader: None,
@@ -300,6 +307,23 @@ impl PhysicalPlanner {
     pub fn with_exec_id(mut self, exec_context_id: i64) -> Self {
         self.exec_context_id = exec_context_id;
         self
+    }
+
+    fn resolve_struct_subquery(
+        &self,
+        id: i64,
+        data_type: &DataType,
+        resolve: impl FnOnce(i64, i64, &DataType) -> datafusion::common::Result<ScalarValue>,
+    ) -> datafusion::common::Result<Arc<Literal>> {
+        let key = (self.exec_context_id, id, data_type.clone());
+        let mut literals = self.struct_subquery_literals.lock();
+        if let Some(literal) = literals.get(&key) {
+            return Ok(Arc::clone(literal));
+        }
+        let value = resolve(self.exec_context_id, id, data_type)?;
+        let literal = Arc::new(Subquery::resolved_struct_literal(value));
+        literals.insert(key, Arc::clone(&literal));
+        Ok(literal)
     }
 
     pub fn with_strict_timestamp_labels(mut self, strict: bool) -> Self {
@@ -959,8 +983,7 @@ impl PhysicalPlanner {
                     // Spark has materialized and registered the result before this physical
                     // plan is created in executePlan. Keep an owned constant in the plan rather
                     // than initializing mutable state while evaluating input batches.
-                    let value = Subquery::resolve_struct(self.exec_context_id, id, &data_type)?;
-                    Ok(Arc::new(Subquery::resolved_struct_literal(value)))
+                    Ok(self.resolve_struct_subquery(id, &data_type, Subquery::resolve_struct)?)
                 } else {
                     Ok(Arc::new(Subquery::new(self.exec_context_id, id, data_type)))
                 }
@@ -3131,7 +3154,7 @@ mod tests {
 
     use arrow::array::{
         Array, ArrayRef, DictionaryArray, Float32Array, Float64Array, Int32Array, Int8Array,
-        ListArray, RecordBatch, StringArray,
+        ListArray, RecordBatch, StringArray, StructArray,
     };
     use arrow::datatypes::{DataType, Field, FieldRef, Fields, IntervalUnit, Schema, SchemaRef};
     use datafusion::catalog::memory::DataSourceExec;
@@ -3154,7 +3177,7 @@ mod tests {
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::SessionConfig;
     use datafusion::{assert_batches_eq, physical_plan::common::collect, prelude::SessionContext};
-    use datafusion_comet_spark_expr::{CometCollectList, CometCollectSet};
+    use datafusion_comet_spark_expr::{CometCollectList, CometCollectSet, GetStructField};
     use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
     use parquet::variant::VariantType;
     use tempfile::TempDir;
@@ -3187,6 +3210,115 @@ mod tests {
         },
     };
     use datafusion_comet_spark_expr::EvalMode;
+
+    #[test]
+    fn merged_struct_subquery_fields_share_one_resolved_literal() {
+        let planner = PhysicalPlanner::default().with_exec_id(41);
+        let fields: Fields = (0..32)
+            .map(|i| {
+                Field::new(format!("f{i}"), DataType::Utf8, true).with_metadata(
+                    std::collections::HashMap::from([(
+                        "PARQUET:field_id".to_owned(),
+                        i.to_string(),
+                    )]),
+                )
+            })
+            .collect();
+        let columns: Vec<ArrayRef> = (0..32)
+            .map(|i| {
+                Arc::new(StringArray::from(vec![
+                    (i != 1).then(|| format!("{}{i}", "x".repeat(65536)))
+                ])) as ArrayRef
+            })
+            .collect();
+        let value = ScalarValue::Struct(Arc::new(StructArray::new(fields, columns, None)));
+        let data_type = value.data_type();
+        let calls = AtomicUsize::new(0);
+        let batch = RecordBatch::try_new_with_options(
+            Arc::new(Schema::empty()),
+            vec![],
+            &arrow::array::RecordBatchOptions::new().with_row_count(Some(1)),
+        )
+        .unwrap();
+        let mut first = None;
+        for ordinal in 0..32 {
+            let literal = planner
+                .clone()
+                .resolve_struct_subquery(7, &data_type, |context, id, expected| {
+                    assert_eq!((context, id), (41, 7));
+                    assert_eq!(expected, &data_type);
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(value.clone())
+                })
+                .unwrap();
+            assert_eq!(literal.value(), &value);
+            if let Some(first) = &first {
+                assert!(Arc::ptr_eq(first, &literal));
+            } else {
+                first = Some(Arc::clone(&literal));
+            }
+            let field = GetStructField::new(literal, ordinal)
+                .evaluate(&batch)
+                .unwrap()
+                .into_array(1)
+                .unwrap();
+            let ScalarValue::Struct(expected) = &value else {
+                unreachable!()
+            };
+            assert_eq!(field.as_ref(), expected.column(ordinal).as_ref());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn resolved_struct_subqueries_separate_context_id_and_type_and_retry_errors() {
+        let planner = PhysicalPlanner::default().with_exec_id(41);
+        let data_type = DataType::Struct(vec![Field::new("v", DataType::Utf8, true)].into());
+        let changed_type = DataType::Struct(
+            vec![Field::new("v", DataType::Utf8, true).with_metadata(
+                std::collections::HashMap::from([("PARQUET:field_id".into(), "1".into())]),
+            )]
+            .into(),
+        );
+        let calls = AtomicUsize::new(0);
+        let resolve = |_, _, data_type: &DataType| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            ScalarValue::try_from(data_type)
+        };
+        let first = planner
+            .resolve_struct_subquery(7, &data_type, resolve)
+            .unwrap();
+        assert!(first.value().is_null());
+        let reused = planner
+            .resolve_struct_subquery(7, &data_type, resolve)
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &reused));
+        let other_context = planner
+            .clone()
+            .with_exec_id(42)
+            .resolve_struct_subquery(7, &data_type, resolve)
+            .unwrap();
+        let other_id = planner
+            .resolve_struct_subquery(8, &data_type, resolve)
+            .unwrap();
+        let other_type = planner
+            .resolve_struct_subquery(7, &changed_type, resolve)
+            .unwrap();
+        for literal in [&other_context, &other_id, &other_type] {
+            assert!(!Arc::ptr_eq(&first, literal));
+        }
+        assert_eq!(other_type.value().data_type(), changed_type);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        assert!(planner
+            .resolve_struct_subquery(9, &data_type, |_, _, _| {
+                Err(DataFusionError::Execution("decode failed".into()))
+            })
+            .is_err());
+        planner
+            .resolve_struct_subquery(9, &data_type, resolve)
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
+    }
 
     #[test]
     fn scan_default_rejects_struct_expressions() {

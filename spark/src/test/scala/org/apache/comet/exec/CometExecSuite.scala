@@ -52,7 +52,7 @@ import org.apache.spark.sql.internal.SQLConf.SESSION_LOCAL_TIMEZONE
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
-import org.apache.comet.{CometConf, CometExecIterator, CometExplainInfo, CometNativeException, ExtendedExplainInfo}
+import org.apache.comet.{CometConf, CometExecIterator, CometExplainInfo, CometNativeException, ExtendedExplainInfo, Native}
 import org.apache.comet.CometSparkSessionExtensions.{isSpark35Plus, isSpark40Plus, isSpark41Plus, isSpark42Plus}
 import org.apache.comet.rules.CometCoalesceShufflePartitions
 import org.apache.comet.serde.Config.ConfigMap
@@ -67,6 +67,57 @@ class CometExecSuite extends CometTestBase {
     super.test(testName, testTags: _*) {
       withSQLConf(CometConf.COMET_SHUFFLE_ENABLED.key -> "true") {
         testFun
+      }
+    }
+  }
+
+  test("scalar merged field reads share the retained native struct result") {
+    withSQLConf(
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      SQLConf.SUBQUERY_REUSE_ENABLED.key -> "true",
+      SQLConf.LEAF_NODE_DEFAULT_PARALLELISM.key -> "1") {
+      val fields = 32
+      val width = 65536
+      withParquetTable(Seq(Tuple1("x" * width)), "shared_scalar_source") {
+        withParquetTable((0 until 256).map(Tuple1(_)), "shared_scalar_outer") {
+          val expressions = (0 until fields).map { i =>
+            s"octet_length((SELECT max(concat(_1, 'x$i')) FROM shared_scalar_source)) c$i"
+          }
+          val df = sql(s"SELECT ${expressions.mkString(",")} FROM shared_scalar_outer")
+          val merged = df.queryExecution.optimizedPlan.flatMap { node =>
+            node.expressions.flatMap(_.collect {
+              case field: GetStructField if field.child.isInstanceOf[LogicalScalarSubquery] =>
+                field
+            })
+          }
+          assert(merged.map(_.ordinal).toSet == (0 until fields).toSet)
+          assert(merged.forall(_.child.dataType.asInstanceOf[StructType].length == fields))
+
+          val before = new Native().getMemoryUsage()(0)
+          val measurements = df.queryExecution.toRdd
+            .mapPartitions { rows =>
+              assert(rows.hasNext)
+              // Measure while the physical expressions and their literals are still live.
+              val retained = new Native().getMemoryUsage()(0) - before
+              var count = 0
+              rows.foreach { row =>
+                (0 until fields).foreach { i =>
+                  assert(row.getInt(i) == width + s"x$i".length)
+                }
+                count += 1
+              }
+              Iterator((retained, count))
+            }
+            .collect()
+            .toSeq
+          assert(measurements.size == 1)
+          assert(measurements.head._2 == 256)
+          // The merged value is about 2 MiB. Per-occurrence copies retain over 128 MiB.
+          assert(measurements.head._1 < 32L * 1024 * 1024, measurements)
+          val plan = df.queryExecution.executedPlan
+          assert(collect(plan) { case p: CometProjectExec => p }.nonEmpty, plan)
+          assertExpressionImpl(plan, native = Seq("octet_length"), dispatched = Seq.empty)
+        }
       }
     }
   }

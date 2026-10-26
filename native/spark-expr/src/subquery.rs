@@ -80,7 +80,8 @@ impl Subquery {
     /// Resolve Spark's already materialized struct result during native physical planning.
     /// Registration precedes the first executePlan call, which creates the physical plan.
     /// The planner stores the owned result in a Literal, so evaluation needs no JVM lookup or
-    /// mutable initialization state. Separate physical expressions may resolve the same ID.
+    /// mutable initialization state. The planner shares the result across physical expressions
+    /// with the same execution context, subquery ID and planned type.
     pub fn resolve_struct(
         exec_context_id: i64,
         id: i64,
