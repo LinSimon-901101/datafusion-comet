@@ -3249,7 +3249,7 @@ mod tests {
             .collect();
         let proto_type = spark_expression::DataType {
             type_id: spark_expression::data_type::DataTypeId::Struct as i32,
-            type_info: Some(spark_expression::data_type::DataTypeInfo {
+            type_info: Some(Box::new(spark_expression::data_type::DataTypeInfo {
                 datatype_struct: Some(
                     spark_expression::data_type::data_type_info::DatatypeStruct::Struct(
                         spark_expression::data_type::StructInfo {
@@ -3271,7 +3271,7 @@ mod tests {
                         },
                     ),
                 ),
-            }),
+            })),
         };
         let value = ScalarValue::Struct(Arc::new(StructArray::new(fields, columns, None)));
         let data_type = value.data_type();
