@@ -20,7 +20,7 @@
 package org.apache.comet.serde
 
 import org.apache.spark.sql.{CometTestBase, Row}
-import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Cast, Coalesce, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, Expression, GetStructField, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, NamedExpression, Not, OctetLength, Rand, StringRepeat, TruncDate, UnixDate, WeekDay}
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, AttributeReference, Cast, Coalesce, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, GetStructField, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Murmur3Hash, NamedExpression, Not, OctetLength, Rand, StringRepeat, TruncDate, UnixDate, WeekDay, XxHash64}
 import org.apache.spark.sql.comet.{CometScalarSubquery => NativeScalarSubquery}
 import org.apache.spark.sql.execution.{FilterExec, ProjectExec, ReusedSubqueryExec, ScalarSubquery, SubqueryExec}
 import org.apache.spark.sql.types._
@@ -66,6 +66,44 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     } finally {
       queries.foreach(NativeScalarSubquery.removeSubquery(context, _))
       NativeScalarSubquery.removeSubquery(secondContext, otherContext)
+    }
+  }
+
+  test("array hash fusion preserves argument order and evaluation boundaries") {
+    val value = AttributeReference("value", LongType, nullable = true)()
+    val children = Seq(value, Literal(1L), Literal.create(null, LongType))
+    val array = CreateArray(children)
+    assert(
+      HashUtils.hashChildren(Seq(Literal(7L), array, value)) ==
+        Seq(Literal(7L)) ++ children ++ Seq(value))
+    val proto =
+      CometMurmur3Hash.convert(Murmur3Hash(Seq(array), 17), Seq(value), binding = false).get
+    assert(proto.getScalarFunc.getArgsCount == 4)
+    assert(proto.getScalarFunc.getArgs(3).getLiteral.getIntVal == 17)
+    val xx = CometXxHash64.convert(XxHash64(Seq(array), 17L), Seq(value), binding = false).get
+    assert(xx.getScalarFunc.getArgsCount == 4)
+    assert(xx.getScalarFunc.getArgs(3).getLiteral.getLongVal == 17L)
+    for (dataType <- Seq(
+        BooleanType,
+        FloatType,
+        DoubleType,
+        DecimalType(18, 2),
+        StringType,
+        BinaryType,
+        struct(LongType),
+        ArrayType(LongType),
+        MapType(StringType, LongType))) {
+      val value = AttributeReference("value", dataType, nullable = true)()
+      val values = Seq(value, Literal.create(null, dataType))
+      assert(HashUtils.hashChildren(Seq(CreateArray(values))) == values)
+    }
+    val fallible = array.copy(children = Seq(Add(value, Literal(1L), EvalMode.ANSI)))
+    val stateful = array.copy(children = Seq(Cast(Rand(42L), LongType)))
+    val nullable = Literal.create(null, ArrayType(LongType))
+    val conditional = If(Literal(true), array, nullable)
+    val empty = CreateArray(Seq.empty)
+    for (child <- Seq(fallible, stateful, nullable, conditional, empty)) {
+      assert(HashUtils.hashChildren(Seq(child)) == Seq(child))
     }
   }
 
@@ -511,6 +549,25 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     CometScalarSubquery.tagPlanInputs(consumer)
     assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty)
     assert(CometScalarSubquery.rowPathFallbackReason(consumer).isEmpty)
+  }
+
+  test("bounded scalar aliases do not force a Spark row path") {
+    val number = GetStructField(subquery(struct(LongType)), 0)
+    val values =
+      Seq(number, Cast(number, StringType), CreateArray(Seq(number, Literal(1L), Literal(2L))))
+    values.foreach { value =>
+      val alias = Alias(value, "bounded")()
+      val producer = ProjectExec(Seq(alias), emptyInput)
+      val consumer = FilterExec(IsNotNull(alias.toAttribute), producer)
+      CometScalarSubquery.tagPlanInputs(consumer)
+      assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty, value)
+      assert(CometScalarSubquery.rowPathFallbackReason(consumer).isEmpty, value)
+      CometScalarSubquery.withPlanInputs(consumer) {
+        assert(
+          CometScalarSubquery.operatorArgumentFallbackReason(alias.toAttribute).isEmpty,
+          value)
+      }
+    }
   }
 
   test("wide row paths mark only the affected union branch") {

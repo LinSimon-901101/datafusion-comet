@@ -418,6 +418,17 @@ fn bounded_output_bytes(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option
                 Some(bound.max(bounded_output_bytes(value, schema)?))
             });
         }
+        if fun.fun().name() == "make_array" {
+            // Arity bounds the list cardinality; each child bounds its one element's bytes.
+            return fun.args().iter().try_fold(5usize, |total, child| {
+                total.checked_add(bounded_output_bytes(child, schema)?)
+            });
+        }
+    }
+    if expr.is::<CreateNamedStruct>() {
+        return expr.children().iter().try_fold(1usize, |total, child| {
+            total.checked_add(bounded_output_bytes(child, schema)?)
+        });
     }
     None
 }

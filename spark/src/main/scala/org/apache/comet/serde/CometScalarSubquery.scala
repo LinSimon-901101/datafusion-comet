@@ -22,7 +22,7 @@ package org.apache.comet.serde
 import scala.jdk.CollectionConverters._
 import scala.util.DynamicVariable
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, BoundReference, CaseWhen, Cast, Coalesce, Concat, ConcatWs, CreateArray, CreateMap, CreateNamedStruct, DateFormatClass, DateFromUnixDate, DayOfWeek, ElementAt, EqualNullSafe, EqualTo, Expression, ExprId, GetArrayItem, GetArrayStructFields, GetMapValue, GetStructField, GreaterThan, GreaterThanOrEqual, Greatest, Hour, If, In, InSet, IsNotNull, IsNull, KnownNotNull, KnownNullable, LambdaFunction, Least, LessThan, LessThanOrEqual, Literal, Minute, NamedExpression, PreciseTimestampConversion, RegExpExtract, RegExpExtractAll, ScalaUDF, Second, SortOrder, SpecifiedWindowFrame, StringLPad, StringRepeat, StringRPad, ToUnixTimestamp, TryEval, UnixDate, UnixTimestamp, WeekDay, WindowSpecDefinition}
+import org.apache.spark.sql.catalyst.expressions.{Alias, ArraysZip, Attribute, BoundReference, CaseWhen, Cast, Coalesce, Concat, ConcatWs, CreateArray, CreateMap, CreateNamedStruct, DateFormatClass, DateFromUnixDate, DayOfWeek, ElementAt, EqualNullSafe, EqualTo, Expression, ExprId, GetArrayItem, GetArrayStructFields, GetMapValue, GetStructField, GreaterThan, GreaterThanOrEqual, Greatest, Hour, If, In, InSet, IsNotNull, IsNull, KnownNotNull, KnownNullable, LambdaFunction, Least, LessThan, LessThanOrEqual, Literal, Minute, NamedExpression, PreciseTimestampConversion, RegExpExtract, RegExpExtractAll, ScalaUDF, Second, SortOrder, SpecifiedWindowFrame, StringLPad, StringRepeat, StringRPad, ToUnixTimestamp, TryEval, UnixDate, UnixTimestamp, WeekDay, WindowSpecDefinition}
 import org.apache.spark.sql.catalyst.expressions.objects.StaticInvoke
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.catalyst.trees.TreePattern.PLAN_EXPRESSION
@@ -379,6 +379,15 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
         case concat: Concat => sumBounds(concat.children.map(boundedResultBytes), 5)
         case concat: ConcatWs if hasLiteralNullSeparator(concat) =>
           Some(0L)
+        case array: CreateArray => sumBounds(array.children.map(boundedResultBytes), 5)
+        case zip: ArraysZip if zip.children.forall(_.isInstanceOf[CreateArray]) =>
+          val length = zip.children.map(_.children.length.toLong).foldLeft(0L)(math.max)
+          // NULL padding still allocates a full fixed-width slot in every result field.
+          sumBounds(
+            zip.children.map(a => fixedTypeBytes(a.dataType.asInstanceOf[ArrayType].elementType)),
+            1)
+            .filter(_ <= (Long.MaxValue - 5) / math.max(1L, length))
+            .map(_ * length + 5)
         case structure: CreateNamedStruct =>
           sumBounds(structure.valExprs.map(boundedResultBytes), 1)
         case conditional: If =>

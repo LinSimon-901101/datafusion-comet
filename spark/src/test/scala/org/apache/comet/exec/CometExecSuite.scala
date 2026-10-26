@@ -32,7 +32,7 @@ import org.apache.hadoop.fs.Path
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.{FunctionIdentifier, TableIdentifier}
 import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogStatistics, CatalogTable}
-import org.apache.spark.sql.catalyst.expressions.{DynamicPruningExpression, Expression, ExpressionInfo, GetStructField, Hex, Literal, ScalarSubquery => LogicalScalarSubquery}
+import org.apache.spark.sql.catalyst.expressions.{DynamicPruningExpression, Expression, ExpressionInfo, GetStructField, Hex, Literal, Murmur3Hash, ScalarSubquery => LogicalScalarSubquery, XxHash64}
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateMode, BloomFilterAggregate, Final}
 import org.apache.spark.sql.catalyst.plans.logical.Expand
 import org.apache.spark.sql.comet._
@@ -3786,6 +3786,90 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar struct array overlap consumers compare every row") {
+    withTempPath { path =>
+      withTempView("scalar_overlap_rows") {
+        withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+          spark
+            .range(0, 4, 1, 1)
+            .selectExpr("CAST(id AS INT) id", "array(CAST(id + 1 AS INT)) a")
+            .write
+            .parquet(path.toString)
+        }
+        spark.read.parquet(path.toString).createOrReplaceTempView("scalar_overlap_rows")
+        val scalar = "(SELECT max(named_struct('n', id)) FROM scalar_overlap_rows).n"
+        for {
+          excluded <- Seq("org.apache.spark.sql.catalyst.optimizer.ConstantFolding", "")
+          factoryMode <- Seq("CODEGEN_ONLY", "FALLBACK")
+          arguments <- Seq("array(1), a", "a, array(1)")
+          conditional <- Seq(false, true)
+        } {
+          withSQLConf(
+            SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+            SQLConf.CODEGEN_FACTORY_MODE.key -> factoryMode,
+            SQLConf.OPTIMIZER_EXCLUDED_RULES.key -> excluded,
+            CometConf.COMET_BATCH_SIZE.key -> "8192") {
+            val overlap = s"arrays_overlap($arguments)"
+            val result = if (conditional) s"IF($scalar > 0, $overlap, false)" else overlap
+            val df = sql(s"SELECT id, $scalar n, $result overlap FROM scalar_overlap_rows")
+            val nativeExpected = conditional || excluded.nonEmpty
+            val (_, cometPlan) = if (nativeExpected) {
+              checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+            } else {
+              checkSparkAnswer(df)
+            }
+            assert(stripAQEPlan(cometPlan).exists {
+              case p: CometProjectExec if nativeExpected =>
+                p.projectList.exists(_.name == "overlap")
+              case p: ProjectExec if !nativeExpected =>
+                p.projectList.exists(_.name == "overlap")
+              case _ => false
+            })
+          }
+        }
+      }
+    }
+  }
+
+  test("scalar struct NullType fields retain native hashes") {
+    withTempPath { path =>
+      withTempView("scalar_null_hash_rows") {
+        withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+          spark.range(0, 4, 1, 1).write.parquet(path.toString)
+        }
+        spark.read.parquet(path.toString).createOrReplaceTempView("scalar_null_hash_rows")
+        for {
+          factoryMode <- Seq("CODEGEN_ONLY", "FALLBACK")
+          empty <- Seq(false, true)
+          fields <- Seq("'n', id", "'n', id, 'v', NULL")
+          function <- Seq("hash", "xxhash64")
+        } {
+          withSQLConf(
+            SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+            SQLConf.CODEGEN_FACTORY_MODE.key -> factoryMode) {
+            val condition = if (empty) " WHERE id < 0" else ""
+            val scalar = s"(SELECT max(named_struct($fields)) " +
+              s"FROM scalar_null_hash_rows$condition)"
+            val df = sql(s"SELECT id, $function($scalar) answer FROM scalar_null_hash_rows")
+            val (_, cometPlan) =
+              checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+            assert(stripAQEPlan(cometPlan).exists {
+              case p: CometProjectExec =>
+                p.projectList.exists { expression =>
+                  expression.name == "answer" && expression.exists {
+                    case _: Murmur3Hash if function == "hash" => true
+                    case _: XxHash64 if function == "xxhash64" => true
+                    case _ => false
+                  }
+                }
+              case _ => false
+            })
+          }
+        }
+      }
+    }
+  }
+
   test("scalar struct NullType fields preserve null parents") {
     withTempPath { path =>
       withTempView("scalar_null_field_rows") {
@@ -3823,6 +3907,20 @@ class CometExecSuite extends CometTestBase {
         sql(
           "SELECT octet_length(CAST(id AS STRING)), (SELECT max(n) FROM review_src), " +
             "(SELECT min(n) FROM review_src) FROM review_outer"),
+        Seq(classOf[CometProjectExec]))
+    }
+  }
+
+  test("scalar review fixed-cardinality arrays remain native") {
+    withScalarReviewTables {
+      val value = "hash(array(id, " +
+        "CAST((SELECT max(k) FROM review_nums) AS BIGINT), " +
+        "CAST((SELECT min(k) FROM review_nums) AS BIGINT)))"
+      checkSparkAnswerAndOperator(
+        sql(s"SELECT sum(CAST($value AS BIGINT)) FROM review_outer"),
+        Seq(classOf[CometHashAggregateExec]))
+      checkSparkAnswerAndOperator(
+        sql(s"SELECT id, $value FROM review_outer"),
         Seq(classOf[CometProjectExec]))
     }
   }

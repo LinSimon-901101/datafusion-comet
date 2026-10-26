@@ -19,7 +19,8 @@
 
 package org.apache.comet.serde
 
-import org.apache.spark.sql.catalyst.expressions.{Attribute, Expression, Murmur3Hash, Sha1, Sha2, XxHash64}
+import org.apache.spark.sql.catalyst.expressions.{Attribute, BoundReference, Cast, CreateArray, Expression, GetStructField, Literal, Murmur3Hash, Sha1, Sha2, XxHash64}
+import org.apache.spark.sql.execution.ExecSubqueryExpression
 import org.apache.spark.sql.types.{ArrayType, DataType, IntegerType, LongType, MapType, StringType, StructType}
 
 import org.apache.comet.serde.QueryPlanSerde.{exprToProtoInternal, isTimeType, scalarFunctionExprToProtoWithReturnType, serializeDataType, supportedDataType}
@@ -35,7 +36,7 @@ object CometXxHash64 extends CometExpressionSerde[XxHash64] {
       expr: XxHash64,
       inputs: Seq[Attribute],
       binding: Boolean): Option[ExprOuterClass.Expr] = {
-    val exprs = expr.children.map(exprToProtoInternal(_, inputs, binding))
+    val exprs = HashUtils.hashChildren(expr.children).map(exprToProtoInternal(_, inputs, binding))
     val seedBuilder = LiteralOuterClass.Literal
       .newBuilder()
       .setDatatype(serializeDataType(LongType).get)
@@ -57,7 +58,7 @@ object CometMurmur3Hash extends CometExpressionSerde[Murmur3Hash] {
       expr: Murmur3Hash,
       inputs: Seq[Attribute],
       binding: Boolean): Option[ExprOuterClass.Expr] = {
-    val exprs = expr.children.map(exprToProtoInternal(_, inputs, binding))
+    val exprs = HashUtils.hashChildren(expr.children).map(exprToProtoInternal(_, inputs, binding))
     val seedBuilder = LiteralOuterClass.Literal
       .newBuilder()
       .setDatatype(serializeDataType(IntegerType).get)
@@ -114,7 +115,24 @@ object CometSha1 extends CometExpressionSerde[Sha1] {
   }
 }
 
-private object HashUtils {
+private[serde] object HashUtils {
+
+  private def isValueRead(expr: Expression): Boolean = expr match {
+    case _: Attribute | _: BoundReference | _: Literal | _: ExecSubqueryExpression => true
+    case field: GetStructField => isValueRead(field.child)
+    case cast: Cast if Cast.canUpCast(cast.child.dataType, cast.dataType) =>
+      isValueRead(cast.child)
+    case _ => false
+  }
+
+  def hashChildren(children: Seq[Expression]): Seq[Expression] =
+    children.flatMap {
+      // A constructed array is non-null and hashes its elements in order. Total
+      // children can be hashed directly without materializing and gathering a ListArray.
+      case array: CreateArray if array.children.nonEmpty && array.children.forall(isValueRead) =>
+        array.children
+      case child => Seq(child)
+    }
 
   private val unsupportedTimeTypeReason = "`TimeType` is not supported"
 
