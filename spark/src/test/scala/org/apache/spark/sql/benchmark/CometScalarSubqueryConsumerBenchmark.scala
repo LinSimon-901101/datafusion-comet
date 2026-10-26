@@ -54,6 +54,12 @@ object CometScalarSubqueryConsumerBenchmark extends CometBenchmarkBase {
         "CAST((SELECT max(id) FROM consumer_array_source) AS BIGINT), " +
         "CAST((SELECT min(id) FROM consumer_array_source) AS BIGINT))) AS BIGINT)) " +
         "FROM consumer_outer",
+      true),
+    (
+      "merged subqueries -> ANSI integer TopK",
+      "SELECT k FROM consumer_outer ORDER BY " +
+        "k + (SELECT max(n) FROM consumer_cast_source), " +
+        "k + (SELECT min(n) FROM consumer_cast_source) LIMIT 7",
       true))
 
   private def configs(comet: Boolean): Seq[(String, String)] = Seq(

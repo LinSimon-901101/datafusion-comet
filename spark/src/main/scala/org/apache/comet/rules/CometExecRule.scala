@@ -1195,7 +1195,8 @@ case class CometExecRule(session: SparkSession, queryStagePrep: Boolean = false)
       // spark.sql.subexpressionElimination.enabled says, and other operators only when it is on.
       val nativeOp = QueryPlanSerde.withSharedSubexpressions(
         op.expressions,
-        alwaysShared = op.isInstanceOf[BaseAggregateExec]) {
+        alwaysShared = op.isInstanceOf[BaseAggregateExec],
+        eagerSharing = op.isInstanceOf[ProjectExec] || op.isInstanceOf[ShuffleExchangeExec]) {
         if (op.children.nonEmpty && op.children.forall(_.isInstanceOf[CometNativeExec])) {
           val childOp = op.children.map(_.asInstanceOf[CometNativeExec].nativeOp)
           childOp.foreach(builder.addChildren)

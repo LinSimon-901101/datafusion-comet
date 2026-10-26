@@ -910,6 +910,8 @@ message Sort {
   optional int32 skip = 4;
   // Attach this TopK execution's live threshold to an eligible native reader.
   bool dynamic_filter_enabled = 5;
+  // Preserve comparator evaluation for small TopK with pure, fallible integer keys.
+  bool defer_sort_errors = 6;
 }
 
 message HashAggregate {

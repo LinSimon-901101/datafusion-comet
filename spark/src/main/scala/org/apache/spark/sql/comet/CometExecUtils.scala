@@ -31,7 +31,7 @@ import org.apache.spark.sql.comet.util.Utils
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.vectorized.ColumnarBatch
 
-import org.apache.comet.serde.OperatorOuterClass
+import org.apache.comet.serde.{CometScalarSubquery => CometScalarSubquerySerde, OperatorOuterClass}
 import org.apache.comet.serde.OperatorOuterClass.Operator
 import org.apache.comet.serde.QueryPlanSerde.{exprToProto, operatorExprToProto, serializeDataType}
 
@@ -143,7 +143,8 @@ object CometExecUtils {
       sortOrder: Seq[SortOrder],
       child: SparkPlan,
       limit: Int,
-      offset: Int = 0): Option[Operator] = {
+      offset: Int = 0,
+      deferSortErrors: Boolean = false): Option[Operator] = {
     val scanBuilder = OperatorOuterClass.Scan.newBuilder().setSource("TopKInput")
     val scanOpBuilder = OperatorOuterClass.Operator.newBuilder()
 
@@ -154,13 +155,16 @@ object CometExecUtils {
     if (scanTypes.length == outputAttributes.length) {
       scanBuilder.addAllFields(scanTypes.asJava)
 
-      val sortOrders = sortOrder.map(operatorExprToProto(_, child.output))
+      val sortOrders = CometScalarSubquerySerde.withDeferredTopK(deferSortErrors) {
+        sortOrder.map(operatorExprToProto(_, child.output))
+      }
 
       if (sortOrders.forall(_.isDefined)) {
         val sortBuilder = OperatorOuterClass.Sort.newBuilder()
         sortBuilder.addAllSortOrders(sortOrders.map(_.get).asJava)
         sortBuilder.setFetch(limit)
         sortBuilder.setSkip(offset)
+        sortBuilder.setDeferSortErrors(deferSortErrors)
 
         val sortOpBuilder = OperatorOuterClass.Operator
           .newBuilder()

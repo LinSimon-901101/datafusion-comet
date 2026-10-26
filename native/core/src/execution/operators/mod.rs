@@ -49,6 +49,7 @@ pub mod projection;
 mod scan;
 mod shuffle_scan;
 mod sorted_input;
+pub(crate) mod spark_topk;
 pub use csv_scan::init_csv_datasource_exec;
 pub use shuffle_scan::ShuffleScanExec;
 pub use sorted_input::SortedInputExec;

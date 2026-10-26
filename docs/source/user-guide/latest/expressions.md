@@ -741,7 +741,16 @@ fall back to Spark. Conditional inputs such as `IF` and `CASE WHEN` that referen
 columns can run natively, including when every row selects a struct-subquery field.
 Column strings with plain scalar-subquery lengths, including NULL lengths, retain the native
 kernel. In struct-subquery plans, unknown merged lengths and unbounded intermediate values use
-Spark rows; finite, safe conditional padding remains native.
+Spark rows; finite, safe conditional padding remains native. Fallible consumers, including constant
+expressions, computed broadcast keys and ANSI grouped decimal sums also retain Spark evaluation where native
+batching or initialization would change the first error or evaluate rows skipped by Spark.
+Bloom filters on these paths retain Spark evaluation when whole-stage code generation or Top-K
+initializes them on the driver. Ordinary Bloom projections can remain native with `CODEGEN_ONLY`
+and whole-stage code generation disabled.
+On Spark 4+, small Top-K queries retain native execution for pure `INT`/`BIGINT` scalar-subquery addition
+keys and direct-column projections when the requested limit, including offset, is at most 15.
+Overflow is exposed only when Spark's comparator would request that key. Other fallible sort
+keys retain Spark evaluation, as do installations using Java's legacy merge sort.
 Other expressions can also produce a scalar string for an entire batch, even when they
 reference columns. The native padding adapter broadcasts these runtime scalar strings
 through the existing array kernel for admitted expressions, preserving scalar and per-row lengths.

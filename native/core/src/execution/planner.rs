@@ -1353,7 +1353,7 @@ impl PhysicalPlanner {
     }
 
     /// Create a DataFusion physical sort expression from Spark physical expression
-    fn create_sort_expr<'a>(
+    pub(crate) fn create_sort_expr<'a>(
         &'a self,
         spark_expr: &'a Expr,
         input_schema: SchemaRef,
@@ -1835,21 +1835,29 @@ impl PhysicalPlanner {
 
                 let fetch = sort.fetch.map(|num| num as usize);
 
-                let sort_plan = SortExec::new(
-                    LexOrdering::new(exprs?).unwrap(),
-                    Arc::clone(&child.native_plan),
-                )
-                .with_fetch(fetch);
-                let mut sort_exec: Arc<dyn ExecutionPlan> = if sort.dynamic_filter_enabled {
-                    match TopKReaderFilterExec::try_new(
-                        &sort_plan,
-                        self.session_ctx.copied_config().options(),
-                    )? {
-                        Some(wrapper) => Arc::new(wrapper),
-                        None => Arc::new(sort_plan),
-                    }
+                let mut sort_exec: Arc<dyn ExecutionPlan> = if sort.defer_sort_errors {
+                    Arc::new(crate::execution::operators::spark_topk::SparkTopKExec::try_new(
+                        Arc::clone(&child.native_plan),
+                        exprs?,
+                        fetch.ok_or_else(|| GeneralError("Deferred TopK requires fetch".into()))?,
+                    )?)
                 } else {
-                    Arc::new(sort_plan)
+                    let sort_plan = SortExec::new(
+                        LexOrdering::new(exprs?).unwrap(),
+                        Arc::clone(&child.native_plan),
+                    )
+                    .with_fetch(fetch);
+                    if sort.dynamic_filter_enabled {
+                        match TopKReaderFilterExec::try_new(
+                            &sort_plan,
+                            self.session_ctx.copied_config().options(),
+                        )? {
+                            Some(wrapper) => Arc::new(wrapper),
+                            None => Arc::new(sort_plan),
+                        }
+                    } else {
+                        Arc::new(sort_plan)
+                    }
                 };
 
                 if let Some(skip) = sort.skip.filter(|&n| n > 0).map(|n| n as usize) {

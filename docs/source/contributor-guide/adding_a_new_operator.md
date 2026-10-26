@@ -93,6 +93,21 @@ eligible. The stream owns the heap and predicate until completion, error, or can
 final TopK after an exchange does not share this state. Reader work stays on scan metrics while
 attachment counters belong to the local TopK.
 
+On Spark 4+, pure scalar-subquery integer addition keys use `Sort.defer_sort_errors` for limits up to 15,
+including offset. The native `SparkTopKExec` keeps successful key evaluation vectorized and
+defers typed overflow until the corresponding comparator call. Key workspace shrinks to fit
+the memory pool, and only retained rows are copied between slices. Its bounded selector follows
+Spark's Guava schedule, including sorting before truncation. This limit keeps each buffer below
+Java TimSort's merge threshold; larger fallible sorts retain Spark execution. Output projections
+on this path are direct attributes. Spark 3 uses an older Guava selection schedule; it retains
+its existing arithmetic support/fallback. Java legacy merge sort also retains fallback.
+
+Spark's `executeCollect` merges sorted partition prefixes on the driver rather than running
+another selector. Comet preserves that boundary with a bounded IPC call to `Native.mergeTopK`.
+Only referenced integer columns cross this call; the driver retains payload rows, and the native
+call returns row indices without a task execution context or persistent native state. Cached
+scalar fields are resolved after query preparation, without evaluating the fallible addition.
+
 ### Choosing the Right Operator Type
 
 When adding a new operator, choose based on these criteria:

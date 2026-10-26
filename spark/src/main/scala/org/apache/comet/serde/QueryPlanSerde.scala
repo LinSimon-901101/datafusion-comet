@@ -1438,6 +1438,18 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
     }
   }
 
+  private[serde] def usesGeneratedExpressionEvaluation: Boolean =
+    !SQLConf.get
+      .getConfString("spark.sql.codegen.factoryMode", "FALLBACK")
+      .equalsIgnoreCase("NO_CODEGEN")
+
+  /** A common child or operator-wide discovery alone does not prove eager evaluation. */
+  private[serde] def isEagerSharedSubexpression(expr: Expression): Boolean =
+    usesGeneratedExpressionEvaluation && sharedSubexpressions.value.exists { shared =>
+      val promoted = DecimalPrecision.promote(expr)
+      shared.eagerSharing && shared.common.exists(_.semanticEquals(promoted))
+    }
+
   /**
    * Has native execution evaluate the arguments of `scalarFunc`, the serialized `expr`, the way
    * Spark evaluates those of a null-intolerant `BinaryExpression` or `TernaryExpression`: each

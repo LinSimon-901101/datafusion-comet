@@ -204,4 +204,34 @@ class QueryPlanSerdeSuite extends AnyFunSuite {
       }
     }
   }
+  test("eager shared roots exclude enclosing expressions and NO_CODEGEN") {
+    val id = AttributeReference("id", LongType)()
+    val inner = org.apache.spark.sql.catalyst.expressions.Add(id, Literal(3L))
+    val outer = Cast(inner, IntegerType)
+    for (mode <- Seq("CODEGEN_ONLY", "NO_CODEGEN"); enabled <- Seq(false, true)) {
+      val conf = new SQLConf
+      conf.setConfString("spark.sql.codegen.factoryMode", mode)
+      conf.setConf(SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED, enabled)
+      SQLConf.withExistingConf(conf) {
+        assert(QueryPlanSerde.usesGeneratedExpressionEvaluation == (mode != "NO_CODEGEN"))
+        withSharedSubexpressions(Seq(outer, outer)) {
+          assert(!QueryPlanSerde.isEagerSharedSubexpression(outer))
+          assert(canSkipEvaluation(Seq(outer)) == !enabled)
+        }
+        withSharedSubexpressions(Seq(outer, outer), eagerSharing = true) {
+          assert(
+            QueryPlanSerde.isEagerSharedSubexpression(outer) ==
+              (enabled && mode != "NO_CODEGEN"))
+        }
+        withSharedSubexpressions(Seq(outer, inner), eagerSharing = true) {
+          assert(!QueryPlanSerde.isEagerSharedSubexpression(outer))
+          assert(
+            QueryPlanSerde.isEagerSharedSubexpression(inner) ==
+              (enabled && mode != "NO_CODEGEN"))
+          assert(canSkipEvaluation(Seq(outer)) == !enabled)
+        }
+      }
+    }
+  }
+
 }

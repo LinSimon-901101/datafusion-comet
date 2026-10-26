@@ -32,14 +32,14 @@ FROM VALUES (0, true, 'a'), (1, true, 'b') AS rows(id, p, s)
 statement
 SET spark.comet.enabled=true
 
--- A NULL string must short-circuit an ANSI length cast that would throw.
-query expect_native(lpad)
+-- A NULL string must short-circuit an ANSI length cast that would throw, on Spark rows.
+query expect_fallback(struct scalar subquer)
 SELECT lpad(concat_ws(CAST(NULL AS STRING), s), CAST(s AS INT), '0'),
        (SELECT max(s) FROM conditional_pad_subq),
        (SELECT min(s) FROM conditional_pad_subq)
 FROM conditional_pad_subq
 
-query expect_native(rpad)
+query expect_fallback(struct scalar subquer)
 SELECT rpad(concat_ws(CAST(NULL AS STRING), s), CAST(s AS INT), '0'),
        (SELECT max(s) FROM conditional_pad_subq),
        (SELECT min(s) FROM conditional_pad_subq)
@@ -172,13 +172,13 @@ INSERT INTO padding_null_short_circuit SELECT /*+ COALESCE(1) */ * FROM VALUES
 statement
 SET spark.comet.enabled=true
 
-query expect_native(lpad)
+query expect_fallback(struct scalar subquer)
 SELECT lpad(s, CAST(len_text AS INT), '0'),
        (SELECT max(s) FROM padding_null_short_circuit),
        (SELECT min(s) FROM padding_null_short_circuit)
 FROM padding_null_short_circuit
 
-query expect_native(rpad)
+query expect_fallback(struct scalar subquer)
 SELECT rpad(s, CAST(len_text AS INT), '0'),
        (SELECT max(s) FROM padding_null_short_circuit),
        (SELECT min(s) FROM padding_null_short_circuit)
