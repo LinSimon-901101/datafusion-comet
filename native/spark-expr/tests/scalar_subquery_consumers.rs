@@ -28,6 +28,49 @@ use datafusion_comet_spark_expr::{GetStructField, ScalarSubqueryConsumer, Subque
 use datafusion_functions::string::octet_length::OctetLengthFunc;
 
 #[test]
+fn scalar_subquery_metric_labels_do_not_repeat_owned_payloads() {
+    use datafusion::physical_expr::expressions::IsNullExpr;
+    use datafusion::physical_expr_common::physical_expr::fmt_sql;
+
+    let payload = "sensitive scalar payload".repeat(4096);
+    let value = ScalarValue::Struct(Arc::new(StructArray::new(
+        vec![Field::new("s", DataType::Utf8, true)].into(),
+        vec![Arc::new(StringArray::from(vec![payload.as_str()]))],
+        None,
+    )));
+    let resolved: Arc<dyn PhysicalExpr> =
+        Arc::new(Subquery::resolved_struct_literal(value.clone()));
+    let field: Arc<dyn PhysicalExpr> = Arc::new(GetStructField::new(Arc::clone(&resolved), 0));
+    let output = ScalarSubqueryConsumer::wrap_projection_literal(
+        Arc::clone(&resolved),
+        Arc::new(Schema::empty()),
+    );
+    let whole = ScalarSubqueryConsumer::wrap(Arc::new(IsNullExpr::new(resolved)));
+    for rows in [0, 1, 4] {
+        let actual = output
+            .evaluate(&batch(rows))
+            .unwrap()
+            .into_array(rows)
+            .unwrap();
+        let expected = value.to_array_of_size(rows).unwrap();
+        assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+    for expression in [field, whole, output] {
+        for label in [
+            expression.to_string(),
+            format!("{expression:?}"),
+            fmt_sql(expression.as_ref()).to_string(),
+        ] {
+            assert!(label.len() < 256, "label retained {} bytes", label.len());
+            assert!(!label.contains("sensitive scalar payload"));
+        }
+    }
+    // Ordinary SQL literal diagnostics retain their existing representation.
+    let ordinary = GetStructField::new(Arc::new(Literal::new(value)), 0);
+    assert!(ordinary.to_string().contains("sensitive scalar payload"));
+}
+
+#[test]
 fn large_scalar_struct_field_is_consumed_before_broadcast() {
     let bytes = 262_144;
     let fields = vec![Field::new("s", DataType::Utf8, true)].into();

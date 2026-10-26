@@ -32,7 +32,7 @@ use datafusion::physical_expr::expressions::{
     BinaryExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NotExpr,
 };
 use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -41,7 +41,7 @@ use std::sync::Arc;
 /// GetStructField retains its batch-sized array contract. Constant consumers run on one row;
 /// pure row-dependent consumers run on bounded slices before their results are concatenated.
 /// Nothing is evaluated during planning, preserving conditional and ANSI NULL short-circuiting.
-#[derive(Debug, Eq)]
+#[derive(Eq)]
 pub struct ScalarSubqueryConsumer {
     inner: Arc<dyn PhysicalExpr>,
     constant: bool,
@@ -56,6 +56,35 @@ const SCALAR_INPUT_BYTES: usize = 1024 * 1024;
 impl ScalarSubqueryConsumer {
     pub fn inner(&self) -> &Arc<dyn PhysicalExpr> {
         &self.inner
+    }
+
+    /// Keep direct struct output metric labels bounded. Apply only at a projection root,
+    /// after field selection and input sizing have inspected the original literal.
+    pub fn wrap_projection_literal(
+        inner: Arc<dyn PhysicalExpr>,
+        schema: SchemaRef,
+    ) -> Arc<dyn PhysicalExpr> {
+        if inner
+            .downcast_ref::<Literal>()
+            .is_some_and(Subquery::is_resolved_struct_literal)
+        {
+            Arc::new(Self {
+                inner,
+                constant: true,
+                max_rows: 1,
+                input_schema: schema,
+            })
+        } else {
+            inner
+        }
+    }
+
+    /// Let a later projection inline a retained whole-struct alias before broadcasting it.
+    pub fn projection_literal(&self) -> Option<Arc<dyn PhysicalExpr>> {
+        self.inner
+            .downcast_ref::<Literal>()
+            .filter(|literal| Subquery::is_resolved_struct_literal(literal))
+            .map(|_| Arc::clone(&self.inner))
     }
 
     /// Inlining retires an input cap. Marked roots regain their consumer guard; unmarked
@@ -455,13 +484,29 @@ impl PartialEq for ScalarSubqueryConsumer {
 
 impl Display for ScalarSubqueryConsumer {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ScalarSubqueryConsumer({})", self.inner)
+        let operation = self
+            .inner
+            .downcast_ref::<ScalarFunctionExpr>()
+            .map_or("expression", ScalarFunctionExpr::name);
+        // Whole-struct consumers also reach DataFusion's retained metric labels. Keep the
+        // operation and evaluation shape, without formatting owned scalar payloads.
+        write!(
+            f,
+            "ScalarSubqueryConsumer [operation: {operation}, type: {:?}, constant: {}, max_rows: {}]",
+            self.inner.data_type(&self.input_schema), self.constant, self.max_rows
+        )
+    }
+}
+
+impl Debug for ScalarSubqueryConsumer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(self, f)
     }
 }
 
 impl PhysicalExpr for ScalarSubqueryConsumer {
     fn fmt_sql(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.inner.fmt_sql(f)
+        Display::fmt(self, f)
     }
 
     fn data_type(&self, input_schema: &Schema) -> Result<DataType> {

@@ -24,12 +24,12 @@ use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_expr::{expressions::Literal, PhysicalExpr};
 use datafusion_comet_common::child_with_parent_nulls;
 use std::{
-    fmt::{Display, Formatter},
+    fmt::{Debug, Display, Formatter},
     hash::Hash,
     sync::Arc,
 };
 
-#[derive(Debug, Eq)]
+#[derive(Eq)]
 pub struct GetStructField {
     child: Arc<dyn PhysicalExpr>,
     ordinal: usize,
@@ -171,11 +171,34 @@ impl PhysicalExpr for GetStructField {
 
 impl Display for GetStructField {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.is_subquery_field() {
+            // DataFusion retains fmt_sql output in expression metric labels. Repeating the
+            // whole merged value here would retain every sibling once per field read.
+            write!(f, "GetStructField [child: ")?;
+            if let Some(parent) = self.child.downcast_ref::<Self>() {
+                Display::fmt(parent, f)?;
+            } else {
+                write!(f, "resolved struct scalar subquery")?;
+            }
+            return write!(f, ", ordinal: {}]", self.ordinal);
+        }
         write!(
             f,
             "GetStructField [child: {:?}, ordinal: {:?}]",
             self.child, self.ordinal
         )
+    }
+}
+
+impl Debug for GetStructField {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.is_subquery_field() {
+            return Display::fmt(self, f);
+        }
+        f.debug_struct("GetStructField")
+            .field("child", &self.child)
+            .field("ordinal", &self.ordinal)
+            .finish()
     }
 }
 

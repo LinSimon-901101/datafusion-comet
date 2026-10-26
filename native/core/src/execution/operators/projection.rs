@@ -95,6 +95,12 @@ impl OperatorBuilder for ProjectionBuilder {
         let (input, exprs) =
             inline_scalar_alias_projection(Arc::clone(&child.native_plan), exprs, batch_size)?;
         let input = bound_projection_input(input, &exprs, batch_size);
+        let exprs = exprs.try_map_exprs(|expr| {
+            Ok(ScalarSubqueryConsumer::wrap_projection_literal(
+                expr,
+                input.schema(),
+            ))
+        })?;
         let projection = Arc::new(ProjectionExec::try_new(exprs.iter().cloned(), input)?);
 
         let spark_plan = if child.plan_id == spark_plan.plan_id {
@@ -130,6 +136,11 @@ fn inline_scalar_alias_projection(
                 || expr.expr.is::<Literal>()
                 || expr
                     .expr
+                    .downcast_ref::<ScalarSubqueryConsumer>()
+                    .and_then(ScalarSubqueryConsumer::projection_literal)
+                    .is_some()
+                || expr
+                    .expr
                     .downcast_ref::<GetStructField>()
                     .is_some_and(|field| field.literal_field().is_some())
         }) {
@@ -152,7 +163,13 @@ fn inline_scalar_alias_projection(
                 })?
                 .data)
         })?;
-        let mapped = inner.projection_expr().try_merge(&unwrapped)?;
+        let producer = inner.projection_expr().clone().try_map_exprs(|expr| {
+            Ok(expr
+                .downcast_ref::<ScalarSubqueryConsumer>()
+                .and_then(ScalarSubqueryConsumer::projection_literal)
+                .unwrap_or(expr))
+        })?;
+        let mapped = producer.try_merge(&unwrapped)?;
         let schema = cap.input.schema();
         if !mapped.iter().all(|expr| {
             ScalarSubqueryConsumer::supports_sliced_evaluation(&expr.expr, &schema, batch_size)
@@ -507,6 +524,14 @@ mod tests {
                         let capped =
                             bound_projection_input(Arc::clone(&input), &producer_exprs, rows);
                         assert!(capped.is::<ProjectionInputBatchExec>());
+                        let producer_exprs = producer_exprs
+                            .try_map_exprs(|expr| {
+                                Ok(ScalarSubqueryConsumer::wrap_projection_literal(
+                                    expr,
+                                    capped.schema(),
+                                ))
+                            })
+                            .unwrap();
                         let producer: Arc<dyn ExecutionPlan> = Arc::new(
                             ProjectionExec::try_new(producer_exprs.iter().cloned(), capped)
                                 .unwrap(),
