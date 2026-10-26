@@ -346,6 +346,26 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
               .toLong + 5)
         case literal: Literal if literal.dataType == BinaryType =>
           Some(literal.value.asInstanceOf[Array[Byte]].length.toLong + 5)
+        case cast: Cast if cast.dataType == StringType =>
+          val digits = cast.child.dataType match {
+            case BooleanType => Some(5L)
+            case decimal: DecimalType =>
+              val precision = decimal.precision.toLong
+              val scale = decimal.scale.toLong
+              val plain =
+                if (scale >= 0) math.max(precision + 2, scale + 3)
+                else precision - scale + 1
+              Some(math.max(plain, precision + 7))
+            case ByteType => Some(4L)
+            case ShortType => Some(6L)
+            case IntegerType => Some(11L)
+            case LongType => Some(20L)
+            // Java-style float formatting uses at most 17 significant digits and a
+            // signed three-digit exponent; leave room for sign, decimal point and E.
+            case FloatType | DoubleType => Some(32L)
+            case _ => None
+          }
+          digits.map(_ + 5)
         case padding: StringLPad => paddingBytes(padding.len)
         case padding: StringRPad => paddingBytes(padding.len)
         case repeat: StringRepeat =>

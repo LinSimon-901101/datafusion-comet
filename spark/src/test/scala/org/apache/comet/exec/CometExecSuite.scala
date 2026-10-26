@@ -3817,6 +3817,16 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar review bounded integer casts remain native") {
+    withScalarReviewTables {
+      checkSparkAnswerAndOperator(
+        sql(
+          "SELECT octet_length(CAST(id AS STRING)), (SELECT max(n) FROM review_src), " +
+            "(SELECT min(n) FROM review_src) FROM review_outer"),
+        Seq(classOf[CometProjectExec]))
+    }
+  }
+
   test("large merged scalar fields are consumed before broadcast") {
     val numRows = 8192
     val bytes = 262144

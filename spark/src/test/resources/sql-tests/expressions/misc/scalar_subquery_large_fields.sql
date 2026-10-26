@@ -49,6 +49,12 @@ SELECT id, octet_length(concat((SELECT max(s) FROM large_field_source), 'x')),
        octet_length((SELECT min(s) FROM large_field_source))
 FROM large_field_outer
 
+-- Primitive formatting supplies a finite concat bound and remains native.
+query expect_native(octet_length,concat)
+SELECT id, octet_length(concat(CAST((SELECT max(id) FROM large_field_source) AS STRING), 'x')),
+       (SELECT min(id) FROM large_field_source)
+FROM large_field_outer
+
 -- The reduced result must still work in mixed and homogeneous conditional branches.
 query expect_native(octet_length)
 SELECT id, IF(id % 2 = 0, octet_length((SELECT max(s) FROM large_field_source)), 0),

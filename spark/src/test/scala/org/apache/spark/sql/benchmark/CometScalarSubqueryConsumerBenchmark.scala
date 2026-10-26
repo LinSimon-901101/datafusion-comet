@@ -41,7 +41,13 @@ object CometScalarSubqueryConsumerBenchmark extends CometBenchmarkBase {
       "ordinary NULL struct -> array -> hash",
       "SELECT sum(CAST(hash(array(IF(p, payload, " +
         "CAST(NULL AS STRUCT<k:BIGINT>)))) AS BIGINT)) FROM consumer_outer",
-      false))
+      false),
+    (
+      "legacy merged subqueries -> integer cast -> length",
+      "SELECT sum(CAST(octet_length(CAST(payload.k + " +
+        "(SELECT max(n) FROM consumer_cast_source) AS STRING)) AS BIGINT)), " +
+        "sum((SELECT min(n) FROM consumer_cast_source)) FROM consumer_outer",
+      true))
 
   private def configs(comet: Boolean): Seq[(String, String)] = Seq(
     CometConf.COMET_ENABLED.key -> comet.toString,

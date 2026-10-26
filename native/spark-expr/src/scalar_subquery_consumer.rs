@@ -329,6 +329,32 @@ fn fixed_width_bytes(dt: &DataType) -> Option<usize> {
     bytes.checked_add(1)
 }
 
+fn bounded_string_cast_bytes(dt: &DataType) -> Option<usize> {
+    match dt {
+        DataType::Boolean => Some(5),
+        DataType::Decimal128(precision, scale) => {
+            let precision = usize::from(*precision);
+            let scale = i16::from(*scale);
+            // ANSI/TRY and Arrow use plain notation; LEGACY can use Java scientific notation.
+            let plain = if scale >= 0 {
+                (precision + 2).max(scale as usize + 3)
+            } else {
+                precision + usize::from(scale.unsigned_abs()) + 1
+            };
+            Some(plain.max(precision + 7))
+        }
+        DataType::Int8 => Some(4),
+        DataType::Int16 => Some(6),
+        DataType::Int32 => Some(11),
+        DataType::Int64 => Some(20),
+        DataType::UInt8 => Some(3),
+        DataType::UInt16 => Some(5),
+        DataType::UInt32 => Some(10),
+        DataType::UInt64 => Some(20),
+        _ => None,
+    }
+}
+
 fn bounded_output_bytes(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option<usize> {
     if let Some(consumer) = expr.downcast_ref::<ScalarSubqueryConsumer>() {
         return bounded_output_bytes(&consumer.inner, schema);
@@ -355,6 +381,32 @@ fn bounded_output_bytes(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option
         return choice.values().try_fold(0usize, |bound, value| {
             Some(bound.max(bounded_output_bytes(value, schema)?))
         });
+    }
+    let cast_child = expr
+        .downcast_ref::<Cast>()
+        .map(|cast| &cast.child)
+        .or_else(|| expr.downcast_ref::<CastExpr>().map(CastExpr::expr));
+    if let Some(child) = cast_child {
+        if matches!(
+            dt,
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        ) {
+            // Five bytes cover a Utf8 offset and validity; use nine for LargeUtf8.
+            let overhead = match dt {
+                DataType::LargeUtf8 => 9,
+                DataType::Utf8View => 17,
+                _ => 5,
+            };
+            let child_type = child.data_type(schema).ok()?;
+            let bytes = bounded_string_cast_bytes(&child_type).or_else(|| {
+                // Comet's Java-style formatter switches to scientific notation outside
+                // [1e-3, 1e7). IEEE digits, sign and exponent fit in 32 ASCII bytes.
+                // Arrow's CastExpr uses a different formatter, so do not infer its bound.
+                (expr.is::<Cast>() && matches!(child_type, DataType::Float32 | DataType::Float64))
+                    .then_some(32)
+            })?;
+            return bytes.checked_add(overhead);
+        }
     }
     if let Some(fun) = expr.downcast_ref::<ScalarFunctionExpr>() {
         let implementation = fun.fun().inner();

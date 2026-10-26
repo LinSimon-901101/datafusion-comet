@@ -296,7 +296,7 @@ mod tests {
     use datafusion::physical_expr::ScalarFunctionExpr;
     use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use datafusion_comet_spark_expr::{
-        GetStructField, IfExpr, RandExpr, Subquery,
+        Cast, EvalMode, GetStructField, IfExpr, RandExpr, SparkCastOptions, Subquery,
     };
     use futures::TryStreamExt;
 
@@ -390,6 +390,82 @@ mod tests {
             .unwrap();
         assert_eq!(empty.len(), 1);
         assert_eq!(empty.iter().map(RecordBatch::num_rows).sum::<usize>(), 0);
+    }
+
+    #[tokio::test]
+    async fn bounded_conditional_output_keeps_one_full_projection_batch() {
+        let rows = 8192;
+        let input = source(rows);
+        let schema = input.schema();
+        let scalar = ScalarValue::Struct(Arc::new(StructArray::new(
+            vec![Field::new("n", DataType::Int64, true)].into(),
+            vec![Arc::new(Int64Array::from(vec![262144]))],
+            None,
+        )));
+        let field: Arc<dyn PhysicalExpr> = Arc::new(GetStructField::new(
+            Arc::new(Subquery::resolved_struct_literal(scalar)),
+            0,
+        ));
+        let formatted = ScalarSubqueryConsumer::wrap_with_schema(
+            Arc::new(Cast::new(
+                ScalarSubqueryConsumer::wrap_with_schema(field, Arc::clone(&schema)),
+                DataType::Utf8,
+                SparkCastOptions::new(EvalMode::Legacy, "UTC"),
+                None,
+                None,
+            )),
+            Arc::clone(&schema),
+        );
+        let condition = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("id", 0)),
+            Operator::Lt,
+            Arc::new(Literal::new(ScalarValue::Int64(Some((rows / 2) as i64)))),
+        ));
+        let conditional = ScalarSubqueryConsumer::wrap_with_schema(
+            Arc::new(IfExpr::new(
+                condition,
+                formatted,
+                Arc::new(Literal::new(ScalarValue::Utf8(Some("x".to_owned())))),
+            )),
+            schema,
+        );
+        let exprs = ProjectionExprs::from(vec![
+            ProjectionExpr::new(conditional, "value".to_owned()),
+            ProjectionExpr::new(Arc::new(Column::new("id", 0)), "id".to_owned()),
+        ]);
+        // Exercise the same input cap and ProjectionExec construction as ProjectionBuilder.
+        let bounded = bound_projection_input(input, &exprs, rows);
+        let projection = ProjectionExec::try_new(exprs.iter().cloned(), bounded).unwrap();
+        let batches = projection
+            .execute(0, SessionContext::new().task_ctx())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(
+            batches.len(),
+            1,
+            "a bounded choice must not become one-row batches"
+        );
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), rows);
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        for row in 0..rows {
+            assert_eq!(ids.value(row), row as i64);
+            assert_eq!(
+                values.value(row),
+                if row < rows / 2 { "262144" } else { "x" }
+            );
+        }
     }
 
     #[tokio::test]
@@ -614,6 +690,12 @@ mod tests {
             )))),
             0,
         ));
+        let small: Arc<dyn PhysicalExpr> =
+            Arc::new(datafusion::physical_expr::expressions::CastExpr::new(
+                Arc::new(Column::new("id", 1)),
+                DataType::Utf8,
+                None,
+            ));
         for (value, inline) in [
             (growing, false),
             (
@@ -653,6 +735,7 @@ mod tests {
                 )))) as Arc<dyn PhysicalExpr>,
                 true,
             ),
+            (small, true),
         ] {
             let outer = ProjectionExprs::from(vec![
                 reducer().as_ref()[0].clone(),

@@ -440,6 +440,39 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     }
   }
 
+  test("retained alias roots check growing constant branches and bounded choices") {
+    val number = Alias(GetStructField(subquery(struct(LongType)), 0), "number")()
+    val id = emptyInput.output.head
+    val producer = ProjectExec(Seq(number, id), emptyInput)
+    val growing = If(
+      IsNotNull(id),
+      StringRepeat(Literal("x"), Literal(512000)),
+      Cast(number.toAttribute, StringType))
+    val reducer = ProjectExec(Seq(Alias(OctetLength(growing), "length")()), producer)
+    CometScalarSubquery.tagPlanInputs(reducer)
+    assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty)
+    assert(CometScalarSubquery.rowPathFallbackReason(reducer).isDefined)
+
+    val predicate = FilterExec(IsNotNull(OctetLength(growing)), producer)
+    CometScalarSubquery.tagPlanInputs(predicate)
+    assert(CometScalarSubquery.rowPathFallbackReason(predicate).isDefined)
+    val topK = org.apache.spark.sql.execution.TakeOrderedAndProjectExec(
+      8192,
+      Seq.empty,
+      Seq(Alias(OctetLength(growing), "length")()),
+      producer)
+    CometScalarSubquery.tagPlanInputs(topK)
+    assert(CometScalarSubquery.rowPathFallbackReason(topK).isDefined)
+
+    val bounded = If(IsNotNull(id), Cast(id, StringType), Cast(number.toAttribute, StringType))
+    val native = ProjectExec(Seq(Alias(bounded, "text")()), producer)
+    val consumer = FilterExec(IsNotNull(native.output.head), native)
+    CometScalarSubquery.tagPlanInputs(consumer)
+    Seq(producer, native, consumer).foreach { plan =>
+      assert(CometScalarSubquery.rowPathFallbackReason(plan).isEmpty, plan)
+    }
+  }
+
   test("retained numeric aliases check window values without evaluating frame data types") {
     import org.apache.spark.sql.catalyst.expressions.{CurrentRow, RowFrame, RowNumber, SpecifiedWindowFrame, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
     import org.apache.spark.sql.catalyst.expressions.aggregate.CollectList
@@ -467,6 +500,58 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
       producer)
     CometScalarSubquery.tagPlanInputs(collect)
     assert(CometScalarSubquery.rowPathFallbackReason(collect).isDefined)
+  }
+
+  test("float field formatting preserves the native struct projection contract") {
+    val dt = StructType(Seq(StructField("text", StringType), StructField("number", DoubleType)))
+    val scalar = Alias(subquery(dt), "scalar")()
+    val producer = ProjectExec(Seq(scalar), emptyInput)
+    val formatted = Cast(GetStructField(scalar.toAttribute, 1), StringType)
+    val consumer = ProjectExec(Seq(Alias(formatted, "formatted")()), producer)
+    CometScalarSubquery.tagPlanInputs(consumer)
+    assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty)
+    assert(CometScalarSubquery.rowPathFallbackReason(consumer).isEmpty)
+  }
+
+  test("wide row paths mark only the affected union branch") {
+    import org.apache.spark.sql.execution.UnionExec
+    val text = Alias(GetStructField(subquery(struct(StringType)), 0), "value")()
+    val wide = ProjectExec(Seq(text), emptyInput)
+    val number = GetStructField(subquery(struct(LongType)), 0)
+    val boundedText = Alias(Cast(number, StringType), "value")()
+    val bounded = ProjectExec(Seq(boundedText), emptyInput)
+    val union = UnionExec(Seq(wide, bounded))
+    val consumer = ProjectExec(Seq(Alias(OctetLength(union.output.head), "length")()), union)
+    CometScalarSubquery.tagPlanInputs(consumer)
+    assert(CometScalarSubquery.rowPathFallbackReason(wide).isDefined)
+    assert(CometScalarSubquery.rowPathFallbackReason(union).isDefined)
+    assert(CometScalarSubquery.rowPathFallbackReason(consumer).isDefined)
+    assert(CometScalarSubquery.rowPathFallbackReason(bounded).isEmpty)
+  }
+
+  test("reused exchanges remap source bounds without depending on attribute identity") {
+    import org.apache.spark.sql.catalyst.plans.physical.SinglePartition
+    import org.apache.spark.sql.execution.exchange.{ReusedExchangeExec, ShuffleExchangeExec}
+    val number = GetStructField(subquery(struct(LongType)), 0)
+    Seq(Cast(number, StringType), GetStructField(subquery(struct(StringType)), 0))
+      .foreach { value =>
+        val alias = Alias(value, "value")()
+        val producer = ProjectExec(Seq(alias), emptyInput)
+        val exchange = ShuffleExchangeExec(SinglePartition, producer)
+        val reused = ReusedExchangeExec(exchange.output.map(_.newInstance()), exchange)
+        val consumer = FilterExec(IsNotNull(reused.output.head), reused)
+        CometScalarSubquery.tagPlanInputs(consumer)
+        val wide = value.dataType == StringType && !value.isInstanceOf[Cast]
+        assert(CometScalarSubquery.rowPathFallbackReason(producer).isDefined == wide, value)
+        assert(CometScalarSubquery.rowPathFallbackReason(consumer).isDefined == wide, value)
+        CometScalarSubquery.withPlanInputs(consumer) {
+          assert(
+            CometScalarSubquery
+              .operatorArgumentFallbackReason(reused.output.head)
+              .isDefined == wide,
+            value)
+        }
+      }
   }
 
 }
