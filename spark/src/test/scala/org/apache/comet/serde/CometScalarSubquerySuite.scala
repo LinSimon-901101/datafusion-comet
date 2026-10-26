@@ -20,11 +20,12 @@
 package org.apache.comet.serde
 
 import org.apache.spark.sql.{CometTestBase, Row}
-import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Ascending, AttributeReference, BloomFilterMightContain, CaseWhen, Cast, Coalesce, ConcatWs, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, GetStructField, GreaterThan, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Murmur3Hash, NamedExpression, Not, OctetLength, Rand, Round, SortOrder, StringLPad, StringRepeat, StringRPad, TruncDate, UnixDate, WeekDay, XxHash64}
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Ascending, AttributeReference, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, ConcatWs, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, FromUTCTimestamp, GetStructField, GreaterThan, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Minute, Murmur3Hash, NamedExpression, Not, OctetLength, PreciseTimestampConversion, Rand, Round, Second, SecondsToTimestamp, SortOrder, StringLPad, StringRepeat, StringRPad, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, WeekDay, XxHash64}
 import org.apache.spark.sql.comet.{CometScalarSubquery => NativeScalarSubquery}
 import org.apache.spark.sql.execution.{FilterExec, ProjectExec, ReusedSubqueryExec, ScalarSubquery, SubqueryExec}
 import org.apache.spark.sql.types._
 
+import org.apache.comet.CometConf
 import org.apache.comet.CometSparkSessionExtensions.{isSpark40Plus, isSpark41Plus}
 import org.apache.comet.shims.CometTypeShim
 
@@ -635,6 +636,207 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
       CometScalarSubquery
         .consumerFallbackReason(Hour(timestamp, Some("America/Los_Angeles")))
         .exists(_.contains("non-fixed timezones")))
+  }
+
+  private def clocks(child: Expression, zone: String): Seq[Expression] =
+    Seq(Hour(child, Some(zone)), Minute(child, Some(zone)), Second(child, Some(zone)))
+
+  private def nativeClockInput(
+      expr: Expression,
+      proto: ExprOuterClass.Expr): ExprOuterClass.Expr =
+    expr match {
+      case _: Hour =>
+        assert(proto.hasHour)
+        proto.getHour.getChild
+      case _: Minute =>
+        assert(proto.hasMinute)
+        proto.getMinute.getChild
+      case _: Second =>
+        assert(proto.hasSecond)
+        proto.getSecond.getChild
+      case other => fail(s"Expected a clock expression, got $other")
+    }
+
+  test("clock offsets with seconds dispatch or retain a clear Spark fallback") {
+    val timestamp = AttributeReference("ts", TimestampType)()
+    val zone = "+05:45:30"
+    for (enabled <- Seq(false, true)) {
+      withSQLConf(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key -> enabled.toString) {
+        clocks(timestamp, zone).foreach { clock =>
+          val (proto, reasons) =
+            QueryPlanSerde.exprToProtoWithFallbackReasons(Alias(clock, "clock")(), Seq(timestamp))
+          if (enabled) {
+            assert(proto.exists(_.hasJvmScalarUdf), s"$clock: $proto $reasons")
+            assert(reasons.isEmpty, reasons)
+          } else {
+            assert(proto.isEmpty, clock)
+            assert(reasons.contains(CometTimeZone.unsupportedReason(Some(zone))), reasons)
+            assert(
+              reasons.exists(_.contains(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key)),
+              reasons)
+          }
+        }
+      }
+    }
+  }
+
+  test("ordinary computed regional clocks dispatch before native serialization") {
+    val id = AttributeReference("id", IntegerType)()
+    val timestamp = AttributeReference("ts", TimestampType)()
+    val scalar = Literal.create(9089364630896000000L, TimestampType)
+    val seconds = AttributeReference("seconds", LongType)()
+    val date = AttributeReference("date", DateType)()
+    val scalarNull = Cast(date, LongType, Some("UTC"), EvalMode.LEGACY)
+    val predicate = GreaterThan(id, Literal(0))
+    val conditional = If(predicate, scalar, timestamp)
+    val conditionalSeconds = If(predicate, Literal(1800L), seconds)
+    for (enabled <- Seq(false, true)) {
+      withSQLConf(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key -> enabled.toString) {
+        val children = Seq(
+          scalar,
+          Literal.create(null, TimestampType),
+          conditional,
+          CaseWhen(Seq(predicate -> scalar), Some(timestamp)),
+          Coalesce(Seq(timestamp, scalar)),
+          Cast(conditional, TimestampType, Some("UTC")),
+          Cast(scalarNull, TimestampType, Some("UTC")),
+          SecondsToTimestamp(conditionalSeconds),
+          PreciseTimestampConversion(conditionalSeconds, LongType, TimestampType),
+          TruncTimestamp(Literal("HOUR"), conditional, Some("America/Los_Angeles")),
+          FromUTCTimestamp(conditional, Literal("UTC")),
+          ToUTCTimestamp(conditional, Literal("UTC")))
+        children.flatMap(clocks(_, "America/Los_Angeles")).foreach { clock =>
+          // There is no subquery: the general serde gate must reject every scalar-capable shape.
+          assert(CometScalarSubquery.consumerFallbackReason(clock).isEmpty)
+          val (proto, reasons) = QueryPlanSerde
+            .exprToProtoWithFallbackReasons(
+              Alias(clock, "clock")(),
+              Seq(id, timestamp, seconds, date))
+          if (enabled) {
+            assert(proto.exists(_.hasJvmScalarUdf), s"$clock: $proto")
+            assert(reasons.isEmpty, reasons)
+          } else {
+            assert(proto.isEmpty, clock)
+            assert(reasons.exists(_.contains(CometTimeZone.clockInputUnsupportedReason)), reasons)
+            assert(
+              reasons.exists(_.contains(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key)),
+              reasons)
+          }
+        }
+      }
+    }
+  }
+
+  test("clock serialization retains column arrays and full-range fixed-offset and NTZ inputs") {
+    val id = AttributeReference("id", IntegerType)()
+    for {
+      enabled <- Seq(false, true)
+      dt <- Seq(TimestampType, TimestampNTZType)
+      zone <- Seq("UTC", "+01:00", "America/Los_Angeles")
+    } {
+      withSQLConf(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key -> enabled.toString) {
+        val timestamp = AttributeReference("ts", dt)()
+        val scalar = Literal.create(Long.MaxValue, dt)
+        val computed = Seq(
+          scalar,
+          Literal.create(Long.MinValue, dt),
+          Literal.create(null, dt),
+          If(GreaterThan(id, Literal(0)), scalar, timestamp))
+        val children =
+          if (dt == TimestampNTZType || zone != "America/Los_Angeles") timestamp +: computed
+          else Seq(timestamp)
+        children.foreach { child =>
+          clocks(child, zone).foreach { clock =>
+            val (proto, reasons) = QueryPlanSerde.exprToProtoWithFallbackReasons(
+              Alias(clock, "clock")(),
+              Seq(id, timestamp))
+            assert(proto.isDefined, s"$clock: $reasons")
+            assert(reasons.isEmpty, reasons)
+            val input = nativeClockInput(clock, proto.get)
+            if (child eq timestamp) assert(input.hasBound, input)
+          }
+        }
+        // Native input binding is emitted by AttributeReference's serde. A raw BoundReference
+        // has no standalone serde, but must remain accepted by the clock support-level gate.
+        val bound = BoundReference(0, dt, nullable = true)
+        assert(CometHour.getSupportLevel(Hour(bound, Some(zone))) == Compatible())
+        assert(CometMinute.getSupportLevel(Minute(bound, Some(zone))) == Compatible())
+        assert(CometSecond.getSupportLevel(Second(bound, Some(zone))) == Compatible())
+      }
+    }
+  }
+
+  test("regional clocks retain array shapes through timestamp producers") {
+    for {
+      enabled <- Seq(false, true)
+      allowIncompatible <- Seq(false, true)
+      zone <- Seq("America/Los_Angeles", "Asia/Kolkata")
+    } {
+      val optIns = Seq("TruncTimestamp", "FromUTCTimestamp", "ToUTCTimestamp")
+        .map { name =>
+          s"spark.comet.expression.$name.allowIncompatible" -> allowIncompatible.toString
+        }
+      val confs = Seq(
+        CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key -> enabled.toString,
+        "spark.sql.ansi.enabled" -> "false") ++ optIns
+      withSQLConf(confs: _*) {
+        val timestamp = AttributeReference("ts", TimestampType)()
+        val inputs = Seq(
+          StringType,
+          DateType,
+          TimestampNTZType,
+          IntegerType,
+          LongType,
+          FloatType,
+          DoubleType,
+          DecimalType(20, 6),
+          BooleanType).map(dt => AttributeReference(s"input_${dt.typeName}", dt)())
+        val nativeSeconds = inputs.filter(a =>
+          Seq(IntegerType, LongType, FloatType, DoubleType).contains(a.dataType))
+        val casts = inputs.map(Cast(_, TimestampType, Some(zone)))
+        val micros = inputs.find(_.dataType == LongType).get
+        val precise = PreciseTimestampConversion(micros, LongType, TimestampType)
+        val decimal = inputs.find(_.dataType.isInstanceOf[DecimalType]).get
+        val arrayProducers =
+          (nativeSeconds.map(SecondsToTimestamp(_)) ++ casts ++ Seq(
+            precise,
+            Cast(SecondsToTimestamp(micros), TimestampType, Some(zone))))
+            .map(_ -> false)
+        val text = inputs.find(_.dataType == StringType).get
+        val scalar = Literal.create(0L, TimestampType)
+        val optInProducers = Seq(
+          TruncTimestamp(Literal("HOUR"), timestamp, Some(zone)),
+          TruncTimestamp(Literal.create(null, StringType), timestamp, Some(zone)),
+          TruncTimestamp(text, scalar, Some(zone)),
+          FromUTCTimestamp(timestamp, Literal("Asia/Tokyo")),
+          FromUTCTimestamp(scalar, text),
+          ToUTCTimestamp(timestamp, Literal("Asia/Tokyo")),
+          ToUTCTimestamp(scalar, text)).map(_ -> !allowIncompatible)
+        val producers = arrayProducers ++ optInProducers ++
+          Seq(SecondsToTimestamp(decimal) -> true)
+        producers.foreach { case (producer, dispatchedChild) =>
+          clocks(producer, zone).foreach { clock =>
+            val (proto, reasons) = QueryPlanSerde.exprToProtoWithFallbackReasons(
+              Alias(clock, "clock")(),
+              timestamp +: inputs)
+            if (dispatchedChild && !enabled) {
+              assert(proto.isEmpty, clock)
+              assert(
+                reasons.exists(_.contains(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key)),
+                reasons)
+              assert(
+                !reasons.exists(_.contains(CometTimeZone.clockInputUnsupportedReason)),
+                reasons)
+            } else {
+              assert(proto.isDefined, s"$clock: $reasons")
+              assert(reasons.isEmpty, reasons)
+              val input = nativeClockInput(clock, proto.get)
+              assert(input.hasJvmScalarUdf == dispatchedChild, s"$clock: $input")
+            }
+          }
+        }
+      }
+    }
   }
 
   test("wide scalar aliases retain a Spark row path through consumers") {

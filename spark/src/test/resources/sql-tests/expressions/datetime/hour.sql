@@ -30,10 +30,6 @@ INSERT INTO test_hour VALUES (timestamp('2024-01-15 00:00:00')), (timestamp('202
 query
 SELECT hour(ts) FROM test_hour
 
--- literal arguments
-query expect_native(hour)
-SELECT hour(timestamp('2024-01-15 00:00:00')), hour(timestamp('2024-01-15 12:30:45')), hour(timestamp('2024-01-15 23:59:59'))
-
 -- TimestampNTZ: the native impl is Incompatible for TimestampNTZType (#3180), so this is routed
 -- through the codegen dispatcher and stays native while matching Spark.
 statement

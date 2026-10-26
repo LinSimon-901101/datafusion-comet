@@ -4523,6 +4523,19 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar review regional clock conditionals use the requested instant") {
+    withScalarReviewTables {
+      withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "America/Los_Angeles") {
+        val instant = "IF(id > 0, timestamp_micros(9089364630896000000L), " +
+          "timestamp_micros(CAST(id AS BIGINT)))"
+        Seq("hour", "minute", "second").foreach { function =>
+          checkSparkAnswer(s"SELECT $function($instant) FROM review_items")
+        }
+        checkAnswer(sql(s"SELECT hour($instant) FROM review_items"), Seq(Row(5), Row(5)))
+      }
+    }
+  }
+
   test("scalar review direct wide fields stay bounded at aggregate and shuffle boundaries") {
     withScalarReviewTables {
       checkSparkAnswer(

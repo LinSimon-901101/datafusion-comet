@@ -166,10 +166,13 @@ object CometQuarter extends CometExpressionSerde[Quarter] with CometExprGetDateF
   }
 }
 
-object CometHour extends CometExpressionSerde[Hour] {
+object CometHour extends CometExpressionSerde[Hour] with CodegenDispatchFallback {
+
+  override def getUnsupportedReasons(): Seq[String] =
+    Seq(CometTimeZone.clockInputUnsupportedReason)
 
   override def getSupportLevel(expr: Hour): SupportLevel =
-    CometTimeZone.supportLevel(expr.timeZoneId)
+    CometTimeZone.clockSupportLevel(expr.child, expr.timeZoneId)
 
   override def convert(
       expr: Hour,
@@ -194,10 +197,13 @@ object CometHour extends CometExpressionSerde[Hour] {
   }
 }
 
-object CometMinute extends CometExpressionSerde[Minute] {
+object CometMinute extends CometExpressionSerde[Minute] with CodegenDispatchFallback {
+
+  override def getUnsupportedReasons(): Seq[String] =
+    Seq(CometTimeZone.clockInputUnsupportedReason)
 
   override def getSupportLevel(expr: Minute): SupportLevel =
-    CometTimeZone.supportLevel(expr.timeZoneId)
+    CometTimeZone.clockSupportLevel(expr.child, expr.timeZoneId)
 
   override def convert(
       expr: Minute,
@@ -222,10 +228,13 @@ object CometMinute extends CometExpressionSerde[Minute] {
   }
 }
 
-object CometSecond extends CometExpressionSerde[Second] {
+object CometSecond extends CometExpressionSerde[Second] with CodegenDispatchFallback {
+
+  override def getUnsupportedReasons(): Seq[String] =
+    Seq(CometTimeZone.clockInputUnsupportedReason)
 
   override def getSupportLevel(expr: Second): SupportLevel =
-    CometTimeZone.supportLevel(expr.timeZoneId)
+    CometTimeZone.clockSupportLevel(expr.child, expr.timeZoneId)
 
   override def convert(
       expr: Second,

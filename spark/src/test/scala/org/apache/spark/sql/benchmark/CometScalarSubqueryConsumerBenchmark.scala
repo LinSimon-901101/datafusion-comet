@@ -60,7 +60,14 @@ object CometScalarSubqueryConsumerBenchmark extends CometBenchmarkBase {
       "SELECT k FROM consumer_outer ORDER BY " +
         "k + (SELECT max(n) FROM consumer_cast_source), " +
         "k + (SELECT min(n) FROM consumer_cast_source) LIMIT 7",
-      true))
+      true),
+    (
+      "runtime scalar clock and timestamp epoch",
+      "SELECT sum(CAST(hour(IF(coalesce(k, 0) >= 0, " +
+        "TIMESTAMP '2024-07-01 12:34:56', timestamp_micros(k))) AS BIGINT)), " +
+        "sum(unix_timestamp(IF(coalesce(k, 0) >= 0, " +
+        "TIMESTAMP '2024-07-01 12:34:56', timestamp_micros(k)))) FROM consumer_outer",
+      false))
 
   private def configs(comet: Boolean): Seq[(String, String)] = Seq(
     CometConf.COMET_ENABLED.key -> comet.toString,
