@@ -20,7 +20,7 @@
 package org.apache.comet.serde
 
 import org.apache.spark.sql.{CometTestBase, Row}
-import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Cast, Coalesce, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, Expression, GetStructField, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, NamedExpression, Not, OctetLength, Rand, TruncDate, UnixDate, WeekDay}
+import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Cast, Coalesce, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, Expression, GetStructField, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, NamedExpression, Not, OctetLength, Rand, StringRepeat, TruncDate, UnixDate, WeekDay}
 import org.apache.spark.sql.comet.{CometScalarSubquery => NativeScalarSubquery}
 import org.apache.spark.sql.execution.{FilterExec, ProjectExec, ReusedSubqueryExec, ScalarSubquery, SubqueryExec}
 import org.apache.spark.sql.types._
@@ -390,6 +390,26 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty)
   }
 
+  test("opaque siblings protect both consumers and producers of retained wide values") {
+    val text = Alias(GetStructField(subquery(struct(StringType)), 0), "text")()
+    val binary = AttributeReference("binary", BinaryType)()
+    Seq[Expression](Rand(Literal(42L)), OctetLength(binary)).foreach { sibling =>
+      val producer = ProjectExec(Seq(text), emptyInput)
+      val consumer = ProjectExec(
+        Seq(Alias(OctetLength(text.toAttribute), "length")(), Alias(sibling, "sibling")()),
+        producer)
+      CometScalarSubquery.tagPlanInputs(consumer)
+      assert(CometScalarSubquery.rowPathFallbackReason(producer).isDefined, sibling)
+      assert(CometScalarSubquery.rowPathFallbackReason(consumer).isDefined, sibling)
+      val inner = ProjectExec(Seq(text, Alias(sibling, "sibling")()), emptyInput)
+      val outer =
+        ProjectExec(Seq(Alias(OctetLength(text.toAttribute), "length")(), inner.output(1)), inner)
+      CometScalarSubquery.tagPlanInputs(outer)
+      assert(CometScalarSubquery.rowPathFallbackReason(inner).isDefined, sibling)
+      assert(CometScalarSubquery.rowPathFallbackReason(outer).isDefined, sibling)
+    }
+  }
+
   test("pure projections preserve bounded native producer batches") {
     val scalar = Alias(subquery(struct(StringType)), "scalar")()
     val producer = ProjectExec(Seq(scalar), emptyInput)
@@ -399,6 +419,24 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     CometScalarSubquery.tagPlanInputs(reducer)
     Seq(producer, fields, reducer).foreach { plan =>
       assert(CometScalarSubquery.rowPathFallbackReason(plan).isEmpty, plan)
+    }
+  }
+
+  test("a retained scalar alias cannot grow an unbounded projection intermediate") {
+    Seq[DataType](StringType, LongType).foreach { dt =>
+      val scalar = Alias(GetStructField(subquery(struct(dt)), 0), "scalar")()
+      val producer = ProjectExec(Seq(scalar), emptyInput)
+      val repeated = if (dt == StringType) {
+        StringRepeat(scalar.toAttribute, Literal(2048))
+      } else {
+        StringRepeat(Literal("x"), Cast(scalar.toAttribute, IntegerType))
+      }
+      val reducer = ProjectExec(Seq(Alias(OctetLength(repeated), "length")()), producer)
+      CometScalarSubquery.tagPlanInputs(reducer)
+      assert(
+        CometScalarSubquery.rowPathFallbackReason(producer).isDefined == (dt == StringType),
+        dt)
+      assert(CometScalarSubquery.rowPathFallbackReason(reducer).isDefined, dt)
     }
   }
 

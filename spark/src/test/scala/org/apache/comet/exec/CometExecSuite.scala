@@ -3563,7 +3563,8 @@ class CometExecSuite extends CometTestBase {
               case _ => false
             })),
             df.queryExecution.optimizedPlan.toString)
-          checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+          checkSparkAnswer(df)
+          assert(stripAQEPlan(df.queryExecution.executedPlan).exists(_.isInstanceOf[ProjectExec]))
         }
       }
     }
@@ -3611,6 +3612,28 @@ class CometExecSuite extends CometTestBase {
             }
           body
         }
+      }
+    }
+  }
+
+  test("scalar review padding wrappers track subplan merging across versions") {
+    withScalarReviewTables {
+      val df = sql(
+        "SELECT lpad(concat(IF(id > 0, (SELECT max(txt) FROM review_items), txt), ''), 8, '0'), " +
+          "rpad(IF(id > 0, (SELECT min(txt) FROM review_items WHERE id < 0), txt), 8, '0') FROM review_items")
+      if (isSpark42Plus) {
+        assert(
+          df.queryExecution.optimizedPlan.exists(_.expressions.exists(_.exists {
+            case GetStructField(_: LogicalScalarSubquery, _, _) => true
+            case _ => false
+          })),
+          df.queryExecution.optimizedPlan.toString)
+        checkSparkAnswer(df)
+        val reason =
+          new ExtendedExplainInfo().generateExtendedInfo(df.queryExecution.executedPlan)
+        assert(reason.contains("Unbounded struct scalar subquery constructors"), reason)
+      } else {
+        checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
       }
     }
   }
@@ -3686,6 +3709,18 @@ class CometExecSuite extends CometTestBase {
           case _ => false
         })
       }
+    }
+  }
+
+  test("scalar review integer subqueries cannot hide wide stateful or dispatched intermediates") {
+    withScalarReviewTables {
+      Seq("monotonically_increasing_id() >= 0", "upper(CAST(id AS STRING)) <> 'missing'")
+        .foreach { condition =>
+          checkSparkAnswer(
+            "SELECT sum(y), min(m) FROM (SELECT octet_length(IF(" +
+              s"$condition, repeat('x', 2 * (SELECT max(n) FROM review_src)), 'z')) y, " +
+              "(SELECT min(n) FROM review_src) m FROM review_outer) q")
+        }
     }
   }
 
@@ -3991,7 +4026,8 @@ class CometExecSuite extends CometTestBase {
                   assert(
                     structs.nonEmpty,
                     s"Expected a whole-struct subquery: ${df.queryExecution}")
-                  val (_, plan) = checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+                  checkSparkAnswer(df)
+                  val plan = df.queryExecution.executedPlan
                   val result = df.collect()
                   assert(result.length == numRows)
                   result.foreach { row =>
@@ -4000,7 +4036,13 @@ class CometExecSuite extends CometTestBase {
                   val projections = stripAQEPlan(plan).collect {
                     case p: CometProjectExec if p.output.exists(_.name == "n") => p
                   }
-                  assert(projections.nonEmpty, s"Expected native whole-struct consumer: $plan")
+                  if (consumer == s"(IF(id > 0, $maxStruct, $minStruct)).d") {
+                    assert(
+                      projections.nonEmpty,
+                      s"Expected native whole-struct field read: $plan")
+                  } else {
+                    assert(stripAQEPlan(plan).exists(_.isInstanceOf[ProjectExec]), plan.toString)
+                  }
                   projections.foreach { projection =>
                     val sizes = projection
                       .executeColumnar()

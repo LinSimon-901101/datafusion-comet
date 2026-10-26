@@ -22,7 +22,8 @@ package org.apache.comet.serde
 import scala.jdk.CollectionConverters._
 import scala.util.DynamicVariable
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, BoundReference, CaseWhen, Cast, Coalesce, Concat, ConcatWs, CreateArray, CreateMap, CreateNamedStruct, DateFromUnixDate, DayOfWeek, ElementAt, EqualNullSafe, EqualTo, Expression, ExprId, GetArrayItem, GetArrayStructFields, GetMapValue, GetStructField, GreaterThan, GreaterThanOrEqual, Greatest, Hour, If, In, InSet, IsNotNull, IsNull, KnownNotNull, KnownNullable, Least, LessThan, LessThanOrEqual, Literal, Minute, NamedExpression, PreciseTimestampConversion, Second, SortOrder, StringLPad, StringRepeat, StringRPad, ToUnixTimestamp, TryEval, UnixDate, UnixTimestamp, WeekDay}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, BoundReference, CaseWhen, Cast, Coalesce, Concat, ConcatWs, CreateArray, CreateMap, CreateNamedStruct, DateFormatClass, DateFromUnixDate, DayOfWeek, ElementAt, EqualNullSafe, EqualTo, Expression, ExprId, GetArrayItem, GetArrayStructFields, GetMapValue, GetStructField, GreaterThan, GreaterThanOrEqual, Greatest, Hour, If, In, InSet, IsNotNull, IsNull, KnownNotNull, KnownNullable, LambdaFunction, Least, LessThan, LessThanOrEqual, Literal, Minute, NamedExpression, PreciseTimestampConversion, RegExpExtract, RegExpExtractAll, ScalaUDF, Second, SortOrder, SpecifiedWindowFrame, StringLPad, StringRepeat, StringRPad, ToUnixTimestamp, TryEval, UnixDate, UnixTimestamp, WeekDay, WindowSpecDefinition}
+import org.apache.spark.sql.catalyst.expressions.objects.StaticInvoke
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.catalyst.trees.TreePattern.PLAN_EXPRESSION
 import org.apache.spark.sql.comet.CometExec
@@ -222,10 +223,45 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
           p.output.exists(a => ids.contains(a.exprId) && !fitsConsumerBatch(a))
         }
       }
+      // Later expressions have columns rather than the native literal's provenance. An
+      // inherited input cap protects reads, not new unbounded intermediates such as repeat.
+      val materializedInputs = childSources.flatten.toSet
+      def constructsUnboundedValue(expression: Expression): Boolean = {
+        val selectsExistingValue = expression match {
+          case _: Attribute | _: GetStructField | _: Alias | _: KnownNotNull | _: KnownNullable |
+              _: TryEval | _: SortOrder | _: If | _: CaseWhen | _: Coalesce | _: Least |
+              _: Greatest | _: WindowSpecDefinition | _: SpecifiedWindowFrame =>
+            true
+          case _ => false
+        }
+        (!selectsExistingValue && !fitsConsumerBatch(expression)) ||
+        expression.children.exists(constructsUnboundedValue)
+      }
+      // A generator's ArrayType describes rows, not an allocated value. Its children are
+      // the actual expression arguments, matching the GenerateExec serializer's boundary.
+      val valueRoots = original match {
+        case generate: GenerateExec => generate.generator.children
+        case other => other.expressions
+      }
+      val expandsMaterializedInput = currentStructSubqueryInputBounds.withValue(bounds) {
+        valueRoots.exists { expression =>
+          // Retained input columns no longer carry the native literal's provenance. Gate
+          // the root once, then inspect all branches, including independent constant work.
+          expression.references.exists(a => materializedInputs.contains(a.exprId)) &&
+          constructsUnboundedValue(expression)
+        }
+      }
       val wideChildren = children.filter(wideOutput)
-      if (wideChildren.nonEmpty &&
+      val opaqueWideProjection = original.isInstanceOf[ProjectExec] &&
+        (wideOutput(plan) || wideChildren.nonEmpty) && withPlanInputs(plan) {
+          QueryPlanSerde.withSharedSubexpressions(valueRoots, eagerSharing = true) {
+            valueRoots.exists(e =>
+              requiresRowProjection(e) || consumerFallbackReason(e).isDefined)
+          }
+        }
+      if (expandsMaterializedInput || opaqueWideProjection || (wideChildren.nonEmpty &&
           (!original.isInstanceOf[ProjectExec] ||
-            wideChildren.exists(_.getTagValue(structSubqueryRowPath).contains(true)))) {
+            wideChildren.exists(_.getTagValue(structSubqueryRowPath).contains(true))))) {
         plan.setTagValue(structSubqueryRowPath, true)
         // Avoid copying wide aliases into Arrow immediately before their Spark row consumer.
         def keepWideInputsOnRows(p: SparkPlan): Unit = {
@@ -371,13 +407,6 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
     case _ => false
   }
 
-  private def hasVariableWidthStructSubquery(expr: Expression): Boolean =
-    expr.containsPattern(PLAN_EXPRESSION) && expr.exists {
-      case subquery: ExecSubqueryExpression =>
-        subquery.dataType.isInstanceOf[StructType] && containsVariableWidth(subquery.dataType)
-      case _ => false
-    }
-
   private def borrowedArray(expr: Expression): Boolean = expr match {
     case _: Attribute | _: BoundReference => true
     case _: Alias | _: KnownNotNull | _: KnownNullable | _: GetStructField | _: SortOrder =>
@@ -418,7 +447,7 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
           case _ => false
         }
     }
-    if (hasVariableWidthStructSubquery(expr) && containsDispatch(proto)) {
+    if (needsBoundedEvaluation(expr) && containsDispatch(proto)) {
       Some("JVM-dispatched consumers of variable-width struct scalar subqueries require Spark")
     } else {
       None
@@ -520,6 +549,28 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
     }
   }
 
+  // Opaque/stateful siblings prevent native projection fusion. Keep their wide producer on rows
+  // too; conservatively include native-opt-in handlers without duplicating dispatch decisions.
+  private def requiresRowProjection(expr: Expression): Boolean =
+    !expr.deterministic || expr.exists {
+      case _: ScalaUDF | _: LambdaFunction | _: StaticInvoke | _: RegExpExtract |
+          _: RegExpExtractAll | _: DateFormatClass =>
+        true
+      case node =>
+        QueryPlanSerde.exprSerdeMap.get(node.getClass).forall { handler =>
+          val serde = handler.asInstanceOf[CometExpressionSerde[Expression]]
+          !CometConf.isExprEnabled(serde.getExprConfigName(node)) || (handler match {
+            case _: CometCodegenDispatch[_] => true
+            case _: NativeOptInAvailable if !handler.isInstanceOf[CodegenDispatchFallback] => true
+            case _ =>
+              serde.getSupportLevel(node) match {
+                case Compatible(_, None) => false
+                case _ => true
+              }
+          })
+        }
+    }
+
   /**
    * Admit only reviewed consumers of dates and timestamps on newly supported struct-subquery
    * paths. Unknown consumers stay on Spark by default, including expressions whose result is not
@@ -529,7 +580,10 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
    * whole-struct casts. A physical subquery may be reused, but it is still an
    * [[ExecSubqueryExpression]]; its result must never be evaluated while planning this check.
    */
-  private[serde] def consumerFallbackReason(expr: Expression): Option[String] = {
+  private[serde] def consumerFallbackReason(expr: Expression): Option[String] =
+    specificConsumerFallbackReason(expr)
+
+  private def specificConsumerFallbackReason(expr: Expression): Option[String] = {
     // Skip paths without struct subqueries. A newly admitted calendar consumer can be a
     // sibling or ancestor of a struct-producing operator without using its result directly.
     // Aliases still carry value provenance through the owning plan's ExprIds.
@@ -539,10 +593,21 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
       (!expr.containsPattern(PLAN_EXPRESSION) || !ExecSubqueryExpression.hasSubquery(expr))) {
       return None
     }
+    val selectsValue = expr match {
+      case _: Attribute | _: BoundReference | _: Literal | _: ExecSubqueryExpression |
+          _: GetStructField | _: Alias | _: KnownNotNull | _: KnownNullable | _: If |
+          _: CaseWhen | _: Coalesce | _: Greatest | _: Least | _: CreateNamedStruct |
+          _: SortOrder =>
+        true
+      case _ => false
+    }
+    val unboundedConstructor = hasStructSubqueryContext(expr) && !selectsValue &&
+      fixedTypeBytes(expr.dataType).isEmpty &&
+      !boundedResultBytes(expr).exists(_ <= Int.MaxValue)
 
     // Native consumers may change batch boundaries to avoid repeating a large scalar field.
     // Stateful consumers must retain Spark's evaluation order and their pre-existing fallback.
-    if (!expr.deterministic && hasVariableWidthStructSubquery(expr)) {
+    if (!expr.deterministic && needsBoundedEvaluation(expr)) {
       return Some(
         "Nondeterministic consumers of variable-width struct scalar subqueries require Spark")
     }
@@ -606,11 +671,18 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
     }
 
     // An allowed wrapper must not hide an unreviewed consumer in its children.
-    reason.orElse {
-      expr.children.iterator.map(consumerFallbackReason).collectFirst { case Some(childReason) =>
-        childReason
+    reason
+      .orElse {
+        if (unboundedConstructor) {
+          Some("Unbounded struct scalar subquery constructors require Spark row evaluation")
+        } else None
       }
-    }
+      .orElse {
+        expr.children.iterator.map(specificConsumerFallbackReason).collectFirst {
+          case Some(childReason) =>
+            childReason
+        }
+      }
   }
 
   override def getUnsupportedReasons(): Seq[String] = Seq(

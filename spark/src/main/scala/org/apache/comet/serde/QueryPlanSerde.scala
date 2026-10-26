@@ -1378,7 +1378,10 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
    */
   private val sharedSubexpressions = new DynamicVariable[Option[SharedSubexpressions]](None)
 
-  private final class SharedSubexpressions(expressions: Seq[Expression], alwaysShared: Boolean) {
+  private final class SharedSubexpressions(
+      expressions: Seq[Expression],
+      alwaysShared: Boolean,
+      val eagerSharing: Boolean) {
     // Find shared nodes in Spark's original trees, then compare them after decimal promotion.
     lazy val common: Seq[Expression] =
       if (alwaysShared || SQLConf.get.subexpressionEliminationEnabled) {
@@ -1397,10 +1400,16 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
    * for an aggregation, whose shared subexpressions Spark's generated code evaluates for every
    * row whatever `spark.sql.subexpressionElimination.enabled` says. An aggregation that Spark
    * runs without generated code shares none when it is off, and stays eager in Comet.
+   * `eagerSharing` separately authorizes the new scalar-consumer fallback to accept eager
+   * evaluation of an entire shared argument. Set it only for expressions that Spark evaluates
+   * together with eager CSE; whole-stage filters do not, even when CSE is enabled.
    */
-  def withSharedSubexpressions[T](expressions: Seq[Expression], alwaysShared: Boolean = false)(
-      f: => T): T =
-    sharedSubexpressions.withValue(Some(new SharedSubexpressions(expressions, alwaysShared)))(f)
+  def withSharedSubexpressions[T](
+      expressions: Seq[Expression],
+      alwaysShared: Boolean = false,
+      eagerSharing: Boolean = false)(f: => T): T =
+    sharedSubexpressions.withValue(
+      Some(new SharedSubexpressions(expressions, alwaysShared, eagerSharing)))(f)
 
   /**
    * Whether native execution may skip the arguments of `expr` after the first on the rows where

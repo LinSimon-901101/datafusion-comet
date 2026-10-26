@@ -42,8 +42,9 @@ SELECT id, octet_length((SELECT max(s) FROM large_field_source)),
        octet_length((SELECT min(s) FROM large_field_source))
 FROM large_field_outer
 
--- Nested consumers must reduce the value before broadcasting any intermediate string.
-query expect_native(octet_length,concat)
+-- A single concatenated value can itself exceed the Arrow offset limit. Unknown
+-- runtime string widths retain Spark rows even when this fixture happens to be small.
+query expect_fallback(Unbounded struct scalar subquery constructors)
 SELECT id, octet_length(concat((SELECT max(s) FROM large_field_source), 'x')),
        octet_length((SELECT min(s) FROM large_field_source))
 FROM large_field_outer
@@ -73,7 +74,7 @@ SELECT id, octet_length(IF(rand(42) >= 0, (SELECT max(s) FROM large_field_source
 FROM large_field_outer
 
 -- A dispatched predicate has no subquery itself, but its surrounding consumer does.
-query expect_fallback(JVM-dispatched consumers of variable-width struct scalar subqueries require Spark)
+query expect_fallback(Unbounded struct scalar subquery constructors)
 SELECT id, octet_length(IF(upper(CAST(id AS STRING)) <> 'missing',
                           (SELECT max(s) FROM large_field_source), '')),
        octet_length((SELECT min(s) FROM large_field_source))
