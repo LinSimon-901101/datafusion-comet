@@ -21,6 +21,7 @@ package org.apache.comet.serde
 
 import org.apache.spark.sql.{CometTestBase, Row}
 import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Ascending, AttributeReference, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, ConcatWs, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, FromUTCTimestamp, GetStructField, GreaterThan, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Minute, Murmur3Hash, NamedExpression, Not, OctetLength, PreciseTimestampConversion, Rand, Round, Second, SecondsToTimestamp, SortOrder, StringLPad, StringRepeat, StringRPad, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, UnixTimestamp, WeekDay, XxHash64}
+import org.apache.spark.sql.comet.{CometScalarSubquery => NativeScalarSubquery}
 import org.apache.spark.sql.execution.{FilterExec, ProjectExec, ReusedSubqueryExec, ScalarSubquery, SubqueryExec}
 import org.apache.spark.sql.types._
 
@@ -44,26 +45,29 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
   private def supported(dt: DataType): Boolean =
     CometScalarSubquery.getSupportLevel(subquery(dt)) == Compatible()
 
-  test("struct reuse shares a materialization ID while preserving registry expression IDs") {
+  test("registered struct result identities follow late physical subquery reuse") {
     val first = subquery(struct(StringType))
     val reused = ScalarSubquery(ReusedSubqueryExec(first.plan), NamedExpression.newExprId)
     val other = subquery(struct(StringType))
-    def serialized(query: ScalarSubquery): ExprOuterClass.Subquery =
-      CometScalarSubquery.convert(query, Seq.empty, binding = false).get.getSubquery
-
-    val original = serialized(first)
-    val shared = serialized(reused)
-    val independent = serialized(other)
-    assert(original.getId == first.exprId.id)
-    assert(shared.getId == reused.exprId.id)
-    assert(original.getId != shared.getId)
-    assert(original.hasStructResultId && shared.hasStructResultId)
-    assert(original.getStructResultId == first.plan.id)
-    assert(shared.getStructResultId == original.getStructResultId)
-    assert(independent.getStructResultId != original.getStructResultId)
-    val scalar = subquery(IntegerType)
-    assert(serialized(scalar).getId == scalar.exprId.id)
-    assert(!serialized(scalar).hasStructResultId)
+    val otherContext = ScalarSubquery(other.plan, first.exprId)
+    val context = Long.MinValue
+    val secondContext = Long.MinValue + 1
+    val queries = Seq(first, reused, other)
+    try {
+      queries.foreach(NativeScalarSubquery.setSubquery(context, _))
+      NativeScalarSubquery.setSubquery(secondContext, otherContext)
+      def resultId(query: ScalarSubquery): Long =
+        NativeScalarSubquery.getStructResultId(context, query.exprId.id)
+      assert(first.exprId != reused.exprId)
+      assert(resultId(first) == first.plan.id)
+      assert(resultId(reused) == resultId(first))
+      assert(resultId(other) != resultId(first))
+      assert(
+        NativeScalarSubquery.getStructResultId(secondContext, first.exprId.id) == other.plan.id)
+    } finally {
+      queries.foreach(NativeScalarSubquery.removeSubquery(context, _))
+      NativeScalarSubquery.removeSubquery(secondContext, otherContext)
+    }
   }
 
   test("array hash fusion preserves argument order and evaluation boundaries") {

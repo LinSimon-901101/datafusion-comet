@@ -23,6 +23,8 @@ import java.util.HashMap;
 
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.comet.execution.arrow.CometArrowConverters$;
+import org.apache.spark.sql.execution.BaseSubqueryExec;
+import org.apache.spark.sql.execution.ReusedSubqueryExec;
 import org.apache.spark.sql.execution.ScalarSubquery;
 import org.apache.spark.sql.types.Decimal;
 import org.apache.spark.sql.types.StructType;
@@ -59,13 +61,29 @@ public class CometScalarSubquery {
     }
   }
 
-  /** Retrieve the result of subquery. */
-  private static Object getSubquery(Long planId, Long id) {
+  private static ScalarSubquery getRegisteredSubquery(Long planId, Long id) {
     if (!subqueryMap.containsKey(planId)) {
       throw new CometRuntimeException("Subquery " + id + " not found for plan " + planId + ".");
     }
 
-    return subqueryMap.get(planId).get(id).eval(null);
+    return subqueryMap.get(planId).get(id);
+  }
+
+  /** Retrieve the result of subquery. */
+  private static Object getSubquery(Long planId, Long id) {
+    return getRegisteredSubquery(planId, id).eval(null);
+  }
+
+  /**
+   * Identify the materialized result after Spark's late subquery reuse rewrite. Expression IDs
+   * remain the registry keys; different expressions can read fields of the same reused result.
+   */
+  public static long getStructResultId(long planId, long id) {
+    BaseSubqueryExec plan = getRegisteredSubquery(planId, id).plan();
+    while (plan instanceof ReusedSubqueryExec) {
+      plan = ((ReusedSubqueryExec) plan).child();
+    }
+    return plan.id();
   }
 
   /** Check if the result of a subquery is null. Called from native code. */

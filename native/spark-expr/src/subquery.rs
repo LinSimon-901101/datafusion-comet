@@ -77,11 +77,21 @@ impl Subquery {
         }
     }
 
+    /// Spark applies subquery reuse after initial Comet serialization. Read the identity from
+    /// the registered physical subquery, rather than capturing its pre-rewrite plan ID.
+    pub fn struct_result_id(exec_context_id: i64, id: i64) -> datafusion::common::Result<i64> {
+        JVMClasses::with_env(|env| unsafe {
+            Ok(jni_static_call!(env,
+                comet_exec.get_struct_result_id(exec_context_id, id) -> jlong
+            )?)
+        })
+    }
+
     /// Resolve Spark's already materialized struct result during native physical planning.
     /// Registration precedes the first executePlan call, which creates the physical plan.
     /// The planner stores the owned result in a Literal, so evaluation needs no JVM lookup or
     /// mutable initialization state. The planner shares the result across physical expressions
-    /// with the same execution context, subquery ID and planned type.
+    /// with the same execution context, materialized result ID and planned type.
     pub fn resolve_struct(
         exec_context_id: i64,
         id: i64,

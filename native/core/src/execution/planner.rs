@@ -175,13 +175,7 @@ pub struct BinaryExprOptions {
 
 pub const TEST_EXEC_CONTEXT_ID: i64 = -1;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-enum StructSubqueryId {
-    Materialized(i64),
-    Expression(i64),
-}
-
-type StructSubqueryLiterals = HashMap<(i64, StructSubqueryId, DataType), Arc<Literal>>;
+type StructSubqueryLiterals = HashMap<(i64, i64, DataType), Arc<Literal>>;
 
 /// The query planner for converting Spark query plans to DataFusion query plans.
 #[derive(Clone)]
@@ -318,15 +312,11 @@ impl PhysicalPlanner {
     fn resolve_struct_subquery(
         &self,
         id: i64,
-        result_id: Option<i64>,
+        result_id: i64,
         data_type: &DataType,
         resolve: impl FnOnce(i64, i64, &DataType) -> datafusion::common::Result<ScalarValue>,
     ) -> datafusion::common::Result<Arc<Literal>> {
-        let identity = result_id.map_or(
-            StructSubqueryId::Expression(id),
-            StructSubqueryId::Materialized,
-        );
-        let key = (self.exec_context_id, identity, data_type.clone());
+        let key = (self.exec_context_id, result_id, data_type.clone());
         let mut literals = self.struct_subquery_literals.lock();
         if let Some(literal) = literals.get(&key) {
             return Ok(Arc::clone(literal));
@@ -994,9 +984,10 @@ impl PhysicalPlanner {
                     // Spark has materialized and registered the result before this physical
                     // plan is created in executePlan. Keep an owned constant in the plan rather
                     // than initializing mutable state while evaluating input batches.
+                    let result_id = Subquery::struct_result_id(self.exec_context_id, id)?;
                     Ok(self.resolve_struct_subquery(
                         id,
-                        expr.struct_result_id,
+                        result_id,
                         &data_type,
                         Subquery::resolve_struct,
                     )?)
@@ -3247,32 +3238,6 @@ mod tests {
                 ])) as ArrayRef
             })
             .collect();
-        let proto_type = spark_expression::DataType {
-            type_id: spark_expression::data_type::DataTypeId::Struct as i32,
-            type_info: Some(Box::new(spark_expression::data_type::DataTypeInfo {
-                datatype_struct: Some(
-                    spark_expression::data_type::data_type_info::DatatypeStruct::Struct(
-                        spark_expression::data_type::StructInfo {
-                            field_names: fields.iter().map(|f| f.name().clone()).collect(),
-                            field_datatypes: vec![
-                                spark_expression::DataType {
-                                    type_id: spark_expression::data_type::DataTypeId::String as i32,
-                                    type_info: None,
-                                };
-                                fields.len()
-                            ],
-                            field_nullable: vec![true; fields.len()],
-                            field_metadata: fields
-                                .iter()
-                                .map(|f| spark_expression::data_type::FieldMetadata {
-                                    metadata: f.metadata().clone(),
-                                })
-                                .collect(),
-                        },
-                    ),
-                ),
-            })),
-        };
         let value = ScalarValue::Struct(Arc::new(StructArray::new(fields, columns, None)));
         let data_type = value.data_type();
         let calls = AtomicUsize::new(0);
@@ -3282,30 +3247,28 @@ mod tests {
             &arrow::array::RecordBatchOptions::new().with_row_count(Some(1)),
         )
         .unwrap();
-        let first: Arc<dyn PhysicalExpr> = planner
-            .resolve_struct_subquery(7, Some(42), &data_type, |context, id, expected| {
-                assert_eq!((context, id), (41, 7));
-                assert_eq!(expected, &data_type);
-                calls.fetch_add(1, Ordering::SeqCst);
-                Ok(value.clone())
-            })
-            .unwrap();
+        let mut first = None;
         for ordinal in 0..32 {
-            // Spark gives each reused field a different expression ID. Exercise the real
-            // dispatch with that shape, not only repeated calls with the same lookup ID.
-            let expression = Expr {
-                expr_struct: Some(ExprStruct::Subquery(spark_expression::Subquery {
-                    id: 100 + ordinal as i64,
-                    struct_result_id: Some(42),
-                    datatype: Some(proto_type.clone()),
-                })),
-                ..Default::default()
-            };
             let literal = planner
                 .clone()
-                .create_expr(&expression, Arc::new(Schema::empty()))
+                .resolve_struct_subquery(
+                    7 + ordinal as i64,
+                    42,
+                    &data_type,
+                    |context, id, expected| {
+                        assert_eq!((context, id), (41, 7));
+                        assert_eq!(expected, &data_type);
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(value.clone())
+                    },
+                )
                 .unwrap();
-            assert!(Arc::ptr_eq(&first, &literal));
+            assert_eq!(literal.value(), &value);
+            if let Some(first) = &first {
+                assert!(Arc::ptr_eq(first, &literal));
+            } else {
+                first = Some(Arc::clone(&literal));
+            }
             let field = GetStructField::new(literal, ordinal)
                 .evaluate(&batch)
                 .unwrap()
@@ -3335,41 +3298,38 @@ mod tests {
             ScalarValue::try_from(data_type)
         };
         let first = planner
-            .resolve_struct_subquery(7, None, &data_type, resolve)
+            .resolve_struct_subquery(7, 42, &data_type, resolve)
             .unwrap();
         assert!(first.value().is_null());
         let reused = planner
-            .resolve_struct_subquery(7, None, &data_type, resolve)
+            .resolve_struct_subquery(7, 42, &data_type, resolve)
             .unwrap();
         assert!(Arc::ptr_eq(&first, &reused));
         let other_context = planner
             .clone()
             .with_exec_id(42)
-            .resolve_struct_subquery(7, None, &data_type, resolve)
+            .resolve_struct_subquery(7, 42, &data_type, resolve)
             .unwrap();
         let other_id = planner
-            .resolve_struct_subquery(8, None, &data_type, resolve)
+            .resolve_struct_subquery(8, 43, &data_type, resolve)
             .unwrap();
         let other_type = planner
-            .resolve_struct_subquery(7, None, &changed_type, resolve)
+            .resolve_struct_subquery(7, 42, &changed_type, resolve)
             .unwrap();
-        let materialized_id = planner
-            .resolve_struct_subquery(7, Some(7), &data_type, resolve)
-            .unwrap();
-        for literal in [&other_context, &other_id, &other_type, &materialized_id] {
+        for literal in [&other_context, &other_id, &other_type] {
             assert!(!Arc::ptr_eq(&first, literal));
         }
         assert_eq!(other_type.value().data_type(), changed_type);
-        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
         assert!(planner
-            .resolve_struct_subquery(9, None, &data_type, |_, _, _| {
+            .resolve_struct_subquery(9, 49, &data_type, |_, _, _| {
                 Err(DataFusionError::Execution("decode failed".into()))
             })
             .is_err());
         planner
-            .resolve_struct_subquery(9, None, &data_type, resolve)
+            .resolve_struct_subquery(9, 49, &data_type, resolve)
             .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 6);
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
     }
 
     #[test]
