@@ -3615,6 +3615,13 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar review integer division does not disable bounded IF evaluation") {
+    withScalarReviewTables {
+      checkSparkAnswer("SELECT id, octet_length(IF(id DIV 2 >= 0, " +
+        "(SELECT max(s) FROM review_wide), (SELECT min(s) FROM review_wide))) FROM review_outer")
+    }
+  }
+
   test("scalar review ordinary struct literals keep native column execution") {
     withScalarReviewTables {
       checkSparkAnswerAndOperator(

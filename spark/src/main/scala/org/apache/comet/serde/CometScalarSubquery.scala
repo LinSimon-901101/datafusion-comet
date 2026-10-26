@@ -22,7 +22,7 @@ package org.apache.comet.serde
 import scala.jdk.CollectionConverters._
 import scala.util.DynamicVariable
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, BoundReference, CaseWhen, Cast, Coalesce, CreateArray, CreateMap, CreateNamedStruct, DateFromUnixDate, DayOfWeek, ElementAt, EqualNullSafe, EqualTo, Expression, ExprId, GetArrayItem, GetArrayStructFields, GetMapValue, GetStructField, GreaterThan, GreaterThanOrEqual, Greatest, Hour, If, In, InSet, IsNotNull, IsNull, KnownNotNull, KnownNullable, Least, LessThan, LessThanOrEqual, Literal, Minute, NamedExpression, PreciseTimestampConversion, Second, SortOrder, ToUnixTimestamp, TryEval, UnixDate, UnixTimestamp, WeekDay}
+import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, BoundReference, CaseWhen, Cast, Coalesce, Concat, ConcatWs, CreateArray, CreateMap, CreateNamedStruct, DateFromUnixDate, DayOfWeek, ElementAt, EqualNullSafe, EqualTo, Expression, ExprId, GetArrayItem, GetArrayStructFields, GetMapValue, GetStructField, GreaterThan, GreaterThanOrEqual, Greatest, Hour, If, In, InSet, IsNotNull, IsNull, KnownNotNull, KnownNullable, Least, LessThan, LessThanOrEqual, Literal, Minute, NamedExpression, PreciseTimestampConversion, Second, SortOrder, StringLPad, StringRepeat, StringRPad, ToUnixTimestamp, TryEval, UnixDate, UnixTimestamp, WeekDay}
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.catalyst.trees.TreePattern.PLAN_EXPRESSION
 import org.apache.spark.sql.comet.CometExec
@@ -34,6 +34,7 @@ import org.apache.spark.sql.types._
 
 import com.google.protobuf.Message
 
+import org.apache.comet.CometConf
 import org.apache.comet.CometSparkSessionExtensions.withFallbackReason
 import org.apache.comet.serde.QueryPlanSerde.{serializeDataType, supportedDataType}
 
@@ -41,6 +42,7 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
 
   private val structSubqueryInputs =
     new TreeNodeTag[Set[ExprId]]("CometStructScalarSubqueryInputs")
+  private val currentStructSubqueryInputBounds = new DynamicVariable[Map[ExprId, Long]](Map.empty)
   private val structSubqueryContext =
     new TreeNodeTag[Boolean]("CometStructScalarSubqueryContext")
   private val currentStructSubqueryInputs = new DynamicVariable[Set[ExprId]](Set.empty)
@@ -176,6 +178,94 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
     case _ => false
   }
 
+  private val scalarInputBytes = 1024L * 1024
+
+  private def sumBounds(bounds: Seq[Option[Long]], overhead: Long): Option[Long] =
+    bounds.foldLeft(Option(overhead)) { (sum, next) =>
+      for {
+        a <- sum
+        b <- next
+        if a <= Long.MaxValue - b
+      } yield a + b
+    }
+
+  private def fixedTypeBytes(dt: DataType): Option[Long] = dt match {
+    case StringType | BinaryType | _: ArrayType | _: MapType => None
+    case StructType(fields) => sumBounds(fields.toSeq.map(f => fixedTypeBytes(f.dataType)), 1)
+    case _ => Some(dt.defaultSize.toLong + 1)
+  }
+
+  // This is an upper bound, never an average-width estimate for strings or array cardinality.
+  private def boundedResultBytes(expr: Expression): Option[Long] = {
+    val inputBound = expr match {
+      case attribute: Attribute => currentStructSubqueryInputBounds.value.get(attribute.exprId)
+      case _ => None
+    }
+    inputBound.orElse(fixedTypeBytes(expr.dataType)).orElse {
+      expr match {
+        case literal: Literal if literal.value == null => Some(0)
+        case literal: Literal if literal.dataType == StringType =>
+          Some(
+            literal.value
+              .asInstanceOf[org.apache.spark.unsafe.types.UTF8String]
+              .numBytes()
+              .toLong + 5)
+        case literal: Literal if literal.dataType == BinaryType =>
+          Some(literal.value.asInstanceOf[Array[Byte]].length.toLong + 5)
+        case padding: StringLPad => paddingBytes(padding.len)
+        case padding: StringRPad => paddingBytes(padding.len)
+        case repeat: StringRepeat =>
+          repeat.right match {
+            case Literal(count: Int, IntegerType) =>
+              boundedResultBytes(repeat.left)
+                .filter(_ <= Long.MaxValue / math.max(1, count))
+                .map(_ * math.max(0, count))
+            case _ => None
+          }
+        case concat: Concat => sumBounds(concat.children.map(boundedResultBytes), 5)
+        case concat: ConcatWs if hasLiteralNullSeparator(concat) =>
+          Some(0L)
+        case structure: CreateNamedStruct =>
+          sumBounds(structure.valExprs.map(boundedResultBytes), 1)
+        case conditional: If =>
+          for {
+            yes <- boundedResultBytes(conditional.trueValue)
+            no <- boundedResultBytes(conditional.falseValue)
+          } yield math.max(yes, no)
+        case conditional: CaseWhen =>
+          val values = conditional.branches.map(_._2) ++ conditional.elseValue.toSeq
+          val bounds = values.map(boundedResultBytes)
+          if (bounds.forall(_.isDefined)) Some(bounds.flatten.foldLeft(0L)(math.max)) else None
+        case _: Coalesce | _: Greatest | _: Least =>
+          val bounds = expr.children.map(boundedResultBytes)
+          if (bounds.forall(_.isDefined)) Some(bounds.flatten.foldLeft(0L)(math.max)) else None
+        case _: Alias | _: KnownNotNull | _: KnownNullable | _: TryEval | _: SortOrder =>
+          expr.children.headOption.flatMap(boundedResultBytes)
+        case _ => None
+      }
+    }
+  }
+
+  private def fitsConsumerBatch(expr: Expression): Boolean =
+    boundedResultBytes(expr).exists(
+      _ <= scalarInputBytes / math.max(1, CometConf.COMET_BATCH_SIZE.get()))
+
+  private def hasLiteralNullSeparator(concat: ConcatWs): Boolean =
+    concat.children.headOption match {
+      case Some(Literal(null, _)) => true
+      case _ => false
+    }
+
+  private def paddingBytes(length: Expression): Option[Long] = length match {
+    case Literal(value: Int, IntegerType) => Some(math.max(0L, value.toLong) * 4 + 5)
+    case Literal(null, _) => Some(0L)
+    case _ => None
+  }
+
+  // Include intermediates such as repeat('x', numericSubquery), even when the source is integral.
+  private def needsBoundedEvaluation(expr: Expression): Boolean =
+    hasStructSubquery(expr) && expr.exists(e => !fitsConsumerBatch(e))
+
   private def containsVariableWidth(dt: DataType): Boolean = dt match {
     case StringType | BinaryType => true
     case s: StructType => s.fields.exists(f => containsVariableWidth(f.dataType))
@@ -209,6 +299,46 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
     }
     if (hasVariableWidthStructSubquery(expr) && containsDispatch(proto)) {
       Some("JVM-dispatched consumers of variable-width struct scalar subqueries require Spark")
+    } else {
+      None
+    }
+  }
+
+  /** Keep an unknown serialized child from silently disabling the native width guard. */
+  private[serde] def unknownConsumerFallbackReason(
+      expr: Expression,
+      proto: ExprOuterClass.Expr): Option[String] = {
+    import ExprOuterClass.Expr.ExprStructCase._
+    def recognized(e: ExprOuterClass.Expr): Boolean = e.getExprStructCase match {
+      case LITERAL | BOUND | UNBOUND | SUBQUERY | ADD | SUBTRACT | MULTIPLY | DIVIDE |
+          INTEGRAL_DIVIDE | REMAINDER | UNARY_MINUS | CAST | CHECK_OVERFLOW | EQ | NEQ | GT |
+          GT_EQ | LT | LT_EQ | EQNULLSAFE | NEQNULLSAFE | AND | OR | NOT | IS_NULL | IS_NOT_NULL |
+          LIKE | RLIKE | SCALARFUNC | BITWISEAND | BITWISEOR | BITWISEXOR | BITWISESHIFTLEFT |
+          BITWISESHIFTRIGHT | CASEWHEN | IN | IF | SORT_ORDER | NORMALIZE_NAN_AND_ZERO |
+          BLOOM_FILTER_MIGHT_CONTAIN | CREATE_NAMED_STRUCT | GET_STRUCT_FIELD | TO_JSON |
+          TO_PRETTY_STRING | LIST_EXTRACT | GET_ARRAY_STRUCT_FIELDS | ARRAY_INSERT | FROM_JSON |
+          TO_CSV | ARRAYS_ZIP | PRECISE_TIMESTAMP_CONVERSION | AT_LEAST_N_NON_NULLS | HOUR |
+          MINUTE | SECOND | UNIX_TIMESTAMP | HOURS_TRANSFORM =>
+        true
+      case _ => false
+    }
+    def containsUnknown(message: Message): Boolean = {
+      val unknown = message match {
+        case e: ExprOuterClass.Expr => !recognized(e)
+        case _ => false
+      }
+      unknown || message.getAllFields.values().asScala.exists {
+        case child: Message => containsUnknown(child)
+        case children: java.util.List[_] =>
+          children.asScala.exists {
+            case child: Message => containsUnknown(child)
+            case _ => false
+          }
+        case _ => false
+      }
+    }
+    if (needsBoundedEvaluation(expr) && containsUnknown(proto)) {
+      Some("Unreviewed consumers of expanded struct scalar subqueries require Spark")
     } else {
       None
     }

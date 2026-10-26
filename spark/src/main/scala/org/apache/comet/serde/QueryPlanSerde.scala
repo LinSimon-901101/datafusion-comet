@@ -1129,7 +1129,9 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
           }
       })
       .filter { protoExpr =>
-        CometScalarSubquery.dispatchedConsumerFallbackReason(expr, protoExpr) match {
+        CometScalarSubquery
+          .dispatchedConsumerFallbackReason(expr, protoExpr)
+          .orElse(CometScalarSubquery.unknownConsumerFallbackReason(expr, protoExpr)) match {
           case Some(reason) =>
             withFallbackReason(expr, reason)
             false

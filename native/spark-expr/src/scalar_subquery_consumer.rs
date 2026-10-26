@@ -17,10 +17,10 @@
 
 use crate::array_funcs::NestedPredicate;
 use crate::{
-    ArrayInsert, AtLeastNNonNulls, CaseWhenExpr, Cast, CheckedBinaryExpr, CreateNamedStruct,
-    FromJson, GetArrayStructFields, GetStructField, IfExpr, ListExtract, NegativeExpr,
-    NormalizeNestedFloats, NullShortCircuit, RLike, SparkArraysZipFunc, SparkComparison, Subquery,
-    ToCsv, ToJson,
+    ArrayInsert, AtLeastNNonNulls, CaseWhenExpr, Cast, CheckOverflow, CheckedBinaryExpr,
+    CreateNamedStruct, DecimalRescaleCheckOverflow, FromJson, GetArrayStructFields, GetStructField,
+    IfExpr, ListExtract, NegativeExpr, NormalizeNaNAndZero, NormalizeNestedFloats,
+    NullShortCircuit, RLike, SparkArraysZipFunc, SparkComparison, Subquery, ToCsv, ToJson,
 };
 use arrow::array::{new_empty_array, Array, ArrayData, ArrayRef};
 use arrow::compute::concat;
@@ -93,7 +93,7 @@ impl ScalarSubqueryConsumer {
         {
             return inner;
         }
-        if let Some(properties) = consumer_properties(&inner) {
+        if let Some(properties) = consumer_properties(&inner, &input_schema) {
             if properties.has_scalar_struct
                 && (properties.constant || properties.bytes != 0 || properties.unbounded_output)
             {
@@ -122,7 +122,10 @@ struct ConsumerProperties {
 
 /// Explicitly recognize pure row-local trees. Unknown nodes and volatile functions cannot safely
 /// be evaluated on a different batch. Columns require sliced evaluation.
-fn consumer_properties(expr: &Arc<dyn PhysicalExpr>) -> Option<ConsumerProperties> {
+fn consumer_properties(
+    expr: &Arc<dyn PhysicalExpr>,
+    input_schema: &Schema,
+) -> Option<ConsumerProperties> {
     if let Some((field, value)) = expr
         .downcast_ref::<GetStructField>()
         .and_then(|field| field.literal_field().map(|value| (field, value)))
@@ -135,11 +138,10 @@ fn consumer_properties(expr: &Arc<dyn PhysicalExpr>) -> Option<ConsumerPropertie
         });
     }
     if let Some(literal) = expr.downcast_ref::<Literal>() {
-        let bytes = match literal.value() {
-            ScalarValue::Utf8(Some(value)) | ScalarValue::LargeUtf8(Some(value)) => value.len(),
-            ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value)) => value.len(),
-            ScalarValue::Struct(value) => variable_bytes(&value.to_data()),
-            _ => 0,
+        let bytes = if fixed_width_bytes(&literal.value().data_type()).is_some() {
+            0
+        } else {
+            literal_bytes(literal.value())?
         };
         return Some(ConsumerProperties {
             constant: true,
@@ -150,12 +152,12 @@ fn consumer_properties(expr: &Arc<dyn PhysicalExpr>) -> Option<ConsumerPropertie
     }
     // Spark materializes and registers this execution-context value before native execution.
     // Lookup still happens at runtime; it is independent of the current input row or batch.
-    if expr.is::<Subquery>() {
+    if let Some(subquery) = expr.downcast_ref::<Subquery>() {
         return Some(ConsumerProperties {
             constant: true,
             has_scalar_struct: false,
             bytes: 0,
-            unbounded_output: false,
+            unbounded_output: fixed_width_bytes(&subquery.data_type).is_none(),
         });
     }
     if expr.is::<Column>() {
@@ -167,10 +169,10 @@ fn consumer_properties(expr: &Arc<dyn PhysicalExpr>) -> Option<ConsumerPropertie
         });
     }
     if let Some(expr) = expr.downcast_ref::<ScalarSubqueryConsumer>() {
-        return consumer_properties(&expr.inner);
+        return consumer_properties(&expr.inner, input_schema);
     }
     if let Some(expr) = expr.downcast_ref::<NullShortCircuit>() {
-        return consumer_properties(expr.inner());
+        return consumer_properties(expr.inner(), input_schema);
     }
     if let Some(fun) = expr.downcast_ref::<ScalarFunctionExpr>() {
         if fun.fun().signature().volatility != Volatility::Immutable {
@@ -189,6 +191,9 @@ fn consumer_properties(expr: &Arc<dyn PhysicalExpr>) -> Option<ConsumerPropertie
         || expr.is::<Cast>()
         || expr.is::<BinaryExpr>()
         || expr.is::<CheckedBinaryExpr>()
+        || expr.is::<CheckOverflow>()
+        || expr.is::<DecimalRescaleCheckOverflow>()
+        || expr.is::<NormalizeNaNAndZero>()
         || expr.is::<NegativeExpr>()
         || expr.is::<SparkComparison>()
         || expr.is::<IsNullExpr>()
@@ -205,43 +210,48 @@ fn consumer_properties(expr: &Arc<dyn PhysicalExpr>) -> Option<ConsumerPropertie
     {
         return None;
     }
+    // Bound fixed outputs such as integer formatting and fixed-cardinality constructors.
+    // Descendant unbounded intermediates are still propagated below.
+    let sizes_output = expr
+        .downcast_ref::<ScalarFunctionExpr>()
+        .map(ScalarFunctionExpr::return_type)
+        .or_else(|| expr.downcast_ref::<Cast>().map(|cast| &cast.data_type))
+        .or_else(|| expr.downcast_ref::<CastExpr>().map(CastExpr::cast_type))
+        .is_some_and(|dt| {
+            matches!(
+                dt,
+                DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Utf8View
+                    | DataType::Binary
+                    | DataType::LargeBinary
+                    | DataType::BinaryView
+            ) || dt.is_nested()
+        })
+        || expr.is::<ToJson>()
+        || expr.is::<ToCsv>()
+        || expr.is::<FromJson>()
+        || expr.is::<ArrayInsert>()
+        || expr.is::<SparkArraysZipFunc>()
+        || expr
+            .downcast_ref::<ListExtract>()
+            .is_some_and(|e| e.default_value().is_some());
+    let output_bytes = if sizes_output {
+        bounded_output_bytes(expr, input_schema)
+    } else {
+        Some(0)
+    };
     let mut properties = ConsumerProperties {
         constant: true,
         has_scalar_struct: false,
-        bytes: 0,
-        // Input payload does not bound outputs such as repeat, padding, JSON or growing lists.
-        // Propagate this even from constant children: a row-dependent IF can select them for
-        // a whole batch before its parent reduces the result.
-        unbounded_output: expr
-            .downcast_ref::<ScalarFunctionExpr>()
-            .map(ScalarFunctionExpr::return_type)
-            .or_else(|| expr.downcast_ref::<Cast>().map(|cast| &cast.data_type))
-            .or_else(|| expr.downcast_ref::<CastExpr>().map(CastExpr::cast_type))
-            .is_some_and(|dt| {
-                matches!(
-                    dt,
-                    DataType::Utf8
-                        | DataType::LargeUtf8
-                        | DataType::Utf8View
-                        | DataType::Binary
-                        | DataType::LargeBinary
-                        | DataType::BinaryView
-                ) || dt.is_nested()
-            })
-            || expr.is::<ToJson>()
-            || expr.is::<ToCsv>()
-            || expr.is::<FromJson>()
-            || expr.is::<ArrayInsert>()
-            || expr.is::<SparkArraysZipFunc>()
-            || expr
-                .downcast_ref::<ListExtract>()
-                .is_some_and(|e| e.default_value().is_some()),
+        bytes: output_bytes.unwrap_or(0),
+        unbounded_output: output_bytes.is_none(),
     };
     let default_value = expr
         .downcast_ref::<ListExtract>()
         .and_then(ListExtract::default_value);
     for child in expr.children().into_iter().chain(default_value) {
-        let child = consumer_properties(child)?;
+        let child = consumer_properties(child, input_schema)?;
         properties.constant &= child.constant;
         properties.has_scalar_struct |= child.has_scalar_struct;
         properties.bytes = properties.bytes.saturating_add(child.bytes);
@@ -257,6 +267,85 @@ fn consumer_properties(expr: &Arc<dyn PhysicalExpr>) -> Option<ConsumerPropertie
         return None;
     }
     Some(properties)
+}
+
+// Conservative per-row bytes, including one byte per validity mask. Unknown variable-length
+// types stay unbounded; a constructor may supply a tighter expression-specific bound.
+fn fixed_width_bytes(dt: &DataType) -> Option<usize> {
+    let bytes = match dt {
+        DataType::Null => 0,
+        DataType::Boolean => 1,
+        DataType::FixedSizeBinary(n) => usize::try_from(*n).ok()?,
+        DataType::FixedSizeList(field, n) => {
+            fixed_width_bytes(field.data_type())?.checked_mul(usize::try_from(*n).ok()?)?
+        }
+        DataType::Struct(fields) => fields.iter().try_fold(0usize, |total, field| {
+            total.checked_add(fixed_width_bytes(field.data_type())?)
+        })?,
+        _ => dt.primitive_width()?,
+    };
+    bytes.checked_add(1)
+}
+
+fn bounded_output_bytes(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option<usize> {
+    if let Some(consumer) = expr.downcast_ref::<ScalarSubqueryConsumer>() {
+        return bounded_output_bytes(&consumer.inner, schema);
+    }
+    if let Some(consumer) = expr.downcast_ref::<NullShortCircuit>() {
+        return bounded_output_bytes(consumer.inner(), schema);
+    }
+    if let Some(field) = expr.downcast_ref::<GetStructField>() {
+        if let Some(value) = field.literal_field() {
+            return value.to_data().get_slice_memory_size().ok();
+        }
+    }
+    if let Some(literal) = expr.downcast_ref::<Literal>() {
+        return literal_bytes(literal.value());
+    }
+    let dt = expr.data_type(schema).ok()?;
+    if let Some(bytes) = fixed_width_bytes(&dt) {
+        return Some(bytes);
+    }
+    let choice = expr
+        .downcast_ref::<CaseWhenExpr>()
+        .or_else(|| expr.downcast_ref::<IfExpr>().map(IfExpr::case_when));
+    if let Some(choice) = choice {
+        return choice.values().try_fold(0usize, |bound, value| {
+            Some(bound.max(bounded_output_bytes(value, schema)?))
+        });
+    }
+    if let Some(fun) = expr.downcast_ref::<ScalarFunctionExpr>() {
+        let implementation = fun.fun().inner();
+        if implementation.is::<datafusion_functions::core::greatest::GreatestFunc>()
+            || implementation.is::<datafusion_functions::core::least::LeastFunc>()
+            || implementation.is::<crate::SparkGreatestLeast>()
+        {
+            return fun.args().iter().try_fold(0usize, |bound, value| {
+                Some(bound.max(bounded_output_bytes(value, schema)?))
+            });
+        }
+    }
+    None
+}
+
+fn literal_bytes(value: &ScalarValue) -> Option<usize> {
+    // Counting a scalar payload must not copy it into Arrow at every enclosing expression.
+    match value {
+        ScalarValue::Utf8(value) => Some(value.as_ref().map_or(0, |v| v.len()).saturating_add(9)),
+        ScalarValue::Binary(value) => Some(value.as_ref().map_or(0, |v| v.len()).saturating_add(9)),
+        ScalarValue::LargeUtf8(value) => {
+            Some(value.as_ref().map_or(0, |v| v.len()).saturating_add(17))
+        }
+        ScalarValue::LargeBinary(value) => {
+            Some(value.as_ref().map_or(0, |v| v.len()).saturating_add(17))
+        }
+        _ => value
+            .to_array()
+            .ok()?
+            .to_data()
+            .get_slice_memory_size()
+            .ok(),
+    }
 }
 
 fn variable_bytes(data: &ArrayData) -> usize {
@@ -402,5 +491,28 @@ impl PhysicalExpr for ScalarSubqueryConsumer {
             inner,
             Arc::clone(&self.input_schema),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literal_payload_bounds_include_offsets_and_nulls() {
+        for value in [
+            ScalarValue::Utf8(Some("λ".repeat(1024))),
+            ScalarValue::Utf8(None),
+            ScalarValue::LargeUtf8(Some("λ".repeat(1024))),
+            ScalarValue::LargeUtf8(None),
+            ScalarValue::Binary(Some(vec![7; 4096])),
+            ScalarValue::Binary(None),
+            ScalarValue::LargeBinary(Some(vec![7; 4096])),
+            ScalarValue::LargeBinary(None),
+        ] {
+            let array = value.to_array().unwrap();
+            let actual = array.to_data().get_slice_memory_size().unwrap();
+            assert!(literal_bytes(&value).unwrap() >= actual, "{value:?}");
+        }
     }
 }

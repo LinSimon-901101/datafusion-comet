@@ -255,7 +255,7 @@ impl CaseWhenExpr {
     }
 
     /// The branch values, THEN and ELSE, in the order they are evaluated eagerly.
-    fn values(&self) -> impl Iterator<Item = &Arc<dyn PhysicalExpr>> {
+    pub(crate) fn values(&self) -> impl Iterator<Item = &Arc<dyn PhysicalExpr>> {
         self.flat_when_then
             .iter()
             .map(|(_, then)| then)
