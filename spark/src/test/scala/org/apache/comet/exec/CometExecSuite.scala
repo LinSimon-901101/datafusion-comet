@@ -3638,6 +3638,49 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar review primitive and fixed-width IN preserve row evaluation") {
+    withScalarReviewTables {
+      Seq(
+        "id IN ((SELECT max(k) FROM review_nums), CAST(txt AS INT))",
+        "named_struct('k', id) IN " +
+          "((SELECT max(named_struct('k', k)) FROM review_nums), " +
+          "named_struct('k', CAST(txt AS INT)))").foreach { predicate =>
+        checkSparkAnswer(
+          s"SELECT id, $predicate, (SELECT min(k) FROM review_nums) FROM review_items")
+      }
+    }
+  }
+
+  test("scalar review fixed-width IN retains shared candidate errors") {
+    withScalarReviewTables {
+      val value = "(SELECT max(k) FROM review_nums)"
+      val query = s"SELECT 1 IN ($value, CAST(txt AS INT)) a, " +
+        s"1 IN (abs($value), CAST(txt AS INT)) b, " +
+        "(SELECT min(k) FROM review_nums) m FROM review_items"
+      withSQLConf(SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "false") {
+        checkSparkAnswer(query)
+      }
+      withSQLConf(SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "true") {
+        val (expected, actual) = checkSparkAnswerMaybeThrows(sql(query))
+        assert(expected.isDefined && actual.isDefined, s"$expected / $actual")
+      }
+    }
+  }
+
+  test("scalar review NULL membership skips observable candidates in both evaluation modes") {
+    withScalarReviewTables {
+      val value = "(SELECT max(named_struct('k', k)) FROM review_nums WHERE k < 0).k"
+      val query = s"SELECT $value IN (CAST(txt AS INT), id), " +
+        "(SELECT min(k) FROM review_nums) FROM review_items"
+      Seq("CODEGEN_ONLY", "NO_CODEGEN").foreach { mode =>
+        withSQLConf(SQLConf.CODEGEN_FACTORY_MODE.key -> mode) {
+          checkSparkAnswer(query)
+          checkAnswer(sql(query), Seq(Row(null, 0), Row(null, 0)))
+        }
+      }
+    }
+  }
+
   test("scalar review direct wide fields stay bounded at aggregate and shuffle boundaries") {
     withScalarReviewTables {
       checkSparkAnswer(
@@ -4070,7 +4113,11 @@ class CometExecSuite extends CometTestBase {
                 s"$value IN ($value, $invalid) AS b FROM range(2)"
               withSQLConf(SQLConf.SUBEXPRESSION_ELIMINATION_ENABLED.key -> "false") {
                 val df = sql(query)
-                checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+                // The nullable value may skip a failing candidate even without shared codegen.
+                checkSparkAnswer(df)
+                val reason =
+                  new ExtendedExplainInfo().generateExtendedInfo(df.queryExecution.executedPlan)
+                assert(reason.contains("Nested membership"), reason)
                 checkAnswer(df, Seq(Row(true, true), Row(true, true)))
               }
               Seq(false, true).foreach { comet =>

@@ -274,7 +274,7 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     }
   }
 
-  test("constant scalar membership requires shared-expression authorization") {
+  test("nullable scalar membership preserves skipped candidates with and without sharing") {
     val dt = StructType(Seq(StructField("s", StringType), StructField("f", DoubleType)))
     val scalar = subquery(dt)
     val literal = Literal.create(Row("x", 0.0d), dt)
@@ -292,9 +292,8 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
       withSQLConf("spark.sql.subexpressionElimination.enabled" -> shared.toString) {
         QueryPlanSerde.withSharedSubexpressions(Seq(first, second)) {
           Seq(first, second).foreach { expr =>
-            assert(CometScalarSubquery.consumerFallbackReason(expr).isDefined == shared)
-            if (shared)
-              assert(QueryPlanSerde.exprToProtoInternal(expr, Seq.empty, binding = false).isEmpty)
+            assert(CometScalarSubquery.consumerFallbackReason(expr).isDefined)
+            assert(QueryPlanSerde.exprToProtoInternal(expr, Seq.empty, binding = false).isEmpty)
           }
         }
       }

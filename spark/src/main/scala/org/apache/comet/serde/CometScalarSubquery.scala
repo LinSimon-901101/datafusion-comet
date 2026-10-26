@@ -22,7 +22,7 @@ package org.apache.comet.serde
 import scala.jdk.CollectionConverters._
 import scala.util.DynamicVariable
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, ArraysZip, Attribute, BoundReference, CaseWhen, Cast, Coalesce, Concat, ConcatWs, CreateArray, CreateMap, CreateNamedStruct, DateFormatClass, DateFromUnixDate, DayOfWeek, ElementAt, EqualNullSafe, EqualTo, Expression, ExprId, GetArrayItem, GetArrayStructFields, GetMapValue, GetStructField, GreaterThan, GreaterThanOrEqual, Greatest, Hour, If, In, InSet, IsNotNull, IsNull, KnownNotNull, KnownNullable, LambdaFunction, Least, LessThan, LessThanOrEqual, Literal, Minute, NamedExpression, PreciseTimestampConversion, RegExpExtract, RegExpExtractAll, ScalaUDF, Second, SortOrder, SpecifiedWindowFrame, StringLPad, StringRepeat, StringRPad, ToUnixTimestamp, TryEval, UnixDate, UnixTimestamp, WeekDay, WindowSpecDefinition}
+import org.apache.spark.sql.catalyst.expressions.{Alias, And, ArraysZip, Attribute, BoundReference, CaseWhen, Cast, Coalesce, Concat, ConcatWs, CreateArray, CreateMap, CreateNamedStruct, DateFormatClass, DateFromUnixDate, DayOfWeek, ElementAt, EqualNullSafe, EqualTo, Expression, ExprId, GetArrayItem, GetArrayStructFields, GetMapValue, GetStructField, GreaterThan, GreaterThanOrEqual, Greatest, Hour, If, In, InSet, IsNotNull, IsNull, KnownNotNull, KnownNullable, LambdaFunction, Least, LessThan, LessThanOrEqual, Literal, Minute, Murmur3Hash, NamedExpression, Not, Or, PreciseTimestampConversion, RegExpExtract, RegExpExtractAll, Remainder, ScalaUDF, Second, SortOrder, SpecifiedWindowFrame, StringLPad, StringRepeat, StringRPad, ToUnixTimestamp, TryEval, UnixDate, UnixTimestamp, WeekDay, WindowSpecDefinition, XxHash64}
 import org.apache.spark.sql.catalyst.expressions.objects.StaticInvoke
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.catalyst.trees.TreePattern.PLAN_EXPRESSION
@@ -429,13 +429,6 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
   private def needsBoundedEvaluation(expr: Expression): Boolean =
     hasStructSubquery(expr) && expr.exists(e => !fitsConsumerBatch(e))
 
-  private def containsVariableWidth(dt: DataType): Boolean = dt match {
-    case StringType | BinaryType => true
-    case s: StructType => s.fields.exists(f => containsVariableWidth(f.dataType))
-    case ArrayType(elementType, _) => containsVariableWidth(elementType)
-    case _ => false
-  }
-
   private def borrowedArray(expr: Expression): Boolean = expr match {
     case _: Attribute | _: BoundReference => true
     case _: Alias | _: KnownNotNull | _: KnownNullable | _: GetStructField | _: SortOrder =>
@@ -578,6 +571,64 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
     }
   }
 
+  // Pure value reads can run on rows Spark skips; deterministic computations can still fail.
+  private val primitiveNumericTypes: Set[DataType] =
+    Set(ByteType, ShortType, IntegerType, LongType, FloatType, DoubleType)
+
+  private def positiveIntegralLiteral(expr: Expression): Boolean = expr match {
+    case Literal(value: Number, dt)
+        if Set[DataType](ByteType, ShortType, IntegerType, LongType).contains(dt) =>
+      value.longValue() > 0
+    case cast: Cast if Cast.canUpCast(cast.child.dataType, cast.dataType) =>
+      positiveIntegralLiteral(cast.child)
+    case _ => false
+  }
+
+  private def canEvaluateForSkippedRows(expr: Expression): Boolean = expr match {
+    case _: Literal | _: Attribute | _: BoundReference | _: ExecSubqueryExpression => true
+    case field: GetStructField => canEvaluateForSkippedRows(field.child)
+    case _: UnixDate | _: DateFromUnixDate =>
+      expr.children.forall(canEvaluateForSkippedRows)
+    case _: IsNull | _: IsNotNull | _: Not | _: And | _: Or | _: EqualTo | _: EqualNullSafe |
+        _: LessThan | _: LessThanOrEqual | _: GreaterThan | _: GreaterThanOrEqual | _: If |
+        _: CaseWhen =>
+      expr.children.forall(canEvaluateForSkippedRows)
+    case remainder: Remainder
+        if Set[DataType](ByteType, ShortType, IntegerType, LongType)
+          .contains(remainder.left.dataType) && positiveIntegralLiteral(remainder.right) =>
+      canEvaluateForSkippedRows(remainder.left)
+    case _: XxHash64 | _: Murmur3Hash
+        if expr.children.forall(child => primitiveNumericTypes.contains(child.dataType)) =>
+      expr.children.forall(canEvaluateForSkippedRows)
+    case hour: Hour if clockFallbackReason(hour.child, hour.timeZoneId).isEmpty =>
+      canEvaluateForSkippedRows(hour.child)
+    case minute: Minute if clockFallbackReason(minute.child, minute.timeZoneId).isEmpty =>
+      canEvaluateForSkippedRows(minute.child)
+    case second: Second if clockFallbackReason(second.child, second.timeZoneId).isEmpty =>
+      canEvaluateForSkippedRows(second.child)
+    case cast: Cast
+        if primitiveNumericTypes.contains(cast.child.dataType) &&
+          primitiveNumericTypes.contains(cast.dataType) &&
+          Cast.canUpCast(cast.child.dataType, cast.dataType) =>
+      canEvaluateForSkippedRows(cast.child)
+    case _ => false
+  }
+
+  private def evaluationFallbackReason(expr: Expression): Option[String] = {
+    if (!hasStructSubqueryContext(expr)) return None
+    expr match {
+      // IN skips candidates after a NULL value or a matching candidate. Native dynamic IN only
+      // stops after a batch-wide match, and Spark may evaluate shared candidates eagerly.
+      case in: In
+          if in.list.exists(!_.isInstanceOf[Literal]) &&
+            (in.references.nonEmpty || !QueryPlanSerde.canSkipEvaluation(in.list) ||
+              !in.deterministic || (in.value.nullable &&
+                in.list.exists(candidate => !canEvaluateForSkippedRows(candidate)))) =>
+        Some("Nested membership of struct scalar subqueries requires Spark")
+      case _ => None
+    }
+  }
+
   // Opaque/stateful siblings prevent native projection fusion. Keep their wide producer on rows
   // too; conservatively include native-opt-in handlers without duplicating dispatch decisions.
   private def requiresRowProjection(expr: Expression): Boolean =
@@ -641,22 +692,6 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
         "Nondeterministic consumers of variable-width struct scalar subqueries require Spark")
     }
 
-    expr match {
-      // Dynamic nested IN stops after a batch-wide match in native execution. Keep row-dependent
-      // candidates on Spark rather than change ANSI/shared-expression evaluation by slicing.
-      // Literal candidates use the separate static IN implementation. Constant membership also
-      // needs sharing authorization: Spark may eagerly evaluate a shared, failing candidate.
-      case in: In
-          if hasStructSubqueryContext(in) &&
-            (in.value.dataType.isInstanceOf[StructType] ||
-              in.value.dataType.isInstanceOf[ArrayType]) &&
-            containsVariableWidth(in.value.dataType) &&
-            in.list.exists(!_.isInstanceOf[Literal]) &&
-            (in.references.nonEmpty || !QueryPlanSerde.canSkipEvaluation(in.list)) =>
-        return Some("Nested membership of struct scalar subqueries requires Spark")
-      case _ =>
-    }
-
     val touchesCalendar =
       containsCalendarType(expr.dataType) ||
         expr.children.exists(child => containsCalendarType(child.dataType))
@@ -712,6 +747,7 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
             childReason
         }
       }
+      .orElse(evaluationFallbackReason(expr))
   }
 
   override def getUnsupportedReasons(): Seq[String] = Seq(
