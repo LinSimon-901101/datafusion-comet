@@ -21,7 +21,7 @@ package org.apache.comet.serde
 
 import org.apache.spark.sql.{CometTestBase, Row}
 import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Ascending, AttributeReference, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, ConcatWs, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, FromUTCTimestamp, GetStructField, GreaterThan, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Minute, Murmur3Hash, NamedExpression, Not, OctetLength, PreciseTimestampConversion, Rand, Round, Second, SecondsToTimestamp, SortOrder, StringLPad, StringRepeat, StringRPad, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, UnixTimestamp, WeekDay, XxHash64}
-import org.apache.spark.sql.execution.{FilterExec, ProjectExec, ScalarSubquery, SubqueryExec}
+import org.apache.spark.sql.execution.{FilterExec, ProjectExec, ReusedSubqueryExec, ScalarSubquery, SubqueryExec}
 import org.apache.spark.sql.types._
 
 import org.apache.comet.CometConf
@@ -43,6 +43,28 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
 
   private def supported(dt: DataType): Boolean =
     CometScalarSubquery.getSupportLevel(subquery(dt)) == Compatible()
+
+  test("struct reuse shares a materialization ID while preserving registry expression IDs") {
+    val first = subquery(struct(StringType))
+    val reused = ScalarSubquery(ReusedSubqueryExec(first.plan), NamedExpression.newExprId)
+    val other = subquery(struct(StringType))
+    def serialized(query: ScalarSubquery): ExprOuterClass.Subquery =
+      CometScalarSubquery.convert(query, Seq.empty, binding = false).get.getSubquery
+
+    val original = serialized(first)
+    val shared = serialized(reused)
+    val independent = serialized(other)
+    assert(original.getId == first.exprId.id)
+    assert(shared.getId == reused.exprId.id)
+    assert(original.getId != shared.getId)
+    assert(original.hasStructResultId && shared.hasStructResultId)
+    assert(original.getStructResultId == first.plan.id)
+    assert(shared.getStructResultId == original.getStructResultId)
+    assert(independent.getStructResultId != original.getStructResultId)
+    val scalar = subquery(IntegerType)
+    assert(serialized(scalar).getId == scalar.exprId.id)
+    assert(!serialized(scalar).hasStructResultId)
+  }
 
   test("array hash fusion preserves argument order and evaluation boundaries") {
     val value = AttributeReference("value", LongType, nullable = true)()

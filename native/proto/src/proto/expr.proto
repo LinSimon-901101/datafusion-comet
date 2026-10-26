@@ -637,6 +637,9 @@ message TruncTimestamp {
 message Subquery {
   int64 id = 1;
   DataType datatype = 2;
+  // Materialized BaseSubqueryExec.id after unwrapping Spark's ReusedSubqueryExec.
+  // Separate from the expression ID used by the JVM result registry.
+  optional int64 struct_result_id = 3;
 }
 
 message BloomFilterMightContain {

@@ -29,7 +29,7 @@ import org.apache.spark.sql.catalyst.optimizer.NormalizeNaNAndZero
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.catalyst.trees.TreePattern.PLAN_EXPRESSION
 import org.apache.spark.sql.comet.CometExec
-import org.apache.spark.sql.execution.{ExecSubqueryExpression, ExpandExec, GenerateExec, ProjectExec, ScalarSubquery, SparkPlan, TakeOrderedAndProjectExec, UnionExec}
+import org.apache.spark.sql.execution.{BaseSubqueryExec, ExecSubqueryExpression, ExpandExec, GenerateExec, ProjectExec, ReusedSubqueryExec, ScalarSubquery, SparkPlan, TakeOrderedAndProjectExec, UnionExec}
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
@@ -1038,6 +1038,12 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
     }
   }
 
+  @scala.annotation.tailrec
+  private def materializedSubqueryId(plan: BaseSubqueryExec): Long = plan match {
+    case reused: ReusedSubqueryExec => materializedSubqueryId(reused.child)
+    case other => other.id.toLong
+  }
+
   override def convert(
       expr: ScalarSubquery,
       inputs: Seq[Attribute],
@@ -1056,6 +1062,9 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] with Com
       .newBuilder()
       .setId(expr.exprId.id)
       .setDatatype(dataType.get)
+    if (expr.dataType.isInstanceOf[StructType]) {
+      builder.setStructResultId(materializedSubqueryId(expr.plan))
+    }
     Some(ExprOuterClass.Expr.newBuilder().setSubquery(builder).build())
   }
 }
