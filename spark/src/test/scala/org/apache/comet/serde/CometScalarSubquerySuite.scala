@@ -20,9 +20,9 @@
 package org.apache.comet.serde
 
 import org.apache.spark.sql.{CometTestBase, Row}
-import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Cast, Coalesce, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, Expression, GetStructField, GreaterThanOrEqual, Hour, If, In, LessThan, Literal, NamedExpression, Not, OctetLength, Rand, TruncDate, UnixDate, WeekDay}
+import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Cast, Coalesce, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, Expression, GetStructField, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, NamedExpression, Not, OctetLength, Rand, TruncDate, UnixDate, WeekDay}
 import org.apache.spark.sql.comet.{CometScalarSubquery => NativeScalarSubquery}
-import org.apache.spark.sql.execution.{ProjectExec, ReusedSubqueryExec, ScalarSubquery, SubqueryExec}
+import org.apache.spark.sql.execution.{FilterExec, ProjectExec, ReusedSubqueryExec, ScalarSubquery, SubqueryExec}
 import org.apache.spark.sql.types._
 
 import org.apache.comet.CometSparkSessionExtensions.{isSpark40Plus, isSpark41Plus}
@@ -370,6 +370,65 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
       CometScalarSubquery
         .consumerFallbackReason(Hour(timestamp, Some("America/Los_Angeles")))
         .exists(_.contains("non-fixed timezones")))
+  }
+
+  test("wide scalar aliases retain a Spark row path through consumers") {
+    val text = GetStructField(subquery(struct(StringType)), 0)
+    val alias = Alias(text, "wide")()
+    val producer = ProjectExec(Seq(alias), emptyInput)
+    val consumer = FilterExec(IsNotNull(alias.toAttribute), producer)
+    val reduced = Alias(OctetLength(alias.toAttribute), "length")()
+    val reducer = ProjectExec(Seq(reduced), consumer)
+    val ancestor = ProjectExec(Seq(Alias(reduced.toAttribute, "result")()), reducer)
+    CometScalarSubquery.tagPlanInputs(ancestor)
+    assert(CometScalarSubquery.rowPathFallbackReason(producer).isDefined)
+    assert(CometScalarSubquery.rowPathFallbackReason(consumer).isDefined)
+    assert(CometScalarSubquery.rowPathFallbackReason(reducer).isDefined)
+    assert(CometScalarSubquery.rowPathFallbackReason(ancestor).isEmpty)
+    // Recompute on the same node: a standalone scalar projection retains its native contract.
+    CometScalarSubquery.tagPlanInputs(producer)
+    assert(CometScalarSubquery.rowPathFallbackReason(producer).isEmpty)
+  }
+
+  test("pure projections preserve bounded native producer batches") {
+    val scalar = Alias(subquery(struct(StringType)), "scalar")()
+    val producer = ProjectExec(Seq(scalar), emptyInput)
+    val field = Alias(GetStructField(scalar.toAttribute, 0), "text")()
+    val fields = ProjectExec(Seq(field), producer)
+    val reducer = ProjectExec(Seq(Alias(OctetLength(field.toAttribute), "length")()), fields)
+    CometScalarSubquery.tagPlanInputs(reducer)
+    Seq(producer, fields, reducer).foreach { plan =>
+      assert(CometScalarSubquery.rowPathFallbackReason(plan).isEmpty, plan)
+    }
+  }
+
+  test("retained numeric aliases check window values without evaluating frame data types") {
+    import org.apache.spark.sql.catalyst.expressions.{CurrentRow, RowFrame, RowNumber, SpecifiedWindowFrame, UnboundedPreceding, WindowExpression, WindowSpecDefinition}
+    import org.apache.spark.sql.catalyst.expressions.aggregate.CollectList
+    import org.apache.spark.sql.execution.window.WindowExec
+    val number = Alias(GetStructField(subquery(struct(LongType)), 0), "number")()
+    val producer = ProjectExec(Seq(number), emptyInput)
+    val spec = WindowSpecDefinition(
+      Seq(number.toAttribute),
+      Seq.empty,
+      SpecifiedWindowFrame(RowFrame, UnboundedPreceding, CurrentRow))
+    val rank = WindowExec(
+      Seq(Alias(WindowExpression(RowNumber(), spec), "rank")()),
+      Seq(number.toAttribute),
+      Seq.empty,
+      producer)
+    CometScalarSubquery.tagPlanInputs(rank)
+    assert(CometScalarSubquery.rowPathFallbackReason(rank).isEmpty)
+    val collect = WindowExec(
+      Seq(
+        Alias(
+          WindowExpression(CollectList(number.toAttribute).toAggregateExpression(), spec),
+          "values")()),
+      Seq(number.toAttribute),
+      Seq.empty,
+      producer)
+    CometScalarSubquery.tagPlanInputs(collect)
+    assert(CometScalarSubquery.rowPathFallbackReason(collect).isDefined)
   }
 
 }

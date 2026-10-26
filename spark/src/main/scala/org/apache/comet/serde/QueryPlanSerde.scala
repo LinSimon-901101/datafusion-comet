@@ -822,6 +822,16 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
       return None
     }
 
+    aggExpr.aggregateFunction.children.iterator
+      .flatMap(CometScalarSubquery.operatorArgumentFallbackReason)
+      .take(1)
+      .toSeq
+      .headOption
+      .foreach { reason =>
+        withFallbackReason(aggExpr, reason)
+        return None
+      }
+
     val fn = aggExpr.aggregateFunction
     val cometExpr = aggrSerdeMap.get(fn.getClass)
     val protoAggExprOpt = cometExpr match {
@@ -951,6 +961,20 @@ object QueryPlanSerde extends Logging with CometExprShim with CometTypeShim {
         }
       }
       result
+    }
+
+  /** Serialize a full-batch operator argument, rather than an ordinary projection output. */
+  def operatorExprToProto(
+      expr: Expression,
+      inputs: Seq[Attribute],
+      binding: Boolean = true): Option[Expr] =
+    CometExplainInfo.withExpressionFallbackReasonScope {
+      CometScalarSubquery.operatorArgumentFallbackReason(expr) match {
+        case Some(reason) =>
+          withFallbackReason(expr, reason)
+          None
+        case None => exprToProto(expr, inputs, binding)
+      }
     }
 
   /**

@@ -26,7 +26,7 @@ import org.apache.spark.sql.catalyst.expressions.{Alias, Attribute, BoundReferen
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.catalyst.trees.TreePattern.PLAN_EXPRESSION
 import org.apache.spark.sql.comet.CometExec
-import org.apache.spark.sql.execution.{ExecSubqueryExpression, ExpandExec, GenerateExec, ScalarSubquery, SparkPlan, UnionExec}
+import org.apache.spark.sql.execution.{ExecSubqueryExpression, ExpandExec, GenerateExec, ProjectExec, ScalarSubquery, SparkPlan, TakeOrderedAndProjectExec, UnionExec}
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec}
 import org.apache.spark.sql.execution.aggregate.BaseAggregateExec
 import org.apache.spark.sql.execution.exchange.ReusedExchangeExec
@@ -42,7 +42,58 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
 
   private val structSubqueryInputs =
     new TreeNodeTag[Set[ExprId]]("CometStructScalarSubqueryInputs")
+  private val structSubqueryInputBounds =
+    new TreeNodeTag[Map[ExprId, Long]]("CometStructScalarSubqueryInputBounds")
+  private val structSubqueryRowPath =
+    new TreeNodeTag[Boolean]("CometStructScalarSubqueryRowPath")
   private val currentStructSubqueryInputBounds = new DynamicVariable[Map[ExprId, Long]](Map.empty)
+  private val structSubqueryRowPathReason =
+    "Materialized variable-width struct scalar subquery aliases require Spark rows"
+
+  private[comet] def rowPathFallbackReason(plan: SparkPlan): Option[String] = {
+    if (!plan.getTagValue(structSubqueryRowPath).contains(true)) return None
+    val original = plan match {
+      case comet: CometExec => comet.originalPlan
+      case other => other
+    }
+    // Preserve a more specific expression diagnostic before the row-path safety gate.
+    val projected = original match {
+      case project: ProjectExec => project.projectList
+      case topK: TakeOrderedAndProjectExec => topK.projectList
+      case _ => Seq.empty
+    }
+    val reason = withPlanInputs(plan) {
+      projected.iterator.map(consumerFallbackReason).collectFirst { case Some(reason) =>
+        reason
+      }
+    }
+    reason
+      .orElse {
+        projected.iterator
+          .flatMap(_.collect { case e: Expression => e })
+          .flatMap { expr =>
+            QueryPlanSerde.exprSerdeMap.get(expr.getClass).flatMap { handler =>
+              handler.asInstanceOf[CometExpressionSerde[Expression]].getSupportLevel(expr) match {
+                case Unsupported(notes) => notes
+                case _ => None
+              }
+            }
+          }
+          .take(1)
+          .toSeq
+          .headOption
+      }
+      .orElse(Some(structSubqueryRowPathReason))
+  }
+
+  private def provenanceChildren(plan: SparkPlan): Seq[SparkPlan] = plan match {
+    case reused: ReusedExchangeExec => Seq(reused.child)
+    case stage: QueryStageExec => Seq(stage.plan)
+    case adaptive: AdaptiveSparkPlanExec => Seq(adaptive.executedPlan)
+    case comet: CometExec if comet.children.isEmpty => Seq(comet.originalPlan)
+    case other => other.children
+  }
+
   private val structSubqueryContext =
     new TreeNodeTag[Boolean]("CometStructScalarSubqueryContext")
   private val currentStructSubqueryInputs = new DynamicVariable[Set[ExprId]](Set.empty)
@@ -67,20 +118,24 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
       remember(plan, Set.empty)
       plan.unsetTagValue(structSubqueryInputs)
       plan.unsetTagValue(structSubqueryContext)
+      plan.unsetTagValue(structSubqueryInputBounds)
+      plan.unsetTagValue(structSubqueryRowPath)
 
       val original = plan match {
         case comet: CometExec => comet.originalPlan
         case other => other
       }
-      val children = plan match {
-        case reused: ReusedExchangeExec => Seq(reused.child)
-        case stage: QueryStageExec => Seq(stage.plan)
-        case adaptive: AdaptiveSparkPlanExec => Seq(adaptive.executedPlan)
-        case comet: CometExec if comet.children.isEmpty => Seq(comet.originalPlan)
-        case other => other.children
-      }
+      val children = provenanceChildren(plan)
       val childSources = children.map(visit)
       var sources = childSources.flatten.toSet
+      var bounds =
+        children.flatMap(_.getTagValue(structSubqueryInputBounds).getOrElse(Map.empty)).toMap
+      def boundFor(expression: Expression): Option[Long] =
+        currentStructSubqueryInputBounds.withValue(bounds)(boundedResultBytes(expression))
+      def rememberBound(id: ExprId, bound: Option[Long]): Unit = bound match {
+        case Some(bytes) => bounds += id -> bytes
+        case None => bounds -= id
+      }
       // A struct subquery can enable native conversion of both its operator and ancestors.
       // Keep that context even when a later projection drops the struct: sibling/ancestor
       // calendar consumers can still receive ordinary columns outside the native range.
@@ -102,6 +157,16 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
                 child.output.lift(ordinal).exists(a => ids.contains(a.exprId))
               }) {
               sources += output.exprId
+              val positionBounds = children.map { child =>
+                child.output.lift(ordinal).flatMap { attribute =>
+                  val known = child.getTagValue(structSubqueryInputBounds).getOrElse(Map.empty)
+                  currentStructSubqueryInputBounds.withValue(known)(boundedResultBytes(attribute))
+                }
+              }
+              rememberBound(
+                output.exprId,
+                if (positionBounds.forall(_.isDefined)) Some(positionBounds.flatten.max)
+                else None)
             }
           }
         case _ =>
@@ -111,8 +176,12 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
       var changed = true
       while (changed) {
         val previous = sources
+        val previousBounds = bounds
         named.foreach { expression =>
-          if (hasStructSubquerySource(expression, sources)) sources += expression.exprId
+          if (hasStructSubquerySource(expression, sources)) {
+            sources += expression.exprId
+            rememberBound(expression.exprId, boundFor(expression))
+          }
         }
         original match {
           case aggregate: BaseAggregateExec =>
@@ -137,10 +206,36 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
             }
           case _ =>
         }
-        changed = previous != sources
+        changed = previous != sources || previousBounds != bounds
       }
 
       plan.setTagValue(structSubqueryInputs, sources)
+      plan.setTagValue(structSubqueryInputBounds, bounds)
+      // ProjectionExec maps each input batch to one output batch, so a native producer's
+      // byte cap survives field reads and projecting retained aliases. Other operators can
+      // coalesce those batches again. Once they use Spark rows, keep wide consumers on rows
+      // until a projection drops or reduces the wide alias before re-entering Arrow.
+      def wideOutput(p: SparkPlan): Boolean = {
+        val ids = p.getTagValue(structSubqueryInputs).getOrElse(Set.empty)
+        val known = p.getTagValue(structSubqueryInputBounds).getOrElse(Map.empty)
+        currentStructSubqueryInputBounds.withValue(known) {
+          p.output.exists(a => ids.contains(a.exprId) && !fitsConsumerBatch(a))
+        }
+      }
+      val wideChildren = children.filter(wideOutput)
+      if (wideChildren.nonEmpty &&
+          (!original.isInstanceOf[ProjectExec] ||
+            wideChildren.exists(_.getTagValue(structSubqueryRowPath).contains(true)))) {
+        plan.setTagValue(structSubqueryRowPath, true)
+        // Avoid copying wide aliases into Arrow immediately before their Spark row consumer.
+        def keepWideInputsOnRows(p: SparkPlan): Unit = {
+          if (wideOutput(p)) {
+            p.setTagValue(structSubqueryRowPath, true)
+            provenanceChildren(p).foreach(keepWideInputsOnRows)
+          }
+        }
+        wideChildren.foreach(keepWideInputsOnRows)
+      }
       val outputs = plan.output.iterator.map(_.exprId).filter(sources.contains).toSet
       remember(plan, outputs)
       outputs
@@ -152,9 +247,12 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
   /** Keep the lineage local to this conversion, even when an attribute was copied or rebound. */
   private[comet] def withPlanInputs[T](plan: SparkPlan)(f: => T): T = {
     val inputs = plan.getTagValue(structSubqueryInputs).getOrElse(Set.empty)
-    currentStructSubqueryInputs.withValue(inputs) {
-      currentPlanHasStructSubquery.withValue(
-        plan.getTagValue(structSubqueryContext).getOrElse(false))(f)
+    val bounds = plan.getTagValue(structSubqueryInputBounds).getOrElse(Map.empty)
+    currentStructSubqueryInputBounds.withValue(bounds) {
+      currentStructSubqueryInputs.withValue(inputs) {
+        currentPlanHasStructSubquery.withValue(
+          plan.getTagValue(structSubqueryContext).getOrElse(false))(f)
+      }
     }
   }
 
@@ -280,6 +378,29 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
       case _ => false
     }
 
+  private def borrowedArray(expr: Expression): Boolean = expr match {
+    case _: Attribute | _: BoundReference => true
+    case _: Alias | _: KnownNotNull | _: KnownNullable | _: GetStructField | _: SortOrder =>
+      expr.children.forall(borrowedArray)
+    case _ => false
+  }
+
+  private def unprotectedBatchValue(expr: Expression, capped: Boolean): Boolean = {
+    val protectedBySource = capped || hasStructSubquery(expr)
+    (!protectedBySource && !fitsConsumerBatch(expr) && !borrowedArray(expr)) ||
+    expr.children.exists(unprotectedBatchValue(_, protectedBySource))
+  }
+
+  /** Physical accumulators and partitioners request their arguments as complete batch arrays. */
+  def operatorArgumentFallbackReason(expr: Expression): Option[String] =
+    if (hasStructSubqueryContext(expr) && unprotectedBatchValue(expr, capped = false)) {
+      Some("Unbounded operator siblings of struct scalar subqueries require Spark")
+    } else if (hasStructSubquery(expr) && !fitsConsumerBatch(expr)) {
+      Some("Variable-width struct scalar subquery operator arguments require Spark")
+    } else {
+      None
+    }
+
   /** Opaque JVM kernels cannot participate in the native consumer's bounded evaluation. */
   private[serde] def dispatchedConsumerFallbackReason(
       expr: Expression,
@@ -341,6 +462,32 @@ object CometScalarSubquery extends CometExpressionSerde[ScalarSubquery] {
       Some("Unreviewed consumers of expanded struct scalar subqueries require Spark")
     } else {
       None
+    }
+  }
+
+  /** Input slicing for one projected scalar also changes its independent siblings' batches. */
+  def projectionConsumerFallbackReason(
+      expressions: Seq[Expression],
+      protos: Seq[ExprOuterClass.Expr]): Option[String] = {
+    if (expressions.exists(hasStructSubqueryContext) &&
+      expressions.exists(unprotectedBatchValue(_, capped = false))) {
+      return Some("Unbounded projection siblings of struct scalar subqueries require Spark")
+    }
+    val source = expressions.find(e => hasStructSubquery(e) && !fitsConsumerBatch(e))
+    source.flatMap { context =>
+      if (expressions.exists(!_.deterministic)) {
+        Some("Nondeterministic siblings of variable-width struct scalar subqueries require Spark")
+      } else {
+        protos.iterator
+          .flatMap { proto =>
+            // The materialized scalar controls slicing for every sibling in this projection.
+            dispatchedConsumerFallbackReason(context, proto)
+              .orElse(unknownConsumerFallbackReason(context, proto))
+          }
+          .take(1)
+          .toSeq
+          .headOption
+      }
     }
   }
 

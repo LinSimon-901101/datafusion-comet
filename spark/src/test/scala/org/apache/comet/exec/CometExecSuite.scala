@@ -3615,10 +3615,77 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar review direct wide fields stay bounded at aggregate and shuffle boundaries") {
+    withScalarReviewTables {
+      checkSparkAnswer(
+        "SELECT id % 2 AS k, count((SELECT max(s) FROM review_wide)), " +
+          "count((SELECT min(s) FROM review_wide)) FROM review_outer GROUP BY id % 2")
+      checkSparkAnswer(
+        "SELECT id FROM review_outer DISTRIBUTE BY " +
+          "(SELECT max(s) FROM review_wide), (SELECT min(s) FROM review_wide)")
+    }
+  }
+
   test("scalar review integer division does not disable bounded IF evaluation") {
     withScalarReviewTables {
       checkSparkAnswer("SELECT id, octet_length(IF(id DIV 2 >= 0, " +
         "(SELECT max(s) FROM review_wide), (SELECT min(s) FROM review_wide))) FROM review_outer")
+    }
+  }
+
+  test("scalar review pure projections preserve bounded retained wide aliases") {
+    withScalarReviewTables {
+      // Reusing a non-cheap scalar source prevents CollapseProject from inlining the alias.
+      val query = "SELECT id, octet_length(s), ascii(s), octet_length(m) FROM " +
+        "(SELECT id, (SELECT max(s) FROM review_wide) s, " +
+        "(SELECT min(s) FROM review_wide) m FROM review_outer) q"
+      val df = sql(query)
+      checkSparkAnswer(df)
+      val projects = df.queryExecution.executedPlan.collect { case p: CometProjectExec => p }
+      assert(projects.size >= 2, df.queryExecution.executedPlan)
+    }
+  }
+
+  test("scalar review row consumers avoid materializing retained wide aliases") {
+    withScalarReviewTables {
+      val source = "(SELECT id, (SELECT max(s) FROM review_wide) s, " +
+        "(SELECT min(s) FROM review_wide) m FROM review_outer) q"
+      Seq(
+        "SELECT count(s), sum(octet_length(s)), sum(octet_length(m)) FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), " +
+          "coalesce(IF(rand(42L) > 0.5, 1L, CAST(NULL AS BIGINT)), id) FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), rand(42L) FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), " +
+          "round(CAST(id AS DOUBLE) / 3D, 1) FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), " +
+          "CAST(id + 1 AS DOUBLE) / 3D FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), " +
+          "regexp_extract(CAST(id AS STRING), '(.)', 1) FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), " +
+          "size(filter(array(id, id + 1), x -> x >= 0)) FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), " +
+          "octet_length(unhex(hex(id))) FROM " + source,
+        "SELECT id, octet_length(s), ascii(s), octet_length(m), r FROM " +
+          "(SELECT id, (SELECT max(s) FROM review_wide) s, " +
+          "(SELECT min(s) FROM review_wide) m, rand(42L) r FROM review_outer) q")
+        .foreach { query =>
+          val df = sql(query)
+          checkSparkAnswer(df)
+          assert(
+            df.queryExecution.executedPlan.exists {
+              case p: ProjectExec => p.projectList.exists(_.name == "s")
+              case _ => false
+            },
+            df.queryExecution.executedPlan)
+        }
+      withSQLConf("spark.comet.expression.Ascii.enabled" -> "false") {
+        val df = sql("SELECT id, octet_length(s), ascii(s), octet_length(m) FROM " + source)
+        checkSparkAnswer(df)
+        assert(df.queryExecution.executedPlan.exists {
+          case p: ProjectExec => p.projectList.exists(_.name == "s")
+          case _ => false
+        })
+      }
     }
   }
 

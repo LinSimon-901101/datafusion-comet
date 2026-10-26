@@ -64,7 +64,7 @@ import org.apache.comet.rules.CometExecRule
 import org.apache.comet.serde.{CometCollectBuffer, CometOperatorSerde, Compatible, OperatorOuterClass, QueryContextInterner, SupportLevel, Unsupported}
 import org.apache.comet.serde.OperatorOuterClass.{AggregateMode => CometAggregateMode, Operator}
 import org.apache.comet.serde.QueryPlanSerde
-import org.apache.comet.serde.QueryPlanSerde.{aggExprToProto, exprToProto, hasNonDefaultStringCollation, isStringCollationType, supportedSortType}
+import org.apache.comet.serde.QueryPlanSerde.{aggExprToProto, exprToProto, hasNonDefaultStringCollation, isStringCollationType, operatorExprToProto, supportedSortType}
 import org.apache.comet.serde.operator.CometSink
 import org.apache.comet.shims.MergeRowsMetricsShim
 
@@ -1437,6 +1437,14 @@ object CometProjectExec extends CometOperatorSerde[ProjectExec] {
       builder: Operator.Builder,
       childOp: Operator*): Option[OperatorOuterClass.Operator] = {
     val exprs = op.projectList.map(exprToProto(_, op.child.output))
+    if (exprs.forall(_.isDefined)) {
+      org.apache.comet.serde.CometScalarSubquery
+        .projectionConsumerFallbackReason(op.projectList, exprs.map(_.get))
+        .foreach { reason =>
+          withFallbackReason(op, reason)
+          return None
+        }
+    }
 
     if (exprs.forall(_.isDefined) && childOp.nonEmpty) {
       val projectBuilder = OperatorOuterClass.Projection
@@ -1571,7 +1579,7 @@ object CometSortExec extends CometOperatorSerde[SortExec] {
       return None
     }
 
-    val sortOrders = op.sortOrder.map(exprToProto(_, op.child.output))
+    val sortOrders = op.sortOrder.map(operatorExprToProto(_, op.child.output))
 
     if (sortOrders.forall(_.isDefined) && childOp.nonEmpty) {
       val sortBuilder = OperatorOuterClass.Sort
@@ -1776,7 +1784,7 @@ object CometExpandExec extends CometOperatorSerde[ExpandExec] {
       withFallbackReason(op, "Expand without output columns is not supported")
       return None
     }
-    val projExprs = op.projections.flatMap(_.map(e => exprToProto(e, op.child.output)))
+    val projExprs = op.projections.flatMap(_.map(e => operatorExprToProto(e, op.child.output)))
 
     if (projExprs.forall(_.isDefined) && childOp.nonEmpty) {
       val expandBuilder = OperatorOuterClass.Expand
@@ -1944,7 +1952,7 @@ object CometExplodeExec extends CometOperatorSerde[GenerateExec] {
       builder: Operator.Builder,
       childOp: OperatorOuterClass.Operator*): Option[OperatorOuterClass.Operator] = {
     val childExpr = op.generator.children.head
-    val childExprProto = exprToProto(childExpr, op.child.output)
+    val childExprProto = operatorExprToProto(childExpr, op.child.output)
 
     if (childExprProto.isEmpty) {
       return None
@@ -2284,6 +2292,16 @@ trait CometBaseAggregate[T <: BaseAggregateExec] extends CometOperatorSerde[T] {
       withFallbackReason(aggregate, "Grouping on non-default collated strings is not supported")
       return None
     }
+
+    groupingExpressions.iterator
+      .flatMap(org.apache.comet.serde.CometScalarSubquery.operatorArgumentFallbackReason)
+      .take(1)
+      .toSeq
+      .headOption
+      .foreach { reason =>
+        withFallbackReason(aggregate, reason)
+        return None
+      }
 
     val groupingExprsWithInput =
       groupingExpressions.map(expr => expr.name -> exprToProto(expr, child.output))
@@ -2928,8 +2946,8 @@ trait CometHashJoin {
       }
     }
 
-    val leftKeys = join.leftKeys.map(exprToProto(_, join.left.output))
-    val rightKeys = join.rightKeys.map(exprToProto(_, join.right.output))
+    val leftKeys = join.leftKeys.map(operatorExprToProto(_, join.left.output))
+    val rightKeys = join.rightKeys.map(operatorExprToProto(_, join.right.output))
 
     // Spark reports the streamed side's order as the join's, and drops a sort above the join
     // that it satisfies. DataFusion's hash join keeps the unmatched probe rows of a right outer
@@ -3633,8 +3651,8 @@ object CometSortMergeJoinExec extends CometOperatorSerde[SortMergeJoinExec] {
       return None
     }
 
-    val leftKeys = join.leftKeys.map(exprToProto(_, join.left.output))
-    val rightKeys = join.rightKeys.map(exprToProto(_, join.right.output))
+    val leftKeys = join.leftKeys.map(operatorExprToProto(_, join.left.output))
+    val rightKeys = join.rightKeys.map(operatorExprToProto(_, join.right.output))
 
     val sortOptions = getKeyOrdering(join.leftKeys, join.left.outputOrdering)
       .map(exprToProto(_, join.left.output))

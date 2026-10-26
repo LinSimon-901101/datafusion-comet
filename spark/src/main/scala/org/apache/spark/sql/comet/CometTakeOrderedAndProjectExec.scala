@@ -34,7 +34,7 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.comet.{CometConf, ConfigEntry}
 import org.apache.comet.CometSparkSessionExtensions.isCometShuffleEnabled
 import org.apache.comet.serde.{Compatible, OperatorOuterClass, SupportLevel, Unsupported}
-import org.apache.comet.serde.QueryPlanSerde.{exprToProto, supportedSortType, withSharedSubexpressions}
+import org.apache.comet.serde.QueryPlanSerde.{exprToProto, operatorExprToProto, supportedSortType, withSharedSubexpressions}
 import org.apache.comet.serde.operator.CometSink
 
 object CometTakeOrderedAndProjectExec extends CometSink[TakeOrderedAndProjectExec] {
@@ -46,15 +46,20 @@ object CometTakeOrderedAndProjectExec extends CometSink[TakeOrderedAndProjectExe
     if (!isCometShuffleEnabled(op.conf)) {
       return Unsupported(Some("TakeOrderedAndProject requires shuffle to be enabled"))
     }
-    op.projectList.foreach { p =>
+    val projectProtos = op.projectList.map { p =>
       val o = exprToProto(p, op.child.output)
       if (o.isEmpty) {
         return Unsupported(Some(s"unsupported projection: $p"))
       }
-      o
+      o.get
     }
+    org.apache.comet.serde.CometScalarSubquery
+      .projectionConsumerFallbackReason(op.projectList, projectProtos)
+      .foreach { reason =>
+        return Unsupported(Some(reason))
+      }
     op.sortOrder.foreach { s =>
-      val o = exprToProto(s, op.child.output)
+      val o = operatorExprToProto(s, op.child.output)
       if (o.isEmpty) {
         return Unsupported(Some(s"unsupported sort order: $s"))
       }

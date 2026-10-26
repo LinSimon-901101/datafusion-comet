@@ -155,7 +155,7 @@ object CometArrowEvalPythonExec extends CometOperatorSerde[ArrowEvalPythonExec] 
         case other => (other, "")
       }
       val argProtos = args.map { case (expr, _) =>
-        QueryPlanSerde.exprToProto(expr, op.child.output)
+        QueryPlanSerde.operatorExprToProto(expr, op.child.output)
       }
       val returnType = QueryPlanSerde.serializeDataType(attr.dataType)
       if (argProtos.exists(_.isEmpty) || returnType.isEmpty) {

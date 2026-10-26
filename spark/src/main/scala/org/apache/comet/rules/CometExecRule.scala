@@ -433,7 +433,29 @@ case class CometExecRule(session: SparkSession, queryStagePrep: Boolean = false)
       tagPartiallyReadTypedDatasetOutputs(plan)
     }
 
+    def restoreScalarRowPath(op: SparkPlan): SparkPlan = op match {
+      // A previous pass can hide a row operator behind a scan or Arrow bridge. Peel these
+      // roots, but keep an untagged native producer and its bounded batches intact.
+      case bridge: CometSparkToColumnarExec => restoreScalarRowPath(bridge.child)
+      case wrapper: CometScanWrapper => restoreScalarRowPath(wrapper.originalPlan)
+      case holder: CometSinkPlaceHolder => restoreScalarRowPath(holder.child)
+      case exchange: CometShuffleExchangeExec
+          if ScalarSubquerySerde.rowPathFallbackReason(exchange).isDefined =>
+        exchange.originalPlan.withNewChildren(exchange.children)
+      case exchange: CometBroadcastExchangeExec
+          if ScalarSubquerySerde.rowPathFallbackReason(exchange).isDefined =>
+        exchange.originalPlan.withNewChildren(exchange.children)
+      case comet: CometExec if ScalarSubquerySerde.rowPathFallbackReason(comet).isDefined =>
+        comet.sparkFallback(comet.children)
+      case other => other
+    }
+
     def convertNode(op: SparkPlan): SparkPlan = op match {
+      case op if ScalarSubquerySerde.rowPathFallbackReason(op).isDefined =>
+        withFallbackReason(
+          restoreScalarRowPath(op),
+          ScalarSubquerySerde.rowPathFallbackReason(op).get)
+
       // Scan marker produced by an optional, out-of-tree scan contrib (e.g. contrib/delta).
       // Matched by trait (no compile-time dependency on the contrib) and present only when that
       // contrib is on the classpath. The marker carries its own serde handler and typically wraps

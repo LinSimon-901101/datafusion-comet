@@ -33,7 +33,7 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import org.apache.comet.serde.OperatorOuterClass
 import org.apache.comet.serde.OperatorOuterClass.Operator
-import org.apache.comet.serde.QueryPlanSerde.{exprToProto, serializeDataType}
+import org.apache.comet.serde.QueryPlanSerde.{exprToProto, operatorExprToProto, serializeDataType}
 
 object CometExecUtils {
 
@@ -89,6 +89,12 @@ object CometExecUtils {
       inputAttributes: Seq[Attribute],
       input: Operator): Option[Operator] = {
     val exprs = projectList.map(exprToProto(_, inputAttributes))
+    if (exprs.forall(_.isDefined) &&
+      org.apache.comet.serde.CometScalarSubquery
+        .projectionConsumerFallbackReason(projectList, exprs.map(_.get))
+        .isDefined) {
+      return None
+    }
     if (exprs.forall(_.isDefined)) {
       val projection = OperatorOuterClass.Projection.newBuilder()
       projection.addAllProjectList(exprs.map(_.get).asJava)
@@ -148,7 +154,7 @@ object CometExecUtils {
     if (scanTypes.length == outputAttributes.length) {
       scanBuilder.addAllFields(scanTypes.asJava)
 
-      val sortOrders = sortOrder.map(exprToProto(_, child.output))
+      val sortOrders = sortOrder.map(operatorExprToProto(_, child.output))
 
       if (sortOrders.forall(_.isDefined)) {
         val sortBuilder = OperatorOuterClass.Sort.newBuilder()

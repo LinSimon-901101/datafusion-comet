@@ -54,6 +54,10 @@ pub struct ScalarSubqueryConsumer {
 const SCALAR_INPUT_BYTES: usize = 1024 * 1024;
 
 impl ScalarSubqueryConsumer {
+    pub fn inner(&self) -> &Arc<dyn PhysicalExpr> {
+        &self.inner
+    }
+
     /// Keep direct struct output metric labels bounded. Apply only at a projection root,
     /// after field selection and input sizing have inspected the original literal.
     pub fn wrap_projection_literal(
@@ -73,6 +77,44 @@ impl ScalarSubqueryConsumer {
         } else {
             inner
         }
+    }
+
+    /// Let a later projection inline a retained whole-struct alias before broadcasting it.
+    pub fn projection_literal(&self) -> Option<Arc<dyn PhysicalExpr>> {
+        self.inner
+            .downcast_ref::<Literal>()
+            .filter(|literal| Subquery::is_resolved_struct_literal(literal))
+            .map(|_| Arc::clone(&self.inner))
+    }
+
+    /// Inlining retires an input cap. Marked roots regain their consumer guard; unmarked
+    /// siblings must be pure and fit a full batch without relying on the retired cap.
+    pub fn supports_sliced_evaluation(
+        expr: &Arc<dyn PhysicalExpr>,
+        schema: &Schema,
+        batch_size: usize,
+    ) -> bool {
+        consumer_properties(expr, schema).is_some_and(|properties| {
+            properties.has_scalar_struct
+                || (!properties.unbounded_output
+                    && properties.bytes <= SCALAR_INPUT_BYTES / batch_size.max(1))
+        })
+    }
+
+    /// Cap a producing projection's input before a scalar value becomes an output column.
+    /// Reducing expressions and ordinary literals/columns retain their normal batch size.
+    pub fn projection_max_rows(expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> Option<usize> {
+        let properties = consumer_properties(expr, schema)?;
+        if !properties.has_scalar_struct
+            || fixed_width_bytes(&expr.data_type(schema).ok()?).is_some()
+        {
+            return None;
+        }
+        Some(
+            bounded_output_bytes(expr, schema)
+                .map(|bytes| (SCALAR_INPUT_BYTES / bytes.max(1)).max(1))
+                .unwrap_or(1),
+        )
     }
 
     pub fn wrap(inner: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
