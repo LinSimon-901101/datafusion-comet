@@ -34,9 +34,16 @@ SELECT unix_timestamp(s, fmt) FROM test_unix_ts_fallback
 query expect_fallback(spark.comet.exec.scalaUDF.codegen.enabled)
 SELECT unix_timestamp('2024-06-15', 'yyyy-MM-dd')
 
--- Date and timestamp inputs keep their native path and ignore the format.
+-- Timestamp inputs keep their native path and ignore the format.
 query expect_native(unix_timestamp)
-SELECT unix_timestamp(d), unix_timestamp(ts), unix_timestamp(ntz) FROM test_unix_ts_fallback
+SELECT unix_timestamp(ts), unix_timestamp(ntz) FROM test_unix_ts_fallback
 
 query expect_native(unix_timestamp)
-SELECT unix_timestamp(d, fmt), unix_timestamp(ts, fmt), unix_timestamp(ntz, fmt) FROM test_unix_ts_fallback
+SELECT unix_timestamp(ts, fmt), unix_timestamp(ntz, fmt) FROM test_unix_ts_fallback
+
+-- Existing date columns retain the native route, including an ignored format.
+query expect_native(unix_timestamp)
+SELECT unix_timestamp(d) FROM test_unix_ts_fallback
+
+query expect_native(unix_timestamp)
+SELECT unix_timestamp(d, fmt) FROM test_unix_ts_fallback

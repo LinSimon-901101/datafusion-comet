@@ -20,7 +20,7 @@
 package org.apache.comet.serde
 
 import org.apache.spark.sql.{CometTestBase, Row}
-import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Ascending, AttributeReference, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, ConcatWs, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, FromUTCTimestamp, GetStructField, GreaterThan, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Minute, Murmur3Hash, NamedExpression, Not, OctetLength, PreciseTimestampConversion, Rand, Round, Second, SecondsToTimestamp, SortOrder, StringLPad, StringRepeat, StringRPad, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, WeekDay, XxHash64}
+import org.apache.spark.sql.catalyst.expressions.{Add, Alias, Ascending, AttributeReference, BloomFilterMightContain, BoundReference, CaseWhen, Cast, Coalesce, ConcatWs, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, EvalMode, Expression, FromUTCTimestamp, GetStructField, GreaterThan, GreaterThanOrEqual, Hour, If, In, IsNotNull, LessThan, Literal, Minute, Murmur3Hash, NamedExpression, Not, OctetLength, PreciseTimestampConversion, Rand, Round, Second, SecondsToTimestamp, SortOrder, StringLPad, StringRepeat, StringRPad, ToUTCTimestamp, TruncDate, TruncTimestamp, UnixDate, UnixTimestamp, WeekDay, XxHash64}
 import org.apache.spark.sql.comet.{CometScalarSubquery => NativeScalarSubquery}
 import org.apache.spark.sql.execution.{FilterExec, ProjectExec, ReusedSubqueryExec, ScalarSubquery, SubqueryExec}
 import org.apache.spark.sql.types._
@@ -833,6 +833,50 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
               val input = nativeClockInput(clock, proto.get)
               assert(input.hasJvmScalarUdf == dispatchedChild, s"$clock: $input")
             }
+          }
+        }
+      }
+    }
+  }
+
+  test("unix_timestamp keeps date columns native and dispatches potentially scalar dates") {
+    val id = AttributeReference("id", IntegerType)()
+    for {
+      enabled <- Seq(false, true)
+      zone <- Seq("UTC", "+01:00", "America/Los_Angeles")
+      dt <- Seq(DateType, TimestampType, TimestampNTZType)
+    } {
+      withSQLConf(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key -> enabled.toString) {
+        val column = AttributeReference("value", dt)()
+        val scalar =
+          if (dt == DateType) Literal.create(Int.MaxValue, dt)
+          else Literal.create(Long.MaxValue, dt)
+        val children = Seq(
+          column,
+          scalar,
+          Literal.create(null, dt),
+          If(GreaterThan(id, Literal(0)), scalar, column))
+        children.foreach { child =>
+          val unix = UnixTimestamp(child, Literal("yyyy-MM-dd"), Some(zone), failOnError = false)
+          assert(CometScalarSubquery.consumerFallbackReason(unix).isEmpty)
+          val (proto, reasons) =
+            QueryPlanSerde.exprToProtoWithFallbackReasons(Alias(unix, "epoch")(), Seq(id, column))
+          if (dt != DateType || (child eq column)) {
+            assert(proto.exists(_.hasUnixTimestamp), s"$unix: $proto $reasons")
+            assert(reasons.isEmpty, reasons)
+            if (child eq column) assert(proto.get.getUnixTimestamp.getChild.hasBound)
+          } else if (enabled) {
+            assert(proto.exists(_.hasJvmScalarUdf), s"$unix: $proto $reasons")
+            assert(reasons.isEmpty, reasons)
+          } else {
+            assert(proto.isEmpty, unix)
+            assert(
+              reasons.exists(_.contains(
+                "date inputs that may be scalar require Spark for checked timezone conversion")),
+              reasons)
+            assert(
+              reasons.exists(_.contains(CometConf.COMET_SCALA_UDF_CODEGEN_ENABLED.key)),
+              reasons)
           }
         }
       }

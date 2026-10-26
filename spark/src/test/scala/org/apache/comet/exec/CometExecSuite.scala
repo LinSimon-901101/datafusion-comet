@@ -4536,6 +4536,26 @@ class CometExecSuite extends CometTestBase {
     }
   }
 
+  test("scalar review date unix timestamp preserves overflow and regional midnight") {
+    withScalarReviewTables {
+      withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "UTC") {
+        val query = "SELECT unix_timestamp(IF(id > 0, date_from_unix_date(2147483647), " +
+          "date_from_unix_date(id))) FROM review_items"
+        val (expected, actual) = checkSparkAnswerMaybeThrows(sql(query))
+        assert(expected.isDefined && actual.isDefined, s"$expected / $actual")
+        Seq(expected.get, actual.get).foreach { error =>
+          assert(causeChain(error).exists(_.getMessage.contains("long overflow")), error)
+        }
+      }
+      withSQLConf(SQLConf.SESSION_LOCAL_TIMEZONE.key -> "America/Los_Angeles") {
+        val query = "SELECT unix_timestamp(IF(id > 0, DATE '2200-07-01', " +
+          "date_from_unix_date(id))) FROM review_items"
+        checkSparkAnswer(query)
+        checkAnswer(sql(query), Seq(Row(7273782000L), Row(7273782000L)))
+      }
+    }
+  }
+
   test("scalar review direct wide fields stay bounded at aggregate and shuffle boundaries") {
     withScalarReviewTables {
       checkSparkAnswer(
