@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::Subquery;
 use arrow::array::{Array, ArrayRef, StructArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -23,12 +24,12 @@ use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_expr::{expressions::Literal, PhysicalExpr};
 use datafusion_comet_common::child_with_parent_nulls;
 use std::{
-    fmt::{Display, Formatter},
+    fmt::{Debug, Display, Formatter},
     hash::Hash,
     sync::Arc,
 };
 
-#[derive(Debug, Eq)]
+#[derive(Eq)]
 pub struct GetStructField {
     child: Arc<dyn PhysicalExpr>,
     ordinal: usize,
@@ -53,7 +54,7 @@ impl GetStructField {
 
     /// Read only an already-materialized literal field for consumer sizing. Do not evaluate
     /// expressions or include unrelated sibling fields in the repeated-input estimate.
-    pub(crate) fn literal_field(&self) -> Option<ArrayRef> {
+    pub fn literal_field(&self) -> Option<ArrayRef> {
         let value: ArrayRef = if let Some(literal) = self.child.downcast_ref::<Literal>() {
             let ScalarValue::Struct(value) = literal.value() else {
                 return None;
@@ -67,6 +68,16 @@ impl GetStructField {
             return None;
         }
         child_with_parent_nulls(structure, self.ordinal).ok()
+    }
+
+    pub(crate) fn is_subquery_field(&self) -> bool {
+        if let Some(literal) = self.child.downcast_ref::<Literal>() {
+            Subquery::is_resolved_struct_literal(literal)
+        } else {
+            self.child
+                .downcast_ref::<Self>()
+                .is_some_and(Self::is_subquery_field)
+        }
     }
 
     fn broadcast_field(child: ArrayRef, rows: usize) -> DataFusionResult<ColumnarValue> {
@@ -160,11 +171,34 @@ impl PhysicalExpr for GetStructField {
 
 impl Display for GetStructField {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.is_subquery_field() {
+            // DataFusion retains fmt_sql output in expression metric labels. Repeating the
+            // whole merged value here would retain every sibling once per field read.
+            write!(f, "GetStructField [child: ")?;
+            if let Some(parent) = self.child.downcast_ref::<Self>() {
+                Display::fmt(parent, f)?;
+            } else {
+                write!(f, "resolved struct scalar subquery")?;
+            }
+            return write!(f, ", ordinal: {}]", self.ordinal);
+        }
         write!(
             f,
             "GetStructField [child: {:?}, ordinal: {:?}]",
             self.child, self.ordinal
         )
+    }
+}
+
+impl Debug for GetStructField {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.is_subquery_field() {
+            return Display::fmt(self, f);
+        }
+        f.debug_struct("GetStructField")
+            .field("child", &self.child)
+            .field("ordinal", &self.ordinal)
+            .finish()
     }
 }
 

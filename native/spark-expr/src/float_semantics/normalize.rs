@@ -23,7 +23,7 @@ use arrow::array::{
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Float32Type, Float64Type, Schema};
 use arrow::record_batch::RecordBatch;
-use datafusion::common::{Result, ScalarValue};
+use datafusion::common::{metadata::FieldMetadata, Result, ScalarValue};
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_expr::expressions::Literal;
 use datafusion::physical_expr::PhysicalExpr;
@@ -233,7 +233,12 @@ pub fn normalize_comparison_operand(
             }
             _ => return Ok(operand),
         };
-        return Ok(Arc::new(Literal::new(normalized)));
+        return Ok(Arc::new(Literal::new_with_metadata(
+            normalized,
+            Some(FieldMetadata::new_from_field(
+                literal.return_field(schema)?.as_ref(),
+            )),
+        )));
     }
     let operand = NormalizeNaNAndZero::wrap_if_needed(operand, schema)?;
     NormalizeNestedFloats::wrap_if_needed(operand, schema)
@@ -881,5 +886,33 @@ mod tests {
         assert_eq!(flat.value(1).to_bits(), f64::NAN.to_bits());
         assert_eq!(flat.value(2), 1.0);
         assert_eq!(flat.value(3).to_bits(), 0.0f64.to_bits());
+    }
+
+    #[test]
+    fn normalized_literals_preserve_subquery_provenance() {
+        use crate::Subquery;
+        use arrow::array::StringArray;
+        let value = ScalarValue::Struct(Arc::new(StructArray::new(
+            vec![
+                Field::new("s", DataType::Utf8, true),
+                Field::new("f", DataType::Float64, true),
+            ]
+            .into(),
+            vec![
+                Arc::new(StringArray::from(vec!["wide"])),
+                Arc::new(Float64Array::from(vec![-0.0])),
+            ],
+            None,
+        )));
+        for subquery in [false, true] {
+            let literal: Arc<dyn PhysicalExpr> = Arc::new(if subquery {
+                Subquery::resolved_struct_literal(value.clone())
+            } else {
+                Literal::new(value.clone())
+            });
+            let normalized = normalize_comparison_operand(literal, &Schema::empty()).unwrap();
+            let normalized = normalized.downcast_ref::<Literal>().unwrap();
+            assert_eq!(Subquery::is_resolved_struct_literal(normalized), subquery);
+        }
     }
 }

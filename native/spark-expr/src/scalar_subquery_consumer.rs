@@ -24,7 +24,7 @@ use crate::{
 };
 use arrow::array::{new_empty_array, Array, ArrayData, ArrayRef};
 use arrow::compute::concat;
-use arrow::datatypes::{DataType, FieldRef, Schema};
+use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion::common::{exec_err, internal_err, Result, ScalarValue};
 use datafusion::logical_expr::{ColumnarValue, Volatility};
@@ -32,7 +32,7 @@ use datafusion::physical_expr::expressions::{
     BinaryExpr, CastExpr, Column, InListExpr, IsNotNullExpr, IsNullExpr, LikeExpr, Literal, NotExpr,
 };
 use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -41,11 +41,12 @@ use std::sync::Arc;
 /// GetStructField retains its batch-sized array contract. Constant consumers run on one row;
 /// pure row-dependent consumers run on bounded slices before their results are concatenated.
 /// Nothing is evaluated during planning, preserving conditional and ANSI NULL short-circuiting.
-#[derive(Debug, Eq)]
+#[derive(Eq)]
 pub struct ScalarSubqueryConsumer {
     inner: Arc<dyn PhysicalExpr>,
     constant: bool,
     max_rows: usize,
+    input_schema: SchemaRef,
 }
 
 // Limit repeated scalar input payload, not the size of the user's final output. A single scalar
@@ -53,7 +54,35 @@ pub struct ScalarSubqueryConsumer {
 const SCALAR_INPUT_BYTES: usize = 1024 * 1024;
 
 impl ScalarSubqueryConsumer {
+    /// Keep direct struct output metric labels bounded. Apply only at a projection root,
+    /// after field selection and input sizing have inspected the original literal.
+    pub fn wrap_projection_literal(
+        inner: Arc<dyn PhysicalExpr>,
+        schema: SchemaRef,
+    ) -> Arc<dyn PhysicalExpr> {
+        if inner
+            .downcast_ref::<Literal>()
+            .is_some_and(Subquery::is_resolved_struct_literal)
+        {
+            Arc::new(Self {
+                inner,
+                constant: true,
+                max_rows: 1,
+                input_schema: schema,
+            })
+        } else {
+            inner
+        }
+    }
+
     pub fn wrap(inner: Arc<dyn PhysicalExpr>) -> Arc<dyn PhysicalExpr> {
+        Self::wrap_with_schema(inner, Arc::new(Schema::empty()))
+    }
+
+    pub fn wrap_with_schema(
+        inner: Arc<dyn PhysicalExpr>,
+        input_schema: SchemaRef,
+    ) -> Arc<dyn PhysicalExpr> {
         // Keep literals and direct field chains visible so a narrow field can be selected
         // before broadcasting. A field read over a computed struct is itself a consumer.
         if inner.is::<Literal>()
@@ -70,6 +99,7 @@ impl ScalarSubqueryConsumer {
             {
                 return Arc::new(Self {
                     inner,
+                    input_schema,
                     constant: properties.constant,
                     max_rows: if properties.unbounded_output {
                         1
@@ -93,13 +123,13 @@ struct ConsumerProperties {
 /// Explicitly recognize pure row-local trees. Unknown nodes and volatile functions cannot safely
 /// be evaluated on a different batch. Columns require sliced evaluation.
 fn consumer_properties(expr: &Arc<dyn PhysicalExpr>) -> Option<ConsumerProperties> {
-    if let Some(value) = expr
+    if let Some((field, value)) = expr
         .downcast_ref::<GetStructField>()
-        .and_then(GetStructField::literal_field)
+        .and_then(|field| field.literal_field().map(|value| (field, value)))
     {
         return Some(ConsumerProperties {
             constant: true,
-            has_scalar_struct: true,
+            has_scalar_struct: field.is_subquery_field(),
             bytes: variable_bytes(&value.to_data()),
             unbounded_output: false,
         });
@@ -113,7 +143,7 @@ fn consumer_properties(expr: &Arc<dyn PhysicalExpr>) -> Option<ConsumerPropertie
         };
         return Some(ConsumerProperties {
             constant: true,
-            has_scalar_struct: matches!(literal.value(), ScalarValue::Struct(_)),
+            has_scalar_struct: Subquery::is_resolved_struct_literal(literal),
             bytes,
             unbounded_output: false,
         });
@@ -226,7 +256,6 @@ fn consumer_properties(expr: &Arc<dyn PhysicalExpr>) -> Option<ConsumerPropertie
     {
         return None;
     }
-    properties.has_scalar_struct |= expr.is::<GetStructField>() && properties.constant;
     Some(properties)
 }
 
@@ -261,13 +290,29 @@ impl PartialEq for ScalarSubqueryConsumer {
 
 impl Display for ScalarSubqueryConsumer {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ScalarSubqueryConsumer({})", self.inner)
+        let operation = self
+            .inner
+            .downcast_ref::<ScalarFunctionExpr>()
+            .map_or("expression", ScalarFunctionExpr::name);
+        // Whole-struct consumers also reach DataFusion's retained metric labels. Keep the
+        // operation and evaluation shape, without formatting owned scalar payloads.
+        write!(
+            f,
+            "ScalarSubqueryConsumer [operation: {operation}, type: {:?}, constant: {}, max_rows: {}]",
+            self.inner.data_type(&self.input_schema), self.constant, self.max_rows
+        )
+    }
+}
+
+impl Debug for ScalarSubqueryConsumer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(self, f)
     }
 }
 
 impl PhysicalExpr for ScalarSubqueryConsumer {
     fn fmt_sql(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        self.inner.fmt_sql(f)
+        Display::fmt(self, f)
     }
 
     fn data_type(&self, input_schema: &Schema) -> Result<DataType> {
@@ -353,6 +398,9 @@ impl PhysicalExpr for ScalarSubqueryConsumer {
             datafusion::common::internal_datafusion_err!("Expected one scalar subquery consumer")
         })?;
         // Recheck after rewrites: constant and row-dependent consumers need different evaluation.
-        Ok(Self::wrap(inner))
+        Ok(Self::wrap_with_schema(
+            inner,
+            Arc::clone(&self.input_schema),
+        ))
     }
 }

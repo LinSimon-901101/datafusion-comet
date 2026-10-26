@@ -52,7 +52,7 @@ import org.apache.spark.sql.internal.SQLConf.SESSION_LOCAL_TIMEZONE
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
 
-import org.apache.comet.{CometConf, CometExecIterator, CometNativeException, ExtendedExplainInfo}
+import org.apache.comet.{CometConf, CometExecIterator, CometNativeException, ExtendedExplainInfo, Native}
 import org.apache.comet.CometSparkSessionExtensions.{isSpark35Plus, isSpark40Plus, isSpark41Plus, isSpark42Plus}
 import org.apache.comet.rules.CometCoalesceShufflePartitions
 import org.apache.comet.serde.Config.ConfigMap
@@ -67,6 +67,57 @@ class CometExecSuite extends CometTestBase {
     super.test(testName, testTags: _*) {
       withSQLConf(CometConf.COMET_SHUFFLE_ENABLED.key -> "true") {
         testFun
+      }
+    }
+  }
+
+  test("scalar merged field reads share the retained native struct result") {
+    withSQLConf(
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      SQLConf.SUBQUERY_REUSE_ENABLED.key -> "true",
+      SQLConf.LEAF_NODE_DEFAULT_PARALLELISM.key -> "1") {
+      val fields = 32
+      val width = 65536
+      withParquetTable(Seq(Tuple1("x" * width)), "shared_scalar_source") {
+        withParquetTable((0 until 256).map(Tuple1(_)), "shared_scalar_outer") {
+          val expressions = (0 until fields).map { i =>
+            s"octet_length((SELECT max(concat(_1, 'x$i')) FROM shared_scalar_source)) c$i"
+          }
+          val df = sql(s"SELECT ${expressions.mkString(",")} FROM shared_scalar_outer")
+          val merged = df.queryExecution.optimizedPlan.flatMap { node =>
+            node.expressions.flatMap(_.collect {
+              case field: GetStructField if field.child.isInstanceOf[LogicalScalarSubquery] =>
+                field
+            })
+          }
+          assert(merged.map(_.ordinal).toSet == (0 until fields).toSet)
+          assert(merged.forall(_.child.dataType.asInstanceOf[StructType].length == fields))
+
+          val before = new Native().getMemoryUsage()(0)
+          val measurements = df.queryExecution.toRdd
+            .mapPartitions { rows =>
+              assert(rows.hasNext)
+              // Measure while the physical expressions and their literals are still live.
+              val retained = new Native().getMemoryUsage()(0) - before
+              var count = 0
+              rows.foreach { row =>
+                (0 until fields).foreach { i =>
+                  assert(row.getInt(i) == width + s"x$i".length)
+                }
+                count += 1
+              }
+              Iterator((retained, count))
+            }
+            .collect()
+            .toSeq
+          assert(measurements.size == 1)
+          assert(measurements.head._2 == 256)
+          // The merged value is about 2 MiB. Per-occurrence copies retain over 128 MiB.
+          assert(measurements.head._1 < 32L * 1024 * 1024, measurements)
+          val plan = df.queryExecution.executedPlan
+          assert(collect(plan) { case p: CometProjectExec => p }.nonEmpty, plan)
+          assertExpressionImpl(plan, native = Seq("octet_length"), dispatched = Seq.empty)
+        }
       }
     }
   }
@@ -3513,6 +3564,145 @@ class CometExecSuite extends CometTestBase {
             })),
             df.queryExecution.optimizedPlan.toString)
           checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+        }
+      }
+    }
+  }
+
+  private def withScalarReviewTables(body: => Unit): Unit = {
+    withSQLConf(
+      SQLConf.ANSI_ENABLED.key -> "true",
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      SQLConf.SUBQUERY_REUSE_ENABLED.key -> "true",
+      SQLConf.SHUFFLE_PARTITIONS.key -> "1",
+      CometConf.COMET_BATCH_SIZE.key -> "8192") {
+      withTempPath { dir =>
+        withTempView("review_items", "review_nums", "review_outer", "review_wide", "review_src") {
+          withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+            Seq((1, "bad"), (2, "2"))
+              .toDF("id", "txt")
+              .coalesce(1)
+              .write
+              .parquet(s"${dir.getCanonicalPath}/review_items")
+            Seq(0, 1)
+              .toDF("k")
+              .coalesce(1)
+              .write
+              .parquet(s"${dir.getCanonicalPath}/review_nums")
+            spark
+              .range(8192)
+              .coalesce(1)
+              .write
+              .parquet(s"${dir.getCanonicalPath}/review_outer")
+            Seq("a" * 262144, "b" * 262144)
+              .toDF("s")
+              .coalesce(1)
+              .write
+              .parquet(s"${dir.getCanonicalPath}/review_wide")
+            Seq(262144)
+              .toDF("n")
+              .coalesce(1)
+              .write
+              .parquet(s"${dir.getCanonicalPath}/review_src")
+          }
+          Seq("review_items", "review_nums", "review_outer", "review_wide", "review_src")
+            .foreach { name =>
+              spark.read.parquet(s"${dir.getCanonicalPath}/$name").createOrReplaceTempView(name)
+            }
+          body
+        }
+      }
+    }
+  }
+
+  test("scalar review ordinary struct literals keep native column execution") {
+    withScalarReviewTables {
+      checkSparkAnswerAndOperator(
+        sql(
+          "SELECT array(IF(id % 2 = 0, named_struct('k', id), " +
+            "CAST(NULL AS STRUCT<k:BIGINT>))) FROM review_outer"),
+        Seq(classOf[CometProjectExec]))
+    }
+  }
+
+  test("scalar struct typed NULL siblings retain supported field names") {
+    Seq("CODEGEN_ONLY", "FALLBACK").foreach { factoryMode =>
+      withSQLConf(
+        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+        SQLConf.CODEGEN_FACTORY_MODE.key -> factoryMode) {
+        withTempPath { path =>
+          withTempView("scalar_null_fields") {
+            withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+              spark.range(0, 4, 1, 1).write.parquet(path.toString)
+            }
+            spark.read.parquet(path.toString).createOrReplaceTempView("scalar_null_fields")
+            val scalar = "(SELECT max(named_struct('n', id)) FROM scalar_null_fields).n"
+            val containers =
+              Seq("%s", "STRUCT<s:%s>", "ARRAY<%s>", "MAP<STRING,%s>", "MAP<%s,STRING>")
+            for {
+              container <- containers
+              duplicate <- Seq(true, false)
+            } {
+              val fields = if (duplicate) "STRUCT<x:INT,x:INT>" else "STRUCT<x:INT,y:INT>"
+              val df = sql(
+                s"SELECT $scalar n, CAST(NULL AS ${container.format(fields)}) d " +
+                  "FROM scalar_null_fields")
+              if (duplicate) {
+                val (_, cometPlan) = checkSparkAnswer(df)
+                assert(stripAQEPlan(cometPlan).exists {
+                  case p: ProjectExec => p.projectList.exists(_.name == "d")
+                  case _ => false
+                })
+              } else {
+                val (_, cometPlan) =
+                  checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+                assert(stripAQEPlan(cometPlan).exists {
+                  case p: CometProjectExec => p.projectList.exists(_.name == "d")
+                  case _ => false
+                })
+              }
+            }
+            val cast = sql(
+              s"SELECT $scalar n, " +
+                "CAST((SELECT max(named_struct('p', id, 'q', id)) FROM scalar_null_fields) " +
+                "AS STRUCT<x:BIGINT,x:BIGINT>) d FROM scalar_null_fields")
+            val (_, castPlan) = checkSparkAnswer(cast)
+            assert(stripAQEPlan(castPlan).exists {
+              case p: ProjectExec => p.projectList.exists(_.name == "d")
+              case _ => false
+            })
+          }
+        }
+      }
+    }
+  }
+
+  test("scalar struct NullType fields preserve null parents") {
+    withTempPath { path =>
+      withTempView("scalar_null_field_rows") {
+        withSQLConf(CometConf.COMET_ENABLED.key -> "false") {
+          spark.range(0, 4, 1, 1).write.parquet(path.toString)
+        }
+        spark.read.parquet(path.toString).createOrReplaceTempView("scalar_null_field_rows")
+        for {
+          factoryMode <- Seq("CODEGEN_ONLY", "FALLBACK")
+          empty <- Seq(false, true)
+          value <- Seq("NULL", "id", "CAST(id AS STRING)")
+        } {
+          withSQLConf(
+            SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+            SQLConf.CODEGEN_FACTORY_MODE.key -> factoryMode) {
+            val condition = if (empty) " WHERE id < 0" else ""
+            val scalar = s"(SELECT max(named_struct('v', $value, 'n', id)) " +
+              s"FROM scalar_null_field_rows$condition)"
+            val df = sql(s"SELECT id, $scalar.v answer FROM scalar_null_field_rows")
+            val (_, cometPlan) =
+              checkSparkAnswerAndOperator(df, Seq(classOf[CometProjectExec]))
+            assert(stripAQEPlan(cometPlan).exists {
+              case p: CometProjectExec => p.projectList.exists(_.name == "answer")
+              case _ => false
+            })
+          }
         }
       }
     }

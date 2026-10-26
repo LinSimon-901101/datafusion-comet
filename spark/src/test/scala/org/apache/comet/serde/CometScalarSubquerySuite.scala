@@ -20,8 +20,9 @@
 package org.apache.comet.serde
 
 import org.apache.spark.sql.{CometTestBase, Row}
-import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Cast, Coalesce, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, GetStructField, GreaterThanOrEqual, Hour, If, In, LessThan, Literal, NamedExpression, Not, OctetLength, Rand, TruncDate, UnixDate, WeekDay}
-import org.apache.spark.sql.execution.{ProjectExec, ScalarSubquery, SubqueryExec}
+import org.apache.spark.sql.catalyst.expressions.{Alias, AttributeReference, Cast, Coalesce, CreateArray, CreateNamedStruct, DateAdd, DateDiff, DayOfWeek, EqualNullSafe, EqualTo, Expression, GetStructField, GreaterThanOrEqual, Hour, If, In, LessThan, Literal, NamedExpression, Not, OctetLength, Rand, TruncDate, UnixDate, WeekDay}
+import org.apache.spark.sql.comet.{CometScalarSubquery => NativeScalarSubquery}
+import org.apache.spark.sql.execution.{ProjectExec, ReusedSubqueryExec, ScalarSubquery, SubqueryExec}
 import org.apache.spark.sql.types._
 
 import org.apache.comet.CometSparkSessionExtensions.{isSpark40Plus, isSpark41Plus}
@@ -42,6 +43,31 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
 
   private def supported(dt: DataType): Boolean =
     CometScalarSubquery.getSupportLevel(subquery(dt)) == Compatible()
+
+  test("registered struct result identities follow late physical subquery reuse") {
+    val first = subquery(struct(StringType))
+    val reused = ScalarSubquery(ReusedSubqueryExec(first.plan), NamedExpression.newExprId)
+    val other = subquery(struct(StringType))
+    val otherContext = ScalarSubquery(other.plan, first.exprId)
+    val context = Long.MinValue
+    val secondContext = Long.MinValue + 1
+    val queries = Seq(first, reused, other)
+    try {
+      queries.foreach(NativeScalarSubquery.setSubquery(context, _))
+      NativeScalarSubquery.setSubquery(secondContext, otherContext)
+      def resultId(query: ScalarSubquery): Long =
+        NativeScalarSubquery.getStructResultId(context, query.exprId.id)
+      assert(first.exprId != reused.exprId)
+      assert(resultId(first) == first.plan.id)
+      assert(resultId(reused) == resultId(first))
+      assert(resultId(other) != resultId(first))
+      assert(
+        NativeScalarSubquery.getStructResultId(secondContext, first.exprId.id) == other.plan.id)
+    } finally {
+      queries.foreach(NativeScalarSubquery.removeSubquery(context, _))
+      NativeScalarSubquery.removeSubquery(secondContext, otherContext)
+    }
+  }
 
   private def versionSpecificTypes: Seq[DataType] = {
     val strings =
@@ -345,4 +371,5 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
         .consumerFallbackReason(Hour(timestamp, Some("America/Los_Angeles")))
         .exists(_.contains("non-fixed timezones")))
   }
+
 }

@@ -24,8 +24,51 @@ use datafusion::common::{config::ConfigOptions, ScalarValue};
 use datafusion::logical_expr::{ColumnarValue, ScalarUDF};
 use datafusion::physical_expr::expressions::Literal;
 use datafusion::physical_expr::{PhysicalExpr, ScalarFunctionExpr};
-use datafusion_comet_spark_expr::{GetStructField, ScalarSubqueryConsumer};
+use datafusion_comet_spark_expr::{GetStructField, ScalarSubqueryConsumer, Subquery};
 use datafusion_functions::string::octet_length::OctetLengthFunc;
+
+#[test]
+fn scalar_subquery_metric_labels_do_not_repeat_owned_payloads() {
+    use datafusion::physical_expr::expressions::IsNullExpr;
+    use datafusion::physical_expr_common::physical_expr::fmt_sql;
+
+    let payload = "sensitive scalar payload".repeat(4096);
+    let value = ScalarValue::Struct(Arc::new(StructArray::new(
+        vec![Field::new("s", DataType::Utf8, true)].into(),
+        vec![Arc::new(StringArray::from(vec![payload.as_str()]))],
+        None,
+    )));
+    let resolved: Arc<dyn PhysicalExpr> =
+        Arc::new(Subquery::resolved_struct_literal(value.clone()));
+    let field: Arc<dyn PhysicalExpr> = Arc::new(GetStructField::new(Arc::clone(&resolved), 0));
+    let output = ScalarSubqueryConsumer::wrap_projection_literal(
+        Arc::clone(&resolved),
+        Arc::new(Schema::empty()),
+    );
+    let whole = ScalarSubqueryConsumer::wrap(Arc::new(IsNullExpr::new(resolved)));
+    for rows in [0, 1, 4] {
+        let actual = output
+            .evaluate(&batch(rows))
+            .unwrap()
+            .into_array(rows)
+            .unwrap();
+        let expected = value.to_array_of_size(rows).unwrap();
+        assert_eq!(actual.as_ref(), expected.as_ref());
+    }
+    for expression in [field, whole, output] {
+        for label in [
+            expression.to_string(),
+            format!("{expression:?}"),
+            fmt_sql(expression.as_ref()).to_string(),
+        ] {
+            assert!(label.len() < 256, "label retained {} bytes", label.len());
+            assert!(!label.contains("sensitive scalar payload"));
+        }
+    }
+    // Ordinary SQL literal diagnostics retain their existing representation.
+    let ordinary = GetStructField::new(Arc::new(Literal::new(value)), 0);
+    assert!(ordinary.to_string().contains("sensitive scalar payload"));
+}
 
 #[test]
 fn large_scalar_struct_field_is_consumed_before_broadcast() {
@@ -36,7 +79,10 @@ fn large_scalar_struct_field_is_consumed_before_broadcast() {
         vec![Arc::new(StringArray::from(vec!["x".repeat(bytes)]))],
         None,
     )));
-    let field = Arc::new(GetStructField::new(Arc::new(Literal::new(scalar)), 0));
+    let field = Arc::new(GetStructField::new(
+        Arc::new(Subquery::resolved_struct_literal(scalar)),
+        0,
+    ));
     let consumer = Arc::new(ScalarFunctionExpr::new(
         "octet_length",
         Arc::new(ScalarUDF::new_from_impl(OctetLengthFunc::new())),
@@ -104,9 +150,13 @@ fn expanding_constant_child_is_consumed_before_its_conditional_broadcasts() {
 fn field(value: ScalarValue) -> Arc<dyn PhysicalExpr> {
     let fields = vec![Field::new("value", value.data_type(), true)].into();
     Arc::new(GetStructField::new(
-        Arc::new(Literal::new(ScalarValue::Struct(Arc::new(
-            StructArray::new(fields, vec![value.to_array().unwrap()], None),
-        )))),
+        Arc::new(Subquery::resolved_struct_literal(ScalarValue::Struct(
+            Arc::new(StructArray::new(
+                fields,
+                vec![value.to_array().unwrap()],
+                None,
+            )),
+        ))),
         0,
     ))
 }
@@ -446,7 +496,7 @@ fn non_null_count_consumes_scalar_fields_and_whole_structs_before_broadcast() {
         (field(large), true),
         (field(ScalarValue::Utf8(None)), false),
         (
-            Arc::new(Literal::new(structure)) as Arc<dyn PhysicalExpr>,
+            Arc::new(Subquery::resolved_struct_literal(structure)) as Arc<dyn PhysicalExpr>,
             true,
         ),
         (field(ScalarValue::Float64(Some(f64::NAN))), false),
@@ -954,11 +1004,15 @@ fn unused_wide_sibling_does_not_split_numeric_consumers() {
                 None,
             );
             Arc::new(GetStructField::new(
-                Arc::new(Literal::new(ScalarValue::Struct(Arc::new(outer)))),
+                Arc::new(Subquery::resolved_struct_literal(ScalarValue::Struct(
+                    Arc::new(outer),
+                ))),
                 0,
             ))
         } else {
-            Arc::new(Literal::new(ScalarValue::Struct(structure.clone())))
+            Arc::new(Subquery::resolved_struct_literal(ScalarValue::Struct(
+                structure.clone(),
+            )))
         };
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = calls.clone();
@@ -1002,7 +1056,9 @@ fn literal_field_chain_preserves_each_parent_null_and_empty_shape() {
             );
             let expr = GetStructField::new(
                 Arc::new(GetStructField::new(
-                    Arc::new(Literal::new(ScalarValue::Struct(Arc::new(outer)))),
+                    Arc::new(Subquery::resolved_struct_literal(ScalarValue::Struct(
+                        Arc::new(outer),
+                    ))),
                     0,
                 )),
                 0,
@@ -1043,7 +1099,8 @@ fn whole_struct_conditional_is_consumed_in_bounded_batches() {
                 ],
                 parent_null.then(|| NullBuffer::new_null(1)),
             )));
-            let literal: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(structure));
+            let literal: Arc<dyn PhysicalExpr> =
+                Arc::new(Subquery::resolved_struct_literal(structure));
             // The planner wraps at each construction point. Keep the source scalar, so a
             // surrounding field read can still select its field before broadcasting it.
             let source = ScalarSubqueryConsumer::wrap(literal.clone());
@@ -1108,7 +1165,8 @@ fn field_reads_bound_computed_structs_before_selecting_narrow_fields() {
         None,
     )));
     for cast in [false, true] {
-        let literal: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(structure.clone()));
+        let literal: Arc<dyn PhysicalExpr> =
+            Arc::new(Subquery::resolved_struct_literal(structure.clone()));
         let computed: Arc<dyn PhysicalExpr> = if cast {
             Arc::new(Cast::new(
                 literal,
@@ -1131,7 +1189,7 @@ fn field_reads_bound_computed_structs_before_selecting_narrow_fields() {
                     Arc::new(Literal::new(ScalarValue::Int64(Some(0)))),
                 )),
                 literal,
-                Arc::new(Literal::new(structure.clone())),
+                Arc::new(Subquery::resolved_struct_literal(structure.clone())),
             ))
         };
         let child = ScalarSubqueryConsumer::wrap(computed);
@@ -1155,4 +1213,53 @@ fn field_reads_bound_computed_structs_before_selecting_narrow_fields() {
             );
         }
     }
+}
+
+#[test]
+fn ordinary_null_struct_does_not_acquire_subquery_provenance() {
+    use arrow::array::BooleanArray;
+    use datafusion::functions_nested::make_array::MakeArray;
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion_comet_spark_expr::IfExpr;
+    let fields = vec![Field::new("k", DataType::Int64, true)].into();
+    let payload: Arc<dyn Array> = Arc::new(StructArray::new(
+        fields,
+        vec![Arc::new(Int64Array::from_iter_values(0..8192))],
+        None,
+    ));
+    let dt = payload.data_type().clone();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("p", DataType::Boolean, false),
+        Field::new("payload", dt.clone(), true),
+    ]));
+    let input = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(BooleanArray::from(
+                (0..8192).map(|id| id % 2 == 0).collect::<Vec<_>>(),
+            )),
+            payload,
+        ],
+    )
+    .unwrap();
+    let branch = Arc::new(IfExpr::new(
+        Arc::new(Column::new("p", 0)),
+        Arc::new(Column::new("payload", 1)),
+        Arc::new(Literal::new(ScalarValue::try_from(&dt).unwrap())),
+    ));
+    let original: Arc<dyn PhysicalExpr> = Arc::new(ScalarFunctionExpr::new(
+        "make_array",
+        Arc::new(ScalarUDF::new_from_impl(MakeArray::new())),
+        vec![branch],
+        Arc::new(Field::new(
+            "array",
+            DataType::List(Arc::new(Field::new("item", dt, true))),
+            true,
+        )),
+        Arc::new(ConfigOptions::default()),
+    ));
+    let wrapped = ScalarSubqueryConsumer::wrap_with_schema(original.clone(), input.schema());
+    assert!(Arc::ptr_eq(&wrapped, &original));
+    let output = wrapped.evaluate(&input).unwrap().into_array(8192).unwrap();
+    assert_eq!(output.len(), 8192);
 }

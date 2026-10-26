@@ -24,6 +24,7 @@ use datafusion::physical_expr::projection::{ProjectionExpr, ProjectionExprs};
 use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion_comet_proto::spark_operator::Operator;
+use datafusion_comet_spark_expr::ScalarSubqueryConsumer;
 use jni::objects::{Global, JObject};
 
 use crate::{
@@ -80,6 +81,12 @@ impl OperatorBuilder for ProjectionBuilder {
                 }
             }
         }
+        let exprs = exprs.try_map_exprs(|expr| {
+            Ok(ScalarSubqueryConsumer::wrap_projection_literal(
+                expr,
+                child.native_plan.schema(),
+            ))
+        })?;
         let projection = Arc::new(ProjectionExec::try_new(
             exprs.iter().cloned(),
             Arc::clone(&child.native_plan),
