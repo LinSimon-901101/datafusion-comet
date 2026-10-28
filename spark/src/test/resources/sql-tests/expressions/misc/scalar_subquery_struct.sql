@@ -49,6 +49,41 @@ INSERT INTO test_struct_subq VALUES
     'local_time', TIMESTAMP_NTZ '1969-12-31 23:59:59.123456',
     'nested', named_struct('last', NULL, 'first', NULL)))
 
+-- Cast from strings: a decimal -0.0 literal would lose the floating-point sign.
+statement
+INSERT INTO test_struct_subq
+SELECT id, named_struct(
+  'flag', NULL, 'tiny', NULL, 'small', NULL, 'number', NULL, 'large', NULL,
+  'single', CAST(value AS FLOAT), 'dbl', CAST(value AS DOUBLE),
+  'amount', NULL, 'compact', NULL, 'text', NULL, 'bytes', NULL, 'day', NULL,
+  'instant', NULL, 'local_time', NULL, 'nested', NULL)
+FROM VALUES (5, '-0.0'), (6, 'NaN'), (7, 'Infinity'), (8, '-Infinity') AS special(id, value)
+
+-- Equality checks zero semantics; string casts also detect a lost negative-zero sign.
+query
+SELECT id, s.single = 0.0, s.dbl = 0.0,
+       CAST(s.single AS STRING), CAST(s.dbl AS STRING)
+FROM (SELECT id, (SELECT payload FROM test_struct_subq WHERE id = 5) AS s
+      FROM test_struct_subq)
+
+query
+SELECT id, isnan(s.single), isnan(s.dbl),
+       CAST(s.single AS STRING), CAST(s.dbl AS STRING)
+FROM (SELECT id, (SELECT payload FROM test_struct_subq WHERE id = 6) AS s
+      FROM test_struct_subq)
+
+query
+SELECT id, s.single > 0, s.dbl > 0,
+       CAST(s.single AS STRING), CAST(s.dbl AS STRING)
+FROM (SELECT id, (SELECT payload FROM test_struct_subq WHERE id = 7) AS s
+      FROM test_struct_subq)
+
+query
+SELECT id, s.single < 0, s.dbl < 0,
+       CAST(s.single AS STRING), CAST(s.dbl AS STRING)
+FROM (SELECT id, (SELECT payload FROM test_struct_subq WHERE id = 8) AS s
+      FROM test_struct_subq)
+
 -- Materialize the entire non-null scalar struct for every outer row.
 query
 SELECT id, (SELECT payload FROM test_struct_subq WHERE id = 1) AS s
