@@ -15,7 +15,7 @@
 -- specific language governing permissions and limitations
 -- under the License.
 
--- Config: spark.sql.session.timeZone=UTC
+-- ConfigMatrix: spark.sql.session.timeZone=UTC,America/Los_Angeles
 
 statement
 CREATE TABLE test_struct_subq(
@@ -94,6 +94,13 @@ query
 SELECT id, s.flag, s.tiny, s.small, s.number, s.large, s.single, s.dbl,
        s.amount, s.compact, s.text, s.bytes, s.day, s.instant, s.local_time,
        s.nested.last, s.nested.first
+FROM (SELECT id, (SELECT payload FROM test_struct_subq WHERE id = 1) AS s
+      FROM test_struct_subq)
+
+-- Consume both timestamp fields after the scalar struct crosses into native code.
+query expect_native(scalarsubquery,getstructfield)
+SELECT id, s.instant = TIMESTAMP '1969-12-31 23:59:59.123456',
+       s.local_time = TIMESTAMP_NTZ '2024-02-29 12:34:56.654321'
 FROM (SELECT id, (SELECT payload FROM test_struct_subq WHERE id = 1) AS s
       FROM test_struct_subq)
 

@@ -69,6 +69,18 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     DecimalType(10, 2),
     DecimalType(38, 38))
 
+  test("non-struct scalar subqueries use the shared type gate defaults") {
+    val types = scalarTypes ++ versionSpecificTypes ++ Seq(
+      ArrayType(IntegerType),
+      MapType(StringType, IntegerType),
+      CalendarIntervalType,
+      YearMonthIntervalType(),
+      DayTimeIntervalType(),
+      CharType(5),
+      VarcharType(5))
+    types.foreach(dt => assert(supported(dt) == supportedDataType(dt), dt))
+  }
+
   test("struct scalar subqueries retain supported fields and case-distinct names") {
     val distinct =
       StructType(Seq(StructField("a", IntegerType), StructField("A", LongType)))
