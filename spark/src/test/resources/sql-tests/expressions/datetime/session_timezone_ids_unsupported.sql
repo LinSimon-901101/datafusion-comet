@@ -20,6 +20,7 @@
 -- https://github.com/apache/datafusion-comet/issues/6329
 
 -- Config: spark.sql.session.timeZone=+05:45:30
+-- Config: spark.comet.exec.scalaUDF.codegen.enabled=true
 
 statement
 CREATE TABLE test_session_tz_seconds(ts timestamp) USING parquet
@@ -31,6 +32,13 @@ INSERT INTO test_session_tz_seconds VALUES (TIMESTAMP'2024-01-15 18:30:45Z'), (N
 query
 SELECT CAST(ts AS STRING), CAST(ts AS DATE) FROM test_session_tz_seconds
 
--- hour has no dispatcher path, so it falls back to Spark
+-- Clock functions use Spark's generated code when the offset has no native spelling.
+query expect_dispatch(hour,minute,second)
+SELECT hour(ts), minute(ts), second(ts) FROM test_session_tz_seconds
+
+statement
+SET spark.comet.exec.scalaUDF.codegen.enabled=false
+
+-- Without the dispatcher, the same unsupported offset retains Spark fallback.
 query expect_fallback(cannot be represented in native code)
-SELECT hour(ts) FROM test_session_tz_seconds
+SELECT hour(ts), minute(ts), second(ts) FROM test_session_tz_seconds

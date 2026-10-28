@@ -157,6 +157,8 @@ for a zero offset, which covers `Z`, `GMT` and `Etc/UTC`, or `+HH:MM` otherwise.
 its region. An offset with seconds, such as `+05:45:30`, has no native spelling, so `nativeId`
 returns `None`. The serde then reports the expression as unsupported through
 `CometTimeZone.supportLevel`, and it runs in the codegen dispatcher or falls back to Spark.
+`hour`, `minute` and `second` use the dispatcher for these offsets. When the dispatcher is
+disabled or cannot handle the expression, the projection falls back to Spark.
 
 Code that takes a fast path for UTC should still compare the ID against a fixed list of UTC
 aliases, and send everything else down the general path. The list in `extract_date_part.rs` is an
