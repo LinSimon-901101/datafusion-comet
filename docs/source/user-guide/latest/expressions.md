@@ -278,7 +278,7 @@ The type-name conversion functions (`bigint`, `binary`, `boolean`, `date`, `deci
 | `extract` | ✅ | — | `SECOND FROM TIME` is native for Spark 4.1+ with `Decimal(8,6)` output |
 | `from_unixtime` | ✅ | Hybrid |  |
 | `from_utc_timestamp` | ✅ | Hybrid | Routes through the JVM codegen dispatcher by default (handles all timezone forms); the native path is opt-in via allowIncompatible ([details](compatibility/expressions/datetime.md)) |
-| `hour` | ✅ | Native |  |
+| `hour` | ✅ | Hybrid | Scalar inputs run natively in fixed-offset timezones and for `timestamp_ntz`; regional timestamp expressions that may return scalars use Spark. |
 | `last_day` | ✅ | Native |  |
 | `localtimestamp` | ✅ | — |  |
 | `make_date` | ✅ | Native | Computed arguments preserve year → month → day NULL checks. Expressions fall back when shared subexpressions or a parent could change which arguments Spark evaluates. IN probes stay native for literal/column candidates and array/struct constructors of those values; other computed candidates require Spark evaluation. |
@@ -289,14 +289,14 @@ The type-name conversion functions (`bigint`, `binary`, `boolean`, `date`, `deci
 | `make_timestamp_ltz` | ✅ | — | The 2-argument `(date, time)` form (Spark 4.1+) runs through codegen dispatch |
 | `make_timestamp_ntz` | ✅ | — | The 2-argument `(date, time)` form (Spark 4.1+) runs through codegen dispatch |
 | `make_ym_interval` | ✅ | Codegen dispatch |  |
-| `minute` | ✅ | Native |  |
+| `minute` | ✅ | Hybrid | Scalar inputs run natively in fixed-offset timezones and for `timestamp_ntz`; regional timestamp expressions that may return scalars use Spark. |
 | `month` | ✅ | Native |  |
 | `monthname` | ✅ | — | Abbreviated month name (Spark 4.0+) |
 | `months_between` | ✅ | Codegen dispatch |  |
 | `next_day` | ✅ | Hybrid | Non-UTF8_BINARY collated `dayOfWeek` routes through the JVM codegen dispatcher; other input runs natively |
 | `now` | ✅ | — | Constant-folded to a literal (alias of `current_timestamp`) |
 | `quarter` | ✅ | Native |  |
-| `second` | ✅ | Native |  |
+| `second` | ✅ | Hybrid | Scalar inputs run natively in fixed-offset timezones and for `timestamp_ntz`; regional timestamp expressions that may return scalars use Spark. |
 | `session_window` | 🔜 | — | Batch session-window grouping falls back (`UpdatingSessionsExec` is not yet native); tracked by [#4785](https://github.com/apache/datafusion-comet/issues/4785) |
 | `time_diff` | ✅ | Codegen dispatch | Spark 4.1+; requires `spark.sql.timeType.enabled=true`, which Spark leaves off by default |
 | `time_trunc` | ✅ | Codegen dispatch | Spark 4.1+; requires `spark.sql.timeType.enabled=true`, which Spark leaves off by default |
@@ -325,7 +325,7 @@ The type-name conversion functions (`bigint`, `binary`, `boolean`, `date`, `deci
 | `unix_micros` | ✅ | Codegen dispatch |  |
 | `unix_millis` | ✅ | Codegen dispatch |  |
 | `unix_seconds` | ✅ | Codegen dispatch |  |
-| `unix_timestamp` | ✅ | Hybrid | String parsing uses Spark's codegen and honors the time parser policy, ANSI mode, and session time zone. Date and timestamp inputs ignore the format and use native execution. |
+| `unix_timestamp` | ✅ | Hybrid | String parsing uses Spark's codegen and honors the time parser policy, ANSI mode, and session time zone. Date inputs guaranteed to produce arrays and timestamp inputs ignore the format and use native execution. Date expressions that may return scalars use Spark for checked overflow and timezone conversion. |
 | `weekday` | ✅ | Native |  |
 | `weekofyear` | ✅ | Native |  |
 | `window` | ✅ | — | Batch tumbling and sliding time-window grouping runs natively |

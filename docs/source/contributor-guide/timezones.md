@@ -173,6 +173,16 @@ with the JVM's and logs a warning if they differ. The user guide describes the e
 "Timezone Database Versions" on the datetime
 [expression compatibility](../user-guide/latest/compatibility/expressions/index.md) page.
 
+Clock kernels accept both scalar and array inputs. UTC, fixed-offset zones and `TimestampNTZType`
+use arithmetic over the full microsecond range, preserving NULLs and scalar results. Regional
+clock inputs that may produce a scalar use Spark because chrono-tz cannot match Java's recurring
+rules outside its transition table. Ordinary regional columns keep their existing native path, as
+do IF, CASE with an explicit ELSE, and COALESCE when all value branches are arrays.
+Similarly, `unix_timestamp` of a timestamp is timezone-independent and accepts scalars, while date
+expressions that may produce scalars use Spark's checked start-of-day conversion. Date column
+branches combined by those same conditionals retain native conversion. Future summer
+instants and overflowing dates must be tested: winter endpoints alone can hide these differences.
+
 ## Scans
 
 Parquet stores timestamps either as `INT64` annotated `TIMESTAMP(MICROS or MILLIS, isAdjustedToUTC)`,

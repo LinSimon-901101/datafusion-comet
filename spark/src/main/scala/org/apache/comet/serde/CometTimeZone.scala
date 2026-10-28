@@ -23,7 +23,9 @@ import java.time.ZoneOffset
 
 import scala.util.Try
 
+import org.apache.spark.sql.catalyst.expressions.{Attribute, BoundReference, CaseWhen, Cast, Coalesce, Expression, FromUTCTimestamp, If, PreciseTimestampConversion, SecondsToTimestamp, ToUTCTimestamp, TruncTimestamp}
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
+import org.apache.spark.sql.types.{TimestampNTZType, TimestampType}
 
 /**
  * Converts the timezone Spark stamps on an expression into an ID that native code can parse.
@@ -53,6 +55,50 @@ object CometTimeZone {
 
   /** Whether `timeZoneId` has a zero offset at every instant. */
   def isUtc(timeZoneId: Option[String]): Boolean = nativeId(timeZoneId).contains("UTC")
+
+  /** Whether native code can represent a timezone whose offset never changes. */
+  private[serde] def isFixedOffset(timeZoneId: Option[String]): Boolean =
+    nativeId(timeZoneId).exists { id =>
+      Try(DateTimeUtils.getZoneId(id).getRules.isFixedOffset).getOrElse(false)
+    }
+
+  private[serde] val clockInputUnsupportedReason: String =
+    "Clock expressions with inputs that may be scalar require Spark for non-fixed timezones"
+
+  /** Only value branches determine whether IF/CASE/COALESCE can return a scalar. */
+  private[serde] def hasArrayResult(input: Expression): Boolean = input match {
+    case _: Attribute | _: BoundReference => true
+    // Other casts can be replaced with a scalar NULL by their serde.
+    case cast: Cast if cast.dataType == TimestampType || cast.dataType == TimestampNTZType =>
+      hasArrayResult(cast.child)
+    case conditional: If =>
+      hasArrayResult(conditional.trueValue) && hasArrayResult(conditional.falseValue)
+    // Without an ELSE, a batch with no match returns a scalar NULL.
+    case conditional: CaseWhen =>
+      conditional.branches.forall { case (_, value) => hasArrayResult(value) } &&
+      conditional.elseValue.exists(hasArrayResult)
+    // COALESCE lowers to CASE, with the final child as its explicit ELSE.
+    case coalesce: Coalesce =>
+      coalesce.children.nonEmpty && coalesce.children.forall(hasArrayResult)
+    case seconds: SecondsToTimestamp => hasArrayResult(seconds.child)
+    case precise: PreciseTimestampConversion => hasArrayResult(precise.child)
+    case trunc: TruncTimestamp =>
+      hasArrayResult(trunc.timestamp) || hasArrayResult(trunc.format)
+    case from: FromUTCTimestamp => hasArrayResult(from.left) || hasArrayResult(from.right)
+    case to: ToUTCTimestamp => hasArrayResult(to.left) || hasArrayResult(to.right)
+    case _ => false
+  }
+
+  private[serde] def clockSupportLevel(
+      child: Expression,
+      timeZoneId: Option[String]): SupportLevel = {
+    if (child.dataType == TimestampNTZType || isFixedOffset(timeZoneId) || hasArrayResult(
+        child)) {
+      supportLevel(timeZoneId)
+    } else {
+      Unsupported(Some(clockInputUnsupportedReason))
+    }
+  }
 
   /** `Unsupported` when native code cannot represent `timeZoneId`, `Compatible` otherwise. */
   def supportLevel(timeZoneId: Option[String]): SupportLevel = nativeId(timeZoneId) match {
