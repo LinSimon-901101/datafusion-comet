@@ -45,7 +45,7 @@ import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, AQEShuffl
 import org.apache.spark.sql.execution.aggregate.{HashAggregateExec, ObjectHashAggregateExec, SortAggregateExec}
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ReusedExchangeExec, ShuffleExchangeExec}
-import org.apache.spark.sql.execution.joins.{BaseJoinExec, BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, HashedRelationBroadcastMode, SortMergeJoinExec}
+import org.apache.spark.sql.execution.joins.{BaseJoinExec, BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, HashedRelationBroadcastMode, ShuffledHashJoinExec, SortMergeJoinExec}
 import org.apache.spark.sql.functions.expr
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{DataTypes, DoubleType, FloatType, StructField, StructType}
@@ -1490,6 +1490,151 @@ class CometExecRuleSuite extends CometTestBase {
       val again = applyCometExecRule(refreshed).asInstanceOf[CometHashAggregateExec]
       assert(again.nativeOp eq refreshed.nativeOp)
       assert(again.serializedPlanOpt.plan.get sameElements refreshed.serializedPlanOpt.plan.get)
+    }
+  }
+
+  test(
+    "CometExecRule refreshes materialized inputs without dropping aggregate result projections") {
+    withAdaptiveAggregateConf {
+      withSQLConf(
+        CometConf.COMET_EXEC_RANGE_ENABLED.key -> "true",
+        SQLConf.SHUFFLE_PARTITIONS.key -> "2") {
+        for {
+          directRead <- Seq(false, true)
+          projected <- Seq(false, true)
+          parent <- Seq(false, true)
+          coalesced <- Seq(false, true)
+        } {
+          withSQLConf(CometConf.COMET_SHUFFLE_DIRECT_READ_ENABLED.key -> directRead.toString) {
+            val resultExpr = if (projected) "SUM(id) + 1" else "SUM(id)"
+            val query = s"SELECT id % 3 AS k, $resultExpr AS total " +
+              "FROM range(0, 100, 1, 2) GROUP BY id % 3"
+            val expected = createSparkPlan(spark, query)
+              .executeCollect()
+              .map(row => (row.getLong(0), row.getLong(1)))
+              .toSeq
+              .sorted
+            val translated = applyCometExecRule(createSparkPlan(spark, query))
+              .asInstanceOf[CometHashAggregateExec]
+            val exchange = translated.child.asInstanceOf[CometShuffleExchangeExec]
+            val partial = exchange.child.asInstanceOf[CometNativeExec]
+            assert(nativeLeaves(partial.nativeOp).exists(leaf =>
+              !leaf.hasScan && !leaf.hasShuffleScan))
+            // Use real serde to model the aggregate before AQE materializes its native input.
+            val fused = applyCometExecRule(translated.originalPlan.withNewChildren(Seq(partial)))
+              .asInstanceOf[CometHashAggregateExec]
+            val stage = ShuffleQueryStageExec(0, exchange, exchange.canonicalized)
+            val materialized = if (coalesced) {
+              // Publish the real completed map statistics, as AQE does before constructing a read.
+              val stats = scala.concurrent.Await.result(
+                stage.materialize(),
+                scala.concurrent.duration.Duration(1, TimeUnit.MINUTES))
+              classOf[QueryStageExec]
+                .getMethod("resultOption")
+                .invoke(stage)
+                .asInstanceOf[java.util.concurrent.atomic.AtomicReference[Option[Any]]]
+                .set(Some(stats))
+              val bytes = stats.getClass
+                .getMethod("bytesByPartitionId")
+                .invoke(stats)
+                .asInstanceOf[Array[Long]]
+                .sum
+              AQEShuffleReadExec(stage, Seq(CoalescedPartitionSpec(0, 2, Some(bytes))))
+            } else {
+              stage
+            }
+            val stale = fused.withNewChildren(Seq(materialized))
+            val input = if (parent) {
+              // Build the native parent first: its protobuf must still embed the OLD child.
+              val nativeParent = applyCometExecRule(ProjectExec(fused.output, fused))
+                .asInstanceOf[CometProjectExec]
+              nativeParent.copy(child = nativeParent.child.withNewChildren(Seq(materialized)))
+            } else {
+              stale.asInstanceOf[CometNativeExec]
+            }
+            val replan = CometExecRule(spark, queryStagePrep = true)
+              .apply(input)
+              .asInstanceOf[CometNativeExec]
+            assert(replan.nativeOp eq input.nativeOp)
+            val result = applyCometExecRule(input).asInstanceOf[CometNativeExec]
+            val aggregate = result.collectFirst { case a: CometHashAggregateExec => a }.get
+            if (projected) assert(aggregate.nativeOp.hasProjection)
+            val aggregateOp = if (aggregate.nativeOp.hasProjection) {
+              aggregate.nativeOp.getChildren(0)
+            } else {
+              aggregate.nativeOp
+            }
+            assert(aggregateOp.hasHashAgg, aggregate.nativeOp)
+            assert(aggregateOp.getChildren(0).getChildrenCount == 0)
+            val expectedLeaf = if (directRead) "SHUFFLE_SCAN" else "SCAN"
+            assert(serializedLeafKinds(result) == Seq(expectedLeaf))
+            val again = applyCometExecRule(result).asInstanceOf[CometNativeExec]
+            assert(again.nativeOp eq result.nativeOp)
+            assert(
+              again.serializedPlanOpt.plan.get sameElements result.serializedPlanOpt.plan.get)
+            val actual = result
+              .executeCollect()
+              .map(row => (row.getLong(0), row.getLong(1)))
+              .toSeq
+              .sorted
+            assert(actual == expected)
+          }
+        }
+      }
+    }
+  }
+
+  test("CometExecRule combines whole-input and shuffle-leaf refreshes across join inputs") {
+    withAdaptiveAggregateConf {
+      withSQLConf(
+        CometConf.COMET_EXEC_RANGE_ENABLED.key -> "true",
+        CometConf.COMET_SHUFFLE_DIRECT_READ_ENABLED.key -> "true",
+        SQLConf.SHUFFLE_PARTITIONS.key -> "2") {
+        val query = "SELECT id % 3 AS k, SUM(id) AS total " +
+          "FROM range(0, 100, 1, 2) GROUP BY id % 3"
+        val expected = createSparkPlan(spark, query)
+          .executeCollect()
+          .map(row => (row.getLong(0), row.getLong(1), row.getLong(0), row.getLong(1)))
+          .toSeq
+          .sorted
+        def input(fused: Boolean): (CometHashAggregateExec, ShuffleQueryStageExec) = {
+          val aggregate = applyCometExecRule(createSparkPlan(spark, query))
+            .asInstanceOf[CometHashAggregateExec]
+          val exchange = aggregate.child.asInstanceOf[CometShuffleExchangeExec]
+          val beforeStage = if (fused) {
+            applyCometExecRule(aggregate.originalPlan.withNewChildren(Seq(exchange.child)))
+              .asInstanceOf[CometHashAggregateExec]
+          } else {
+            aggregate
+          }
+          (
+            beforeStage,
+            ShuffleQueryStageExec(if (fused) 0 else 1, exchange, exchange.canonicalized))
+        }
+        val (left, leftStage) = input(fused = true)
+        val (right, rightStage) = input(fused = false)
+        val join = ShuffledHashJoinExec(
+          Seq(left.output.head),
+          Seq(right.output.head),
+          Inner,
+          BuildRight,
+          None,
+          left,
+          right)
+        val native = applyCometExecRule(join).asInstanceOf[CometNativeExec]
+        val stale = native.withNewChildren(
+          Seq(
+            native.children.head.withNewChildren(Seq(leftStage)),
+            native.children(1).withNewChildren(Seq(rightStage))))
+        val result = applyCometExecRule(stale).asInstanceOf[CometNativeExec]
+        assert(serializedLeafKinds(result) == Seq("SHUFFLE_SCAN", "SHUFFLE_SCAN"))
+        val actual = result
+          .executeCollect()
+          .map(row => (row.getLong(0), row.getLong(1), row.getLong(2), row.getLong(3)))
+          .toSeq
+          .sorted
+        assert(actual == expected)
+      }
     }
   }
 

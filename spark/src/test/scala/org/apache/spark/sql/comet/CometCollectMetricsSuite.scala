@@ -21,6 +21,7 @@ package org.apache.spark.sql.comet
 
 import java.util.concurrent.{FutureTask, TimeUnit}
 
+import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent}
 import org.apache.spark.sql.{CometTestBase, Observation, Row}
 import org.apache.spark.sql.catalyst.analysis.UnresolvedAttribute
 import org.apache.spark.sql.catalyst.plans.physical.RoundRobinPartitioning
@@ -28,11 +29,11 @@ import org.apache.spark.sql.execution.{CollectMetricsExec, MapPartitionsExec, Pr
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
 import org.apache.spark.sql.execution.joins.SortMergeJoinExec
+import org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{ArrayType, IntegerType}
-import org.apache.spark.sql.util.QueryExecutionListener
 
 import org.apache.comet.CometConf
 import org.apache.comet.CometSparkSessionExtensions.isSpark35Plus
@@ -585,39 +586,42 @@ class CometCollectMetricsSuite extends CometTestBase {
           def run(comet: Boolean): (Map[String, Any], SparkPlan) = {
             withCometEnabled(comet) {
               val observation = Observation("foreach_rows")
-              val observed = spark.read
-                .parquet(path.getCanonicalPath)
-                .observe(observation, count(lit(1)).as("rows"))
+              val input = spark.read.parquet(path.getCanonicalPath)
+              // Observation.get also relies on named execution events, absent here on Spark 3.4.
+              val observed = if (isSpark35Plus) {
+                input.observe(observation, count(lit(1)).as("rows"))
+              } else {
+                input.observe("foreach_rows", count(lit(1)).as("rows"))
+              }
               // Spark's code-generated sort does not consume input until its output is requested.
               val result =
                 if (sortBeforeConsume) observed.sortWithinPartitions($"id".desc) else observed
               val consumed = spark.sparkContext.longAccumulator
-              @volatile var executedPlan: Option[SparkPlan] = None
+              @volatile var executedQuery: Option[QueryExecution] = None
               // foreachPartition executes its own deserializing QueryExecution.
-              val listener = new QueryExecutionListener {
-                override def onSuccess(
-                    funcName: String,
-                    qe: QueryExecution,
-                    durationNs: Long): Unit = {
-                  if (funcName == "foreachPartition") executedPlan = Some(qe.executedPlan)
+              // Spark 3.4 does not name this execution, so QueryExecutionListener misses it.
+              val listener = new SparkListener {
+                override def onOtherEvent(event: SparkListenerEvent): Unit = event match {
+                  case end: SparkListenerSQLExecutionEnd if end.qe != null =>
+                    executedQuery = Some(end.qe)
+                  case _ =>
                 }
-
-                override def onFailure(
-                    funcName: String,
-                    qe: QueryExecution,
-                    exception: Exception): Unit = ()
               }
-              spark.listenerManager.register(listener)
+              spark.sparkContext.listenerBus.waitUntilEmpty()
+              spark.sparkContext.addSparkListener(listener)
               try {
                 result.foreachPartition { (rows: Iterator[Row]) =>
                   rows.take(consumeRows).foreach(_ => consumed.add(1L))
                 }
                 spark.sparkContext.listenerBus.waitUntilEmpty()
                 assert(consumed.value == consumeRows.toLong)
-                assert(executedPlan.nonEmpty)
-                (observedMetrics(observation), executedPlan.get)
+                assert(executedQuery.nonEmpty)
+                val execution = executedQuery.get
+                val metrics = Map("rows" -> execution.observedMetrics("foreach_rows").getLong(0))
+                if (isSpark35Plus) assert(observedMetrics(observation) == metrics)
+                (metrics, execution.executedPlan)
               } finally {
-                spark.listenerManager.unregister(listener)
+                spark.sparkContext.removeSparkListener(listener)
               }
             }
           }

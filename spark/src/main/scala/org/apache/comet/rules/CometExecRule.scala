@@ -856,7 +856,9 @@ case class CometExecRule(session: SparkSession, queryStagePrep: Boolean = false)
     val feeders = native.children.map {
       case read: AQEShuffleReadExec =>
         read.child match {
-          case sink: CometSinkPlaceHolder if sink.nativeOp.hasShuffleScan => Some(sink)
+          case sink: CometSinkPlaceHolder
+              if sink.nativeOp.hasShuffleScan || sink.nativeOp.hasScan =>
+            Some(sink)
           case _ => None
         }
       case child: CometNativeExec => Some(child)
@@ -864,15 +866,71 @@ case class CometExecRule(session: SparkSession, queryStagePrep: Boolean = false)
     }
     if (feeders.exists(_.isEmpty)) return None
     val children = feeders.flatten
+    // One Spark operator can contain several protobuf operators (a final aggregate can be
+    // Projection(HashAgg(input))). Locate its original native input subtrees, not its root's
+    // immediate children, so the operator's own wrappers survive a materialized-input repair.
+    val originalChildren = native.originalPlan.children
+    var repairedInput: Option[Operator] = None
+    if (originalChildren.size == children.size &&
+      originalChildren.forall(_.isInstanceOf[CometNativeExec]) &&
+      originalChildren.indices.exists(i =>
+        originalChildren(i).asInstanceOf[CometNativeExec].nativeOp ne children(i).nativeOp)) {
+      val originals = originalChildren.map(_.asInstanceOf[CometNativeExec].nativeOp)
+      val replace =
+        originals.zip(children).zip(originalChildren).map { case ((previous, child), original) =>
+          val current = child.nativeOp
+          val previouslyFusedScan = (previous ne current) && CometExec
+            .nativeLeaves(previous)
+            .exists(leaf => !leaf.hasScan && !leaf.hasShuffleScan)
+          val materialized = current.hasScan || current.hasShuffleScan
+          val sameOperator = previous.getPlanId == current.getPlanId &&
+            previous.getOpStructCase == current.getOpStructCase
+          previouslyFusedScan && (materialized || sameOperator) &&
+          CometExec.nativeLeaves(current).exists(leaf => leaf.hasScan || leaf.hasShuffleScan) &&
+          original.output.map(_.dataType) == child.output.map(_.dataType)
+        }
+      if (replace.contains(true)) {
+        var inputIndex = 0
+        def sameInput(op: Operator, input: Operator): Boolean =
+          (op eq input) || (op.getPlanId == input.getPlanId &&
+            op.getOpStructCase == input.getOpStructCase && op == input)
+        def updateInputs(op: Operator): Operator = {
+          if (inputIndex < originals.size &&
+            (sameInput(op, originals(inputIndex)) ||
+              sameInput(op, children(inputIndex).nativeOp))) {
+            val index = inputIndex
+            inputIndex += 1
+            val current = children(index).nativeOp
+            if (replace(index) && !sameInput(op, current)) current else op
+          } else {
+            var builder: Operator.Builder = null
+            op.getChildrenList.asScala.zipWithIndex.foreach { case (child, index) =>
+              val updated = updateInputs(child)
+              if (updated ne child) {
+                if (builder == null) builder = op.toBuilder
+                builder.setChildren(index, updated)
+              }
+            }
+            if (builder == null) op else builder.build()
+          }
+        }
+        val updated = updateInputs(native.nativeOp)
+        // Do not guess an input boundary when the serialized and physical inputs do not align.
+        if (inputIndex == originals.size && (updated ne native.nativeOp)) {
+          repairedInput = Some(updated)
+        }
+      }
+    }
+    val nativeOp = repairedInput.getOrElse(native.nativeOp)
     // Only a sink that reads a shuffle directly, or a native child that may hold one, can feed
     // a `ShuffleScan`.
     val mayFeedShuffleScan = children.exists {
       case sink: CometSinkPlaceHolder => sink.nativeOp.hasShuffleScan
       case _ => true
     }
-    if (!mayFeedShuffleScan) return None
-    val leaves = CometExec.nativeLeaves(native.nativeOp)
-    if (!leaves.exists(_.hasScan)) return None
+    if (!mayFeedShuffleScan) return repairedInput
+    val leaves = CometExec.nativeLeaves(nativeOp)
+    if (!leaves.exists(_.hasScan)) return repairedInput
 
     // Each plan child feeds a run of leaves, in order: a sink feeds one, and a native child
     // feeds the leaves of its own native plan.
@@ -882,17 +940,17 @@ case class CometExecRule(session: SparkSession, queryStagePrep: Boolean = false)
     }
     def isStale(leaf: Operator, input: Operator): Boolean = leaf.hasScan && input.hasShuffleScan
     val stale = leaves.zip(current).filter { case (leaf, input) => isStale(leaf, input) }
-    if (stale.isEmpty) return None
+    if (stale.isEmpty) return repairedInput
     val isRefreshable = current.length == leaves.length &&
       stale.forall { case (leaf, input) =>
         leaf.getScan.getFieldsList == input.getShuffleScan.getFieldsList
       }
     if (!isRefreshable) {
       withInfo(native, CometExecRule.STALE_SCAN_KEPT)
-      return None
+      return repairedInput
     }
     val inputs = current.iterator
-    Some(mapLeaves(native.nativeOp) { leaf =>
+    Some(mapLeaves(nativeOp) { leaf =>
       val input = inputs.next()
       if (isStale(leaf, input)) input else leaf
     })

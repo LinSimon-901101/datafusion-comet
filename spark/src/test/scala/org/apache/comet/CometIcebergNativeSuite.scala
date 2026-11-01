@@ -6741,53 +6741,63 @@ class CometIcebergNativeSuite
   // SPARK-34637: DPP-side broadcast query stage must be created before the main
   // join's broadcast stage. Iceberg is V2 BatchScan, exercising the equivalent of
   // Spark's V2 path.
-  test("AQE DPP - V2 broadcast query stage creation order (SPARK-34637)") {
-    assume(icebergAvailable, "Iceberg not available")
-    withTempIcebergDir { warehouseDir =>
-      withSQLConf(
-        "spark.sql.catalog.aqe_cat" -> "org.apache.iceberg.spark.SparkCatalog",
-        "spark.sql.catalog.aqe_cat.type" -> "hadoop",
-        "spark.sql.catalog.aqe_cat.warehouse" -> warehouseDir.getAbsolutePath,
-        SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB",
-        SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
-        SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
-        CometConf.COMET_ENABLED.key -> "true",
-        CometConf.COMET_EXEC_ENABLED.key -> "true",
-        CometConf.COMET_ICEBERG_NATIVE_ENABLED.key -> "true") {
+  for (directRead <- Seq(false, true); projected <- Seq(false, true)) {
+    test(
+      s"AQE DPP - V2 broadcast query stage creation order (SPARK-34637), directRead=$directRead, projected=$projected") {
+      assume(icebergAvailable, "Iceberg not available")
+      withTempIcebergDir { warehouseDir =>
+        withSQLConf(
+          "spark.sql.catalog.aqe_cat" -> "org.apache.iceberg.spark.SparkCatalog",
+          "spark.sql.catalog.aqe_cat.type" -> "hadoop",
+          "spark.sql.catalog.aqe_cat.warehouse" -> warehouseDir.getAbsolutePath,
+          SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10MB",
+          SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "true",
+          SQLConf.DYNAMIC_PARTITION_PRUNING_REUSE_BROADCAST_ONLY.key -> "true",
+          CometConf.COMET_SHUFFLE_DIRECT_READ_ENABLED.key -> directRead.toString,
+          CometConf.COMET_ENABLED.key -> "true",
+          CometConf.COMET_EXEC_ENABLED.key -> "true",
+          CometConf.COMET_ICEBERG_NATIVE_ENABLED.key -> "true") {
 
-        spark.sql("""
+          spark.sql("""
           CREATE TABLE aqe_cat.db.q34637_fact (
             store_id INT, units_sold INT
           ) USING iceberg PARTITIONED BY (store_id)
         """)
-        spark.sql("""
+          spark.sql("""
           INSERT INTO aqe_cat.db.q34637_fact VALUES
           (1, 70), (1, 70), (15, 70), (15, 70), (2, 30), (3, 40)
         """)
 
-        // Mirrors the SPARK-34637 query: WITH clause grouped by store_id, self-joined.
-        // The DPP-side broadcast stage must be created before the main BHJ's stage,
-        // otherwise AQE's stageCache cannot dedupe.
-        val query =
-          """WITH v AS (
-            |  SELECT f.store_id FROM aqe_cat.db.q34637_fact f
+          // Mirrors the SPARK-34637 query: WITH clause grouped by store_id, self-joined.
+          // The DPP-side broadcast stage must be created before the main BHJ's stage,
+          // otherwise AQE's stageCache cannot dedupe.
+          val resultExpr = if (projected) ", SUM(f.units_sold) + 1 AS total" else ""
+          val query =
+            s"""WITH v AS (
+            |  SELECT f.store_id$resultExpr FROM aqe_cat.db.q34637_fact f
             |  WHERE f.units_sold = 70 GROUP BY f.store_id
             |)
             |SELECT * FROM v v1 JOIN v v2 ON v1.store_id = v2.store_id""".stripMargin
-        val (_, cometPlan) = checkSparkAnswer(query)
+          val (_, cometPlan) = checkSparkAnswer(query)
 
-        assertNoLeftoverCSAB(cometPlan)
-
-        if (isSpark35Plus) {
-          val cometSubqueries = collectWithSubqueries(cometPlan) {
-            case s: CometSubqueryBroadcastExec => s
-          }
           assert(
-            cometSubqueries.nonEmpty,
-            s"Expected CometSubqueryBroadcastExec for DPP, got 0:\n${cometPlan.treeString}")
-        }
+            collectWithSubqueries(cometPlan) { case scan: CometIcebergNativeScanExec =>
+              scan
+            }.nonEmpty,
+            cometPlan)
+          assertNoLeftoverCSAB(cometPlan)
 
-        spark.sql("DROP TABLE aqe_cat.db.q34637_fact")
+          if (isSpark35Plus) {
+            val cometSubqueries = collectWithSubqueries(cometPlan) {
+              case s: CometSubqueryBroadcastExec => s
+            }
+            assert(
+              cometSubqueries.nonEmpty,
+              s"Expected CometSubqueryBroadcastExec for DPP, got 0:\n${cometPlan.treeString}")
+          }
+
+          spark.sql("DROP TABLE aqe_cat.db.q34637_fact")
+        }
       }
     }
   }

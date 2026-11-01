@@ -254,6 +254,14 @@ Under AQE, an operator that shares its logical node with a shuffle stage, such a
 of a two-phase aggregate, comes back from re-planning as the node already planned, whose input was
 serialized as a `Scan` before the stage existed. `CometExecRule` refreshes such a node: once its input
 is a sink that emits a `ShuffleScan`, that `ShuffleScan` replaces the stale `Scan` leaf.
+Spark 3.4 can also reuse a node whose serialized input still contains a fused native scan and its
+filter, projection and partial aggregate. Once a stage materializes that input, the rule replaces
+the whole old subtree with the stage's `Scan` or `ShuffleScan`, after checking the input types. It
+propagates this change through native parents while retaining their logical links. These repairs
+run when preparing the stage or final plan, not while AQE compares re-planned alternatives.
+The rule matches the original input subtrees so that internal wrappers, such as a final
+aggregate's result projection, remain intact. It then applies the ordinary shuffle-leaf refresh
+to the updated plan so that other inputs keep direct read enabled.
 
 The two are not alternatives on failure. If any output type fails `supportedSinkDataType`,
 `convertToShuffleScan` records the fallback reason `Unsupported data type for shuffle direct read`

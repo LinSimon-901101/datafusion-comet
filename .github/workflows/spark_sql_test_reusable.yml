@@ -140,6 +140,11 @@ jobs:
           mkdir -p native/target/release
           cp native/target/ci/libcomet.so native/target/release/libcomet.so
 
+      - name: Remove native build intermediates before building Spark
+        # The library is uploaded and staged. Cargo's intermediates can fill the runner's disk
+        # before Spark even compiles; the remaining steps only need the staged library.
+        run: rm -rf native/target/ci
+
       - name: Setup Spark
         uses: ./.github/actions/setup-spark-builder
         with:
