@@ -127,7 +127,10 @@ use jni::objects::{Global, JObject};
 use log::warn;
 use num::{BigInt, ToPrimitive};
 use object_store::path::Path;
+use parking_lot::Mutex;
 use std::{collections::HashMap, sync::Arc};
+
+type StructSubqueryCache = HashMap<(i64, DataType), Arc<DataFusionLiteral>>;
 
 pub type PlanCreationResult =
     Result<(Vec<ScanExec>, Vec<ShuffleScanExec>, Arc<SparkPlan>), ExecutionError>;
@@ -182,6 +185,8 @@ pub struct PhysicalPlanner {
     partition: i32,
     session_ctx: Arc<SessionContext>,
     query_context_registry: Arc<datafusion_comet_spark_expr::QueryContextMap>,
+    /// Share owned struct literals across expressions and planner clones for this execution.
+    struct_subqueries: Arc<Mutex<StructSubqueryCache>>,
     /// SQL texts referenced by `QueryContext.sql_text_idx`, taken from the root operator's
     /// `sql_text_pool`. Held as `Arc`s so that every context in the plan shares one allocation
     /// rather than each cloning the full query text out of the proto. Empty when the plan was
@@ -222,6 +227,7 @@ impl PhysicalPlanner {
             session_ctx,
             partition,
             query_context_registry: datafusion_comet_spark_expr::create_query_context_map(),
+            struct_subqueries: Arc::default(),
             sql_text_pool: vec![],
             task_context: None,
             class_loader: None,
@@ -303,6 +309,9 @@ impl PhysicalPlanner {
     }
 
     pub fn with_exec_id(mut self, exec_context_id: i64) -> Self {
+        if self.exec_context_id != exec_context_id {
+            self.struct_subqueries = Arc::default();
+        }
         self.exec_context_id = exec_context_id;
         self
     }
@@ -966,8 +975,17 @@ impl PhysicalPlanner {
                 let id = expr.id;
                 let data_type = to_arrow_datatype(expr.datatype.as_ref().unwrap());
                 if matches!(data_type, DataType::Struct(_)) {
-                    let value = Subquery::resolve_struct(self.exec_context_id, id, &data_type)?;
-                    Ok(Arc::new(DataFusionLiteral::new(value)))
+                    // Keep resolution under the planning lock so concurrent clones cannot
+                    // serialize the same row twice. Evaluation only sees the immutable literal.
+                    let mut subqueries = self.struct_subqueries.lock();
+                    let key = (id, data_type);
+                    if let Some(value) = subqueries.get(&key) {
+                        return Ok(Arc::clone(value) as Arc<dyn PhysicalExpr>);
+                    }
+                    let value = Subquery::resolve_struct(self.exec_context_id, id, &key.1)?;
+                    let literal = Arc::new(DataFusionLiteral::new(value));
+                    subqueries.insert(key, Arc::clone(&literal));
+                    Ok(literal)
                 } else {
                     Ok(Arc::new(Subquery::new(self.exec_context_id, id, data_type)))
                 }

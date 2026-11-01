@@ -19,16 +19,21 @@
 
 package org.apache.comet.serde
 
+import java.util.concurrent.atomic.AtomicInteger
+
 import org.apache.spark.sql.CometTestBase
-import org.apache.spark.sql.catalyst.expressions.{Alias, Literal, NamedExpression}
+import org.apache.spark.sql.catalyst.InternalRow
+import org.apache.spark.sql.catalyst.expressions.{Alias, GenericInternalRow, GetStructField, Literal, NamedExpression}
+import org.apache.spark.sql.comet.{CometExec, CometExecUtils, CometScalarSubquery => JVMScalarSubquery}
 import org.apache.spark.sql.execution.{ProjectExec, ScalarSubquery, SubqueryExec}
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.types.UTF8String
 
 import org.apache.comet.CometSparkSessionExtensions.{isSpark40Plus, isSpark41Plus}
 import org.apache.comet.serde.QueryPlanSerde.supportedDataType
 import org.apache.comet.shims.CometTypeShim
 
-/** Direct type-gate tests avoid optimizer folding and exercise types Parquet cannot store. */
+/** Type-gate and native transfer tests that avoid optimizer folding. */
 class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
 
   private def struct(dt: DataType): StructType = StructType(Seq(StructField("value", dt)))
@@ -68,6 +73,103 @@ class CometScalarSubquerySuite extends CometTestBase with CometTypeShim {
     DecimalType(1, 0),
     DecimalType(10, 2),
     DecimalType(38, 38))
+
+  test("reused struct fields serialize once per native execution context") {
+    val resultType =
+      StructType(Seq(StructField("text", StringType), StructField("number", IntegerType)))
+    val first = subquery(resultType)
+    val other = subquery(resultType)
+    val metadataType = StructType(
+      resultType.fields.updated(
+        0,
+        resultType
+          .fields(0)
+          .copy(metadata = new MetadataBuilder().putLong("parquet.field.id", 41).build())))
+    val metadataFirst = subquery(metadataType).copy(exprId = first.exprId)
+    val range = OperatorOuterClass.Operator
+      .newBuilder()
+      .setRangeScan(
+        OperatorOuterClass.RangeScan
+          .newBuilder()
+          .setStart(0)
+          .setStep(1)
+          .setNumElements(4)
+          .setNumSlices(1))
+      .build()
+    val fields = Seq(
+      Alias(GetStructField(first, 0), "text")(),
+      Alias(GetStructField(first, 1), "number")(),
+      Alias(GetStructField(other, 0), "other")())
+    val projection = CometExec.serializeNativePlan(
+      CometExecUtils.getProjectionNativePlan(fields, Seq.empty, range).get)
+    val metadataProjection = CometExec.serializeNativePlan(
+      CometExecUtils
+        .getProjectionNativePlan(
+          fields :+ Alias(GetStructField(metadataFirst, 0), "metadataText")(),
+          Seq.empty,
+          range)
+        .get)
+
+    val counts = spark.sparkContext
+      .parallelize(Seq(0), 1)
+      .mapPartitions { _ =>
+        (0 until 3).map { generation =>
+          val firstReads = new AtomicInteger()
+          val otherReads = new AtomicInteger()
+          val text = s"$generation-" + ("wide" * 16384)
+          def row(value: String, reads: AtomicInteger): InternalRow =
+            new GenericInternalRow(Array[Any](UTF8String.fromString(value), generation)) {
+              // The IPC serializer reads this field once; isNull and scalar evaluation do not.
+              override def getUTF8String(ordinal: Int): UTF8String = {
+                reads.incrementAndGet()
+                super.getUTF8String(ordinal)
+              }
+            }
+          val firstValue = if (generation == 2) null else row(text, firstReads)
+          val otherValue = row(s"other-$generation", otherReads)
+          val firstResult = new ScalarSubquery(first.plan, first.exprId) {
+            override def eval(input: InternalRow): Any = firstValue
+          }
+          val otherResult = new ScalarSubquery(other.plan, other.exprId) {
+            override def eval(input: InternalRow): Any = otherValue
+          }
+          val (plan, columns) =
+            if (generation == 1) (metadataProjection, 4) else (projection, 3)
+          val iterator = CometExec.getCometIterator(Array.empty[Object], columns, plan, 1, 0)
+          try {
+            JVMScalarSubquery.setSubquery(iterator.id, firstResult)
+            JVMScalarSubquery.setSubquery(iterator.id, otherResult)
+            var rows = 0
+            while (iterator.hasNext) {
+              val batch = iterator.next()
+              (0 until batch.numRows()).foreach { index =>
+                if (generation == 2) {
+                  assert(batch.column(0).isNullAt(index))
+                  assert(batch.column(1).isNullAt(index))
+                } else {
+                  assert(batch.column(0).getUTF8String(index).toString == text)
+                  assert(batch.column(1).getInt(index) == generation)
+                }
+                assert(batch.column(2).getUTF8String(index).toString == s"other-$generation")
+                if (generation == 1) {
+                  assert(batch.column(3).getUTF8String(index).toString == text)
+                }
+                rows += 1
+              }
+            }
+            assert(rows == 4)
+            (firstReads.get(), otherReads.get())
+          } finally {
+            JVMScalarSubquery.removeSubquery(iterator.id, firstResult)
+            JVMScalarSubquery.removeSubquery(iterator.id, otherResult)
+            iterator.close()
+          }
+        }.iterator
+      }
+      .collect()
+      .toSeq
+    assert(counts == Seq((1, 1), (2, 1), (0, 1)))
+  }
 
   test("non-struct scalar subqueries use the shared type gate defaults") {
     val types = scalarTypes ++ versionSpecificTypes ++ Seq(
